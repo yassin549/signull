@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Signull</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=11" />
+</head>
+<body>
+  <div class="app">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="logo">◆ SIGNULL</span>
+        <span class="asset-badge" id="asset-badge">BTC</span>
+        <span class="market-short" id="market-short">—</span>
+      </div>
+      <div class="topbar-status">
+        <span class="status-item" id="feed-status" title="Feed"><i class="dot"></i> <span id="feed-rate">—</span>/s</span>
+        <span class="status-item" id="sync-status" title="Last update"><i class="dot"></i> <span id="sync-text">—</span></span>
+        <span class="status-item" id="mode-status" title="Mode"><i class="dot"></i> <span id="mode-text">Paper</span></span>
+        <span class="status-item" id="bot-status" title="Bot"><i class="dot"></i> <span id="bot-text">—</span></span>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-start" onclick="startBot()">▶ Start</button>
+        <button class="btn btn-stop" onclick="stopBot()">■ Stop</button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-timer">
+        <div class="timer-ring" id="timer-ring">
+          <svg viewBox="0 0 36 36">
+            <circle class="ring-bg" cx="18" cy="18" r="15.5" />
+            <circle class="ring-fg" id="ring-fg" cx="18" cy="18" r="15.5" />
+          </svg>
+          <span class="timer-val" id="countdown">—</span>
+        </div>
+        <span class="timer-label">to close</span>
+      </div>
+
+      <div class="hero-prices">
+        <div class="price-col up">
+          <span class="price-label">Up</span>
+          <span class="price-val" id="price-up">—</span>
+          <span class="price-pct" id="pct-up">—</span>
+        </div>
+        <div class="prob-track">
+          <div class="prob-fill up" id="prob-up" style="width:50%"></div>
+          <span class="prob-delta" id="prob-delta">—</span>
+        </div>
+        <div class="price-col down">
+          <span class="price-label">Down</span>
+          <span class="price-val" id="price-down">—</span>
+          <span class="price-pct" id="pct-down">—</span>
+        </div>
+      </div>
+
+      <div class="hero-btc">
+        <span class="hero-btc-label">BTC / USD</span>
+        <span class="hero-btc-price" id="hero-btc-price">—</span>
+        <span class="hero-btc-meta">
+          <span id="hero-btc-beat">Beat —</span>
+          <span class="meta-sep">·</span>
+          <span id="hero-btc-delta">Δ —</span>
+        </span>
+        <span class="hero-btc-src">Binance live · Chainlink beat</span>
+      </div>
+
+      <div class="hero-signal" id="hero-signal">
+        <span class="signal-badge hold" id="signal-side">HOLD</span>
+        <span class="signal-reason" id="signal-reason">Analyzing market…</span>
+      </div>
+    </section>
+
+    <main class="content">
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Charts</span>
+          <span class="panel-hint">Scroll for order book, trades &amp; wallet</span>
+        </div>
+        <div class="charts-grid">
+          <div class="card chart-card">
+            <div class="card-bar">
+              <span class="card-title">Outcome prices</span>
+              <span class="card-meta" id="chart-meta">—</span>
+            </div>
+            <div class="chart-area">
+              <canvas id="price-chart"></canvas>
+            </div>
+          </div>
+
+          <div class="card chart-card btc-chart-card">
+            <div class="card-bar">
+              <div class="card-title-group">
+                <span class="card-title">Δ vs beat</span>
+                <span class="card-subtitle">Distance from candle open · Chainlink</span>
+              </div>
+              <div class="card-meta card-meta-split">
+                <span id="btc-spot" class="btc-spot">—</span>
+                <span class="meta-sep">·</span>
+                <span id="btc-beat">Beat —</span>
+                <span class="meta-sep">·</span>
+                <span id="btc-delta">Δ —</span>
+                <span class="meta-sep">·</span>
+                <span id="btc-chart-meta">—</span>
+              </div>
+            </div>
+            <div class="chart-area">
+              <canvas id="btc-chart"></canvas>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Order book</span>
+        </div>
+        <div class="card book-card">
+          <div class="card-bar">
+            <div class="tabs" id="book-tabs">
+              <button class="tab active" data-tab="up">UP</button>
+              <button class="tab" data-tab="down">DOWN</button>
+            </div>
+            <span class="card-meta" id="book-spread">—</span>
+          </div>
+          <div class="book-summary" id="book-summary">
+            <div class="book-stat"><span class="lbl">Bid</span><span class="val bid" id="book-best-bid">—</span></div>
+            <div class="book-stat mid"><span class="lbl">Mid</span><span class="val" id="book-mid">—</span></div>
+            <div class="book-stat"><span class="lbl">Ask</span><span class="val ask" id="book-best-ask">—</span></div>
+          </div>
+          <div class="book-cols"><span>Price</span><span>Size</span><span>Total</span></div>
+          <div class="book-body" id="book-body">
+            <div class="placeholder">Waiting for feed…</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel details-grid">
+        <div class="card tape-card">
+          <div class="card-bar">
+            <span class="card-title">Recent trades</span>
+            <span class="card-meta" id="tape-count">0 trades</span>
+          </div>
+          <div class="tape-head">
+            <span>Time</span>
+            <span>Side</span>
+            <span>Outcome</span>
+            <span>Price</span>
+            <span>Size</span>
+          </div>
+          <div class="tape-body" id="trade-tape">
+            <div class="placeholder">No trades yet</div>
+          </div>
+        </div>
+
+        <div class="card info-card">
+          <div class="card-bar">
+            <div class="tabs" id="info-tabs">
+              <button class="tab active" data-tab="wallet">Wallet</button>
+              <button class="tab" data-tab="log">Activity</button>
+            </div>
+          </div>
+
+          <div class="info-body" id="info-wallet">
+            <div class="wallet-hero">
+              <div class="wallet-balance-block">
+                <span class="wallet-label">USDC Balance</span>
+                <span class="wallet-balance" id="wallet-balance">—</span>
+              </div>
+              <span class="wallet-pill" id="wallet-status">—</span>
+            </div>
+            <div class="wallet-grid">
+              <div class="wallet-field">
+                <span class="field-label">Funder</span>
+                <span class="field-value mono" id="wallet-funder">—</span>
+              </div>
+              <div class="wallet-field">
+                <span class="field-label">Signer</span>
+                <span class="field-value mono" id="wallet-signer">—</span>
+              </div>
+              <div class="wallet-field">
+                <span class="field-label">Signature</span>
+                <span class="field-value" id="wallet-type">—</span>
+              </div>
+              <div class="wallet-field">
+                <span class="field-label">Mode</span>
+                <span class="field-value" id="wallet-mode">—</span>
+              </div>
+            </div>
+            <div class="wallet-tips hidden" id="wallet-tips"></div>
+          </div>
+
+          <div class="info-body hidden" id="info-log">
+            <div id="activity-log" class="activity-feed">
+              <div class="placeholder">No activity</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+  <script src="/static/app.js?v=14"></script>
+</body>
+</html>
