@@ -8,3 +8,7 @@ venv/
 terminals/
 mcps/
 agent-tools/
+data/backtest_cache/
+data/btc_klines/
+models/*.pt
+models/*.json

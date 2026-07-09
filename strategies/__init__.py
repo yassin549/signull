@@ -1,0 +1,1 @@
+"""Pluggable trading strategies for backtesting and live trading."""

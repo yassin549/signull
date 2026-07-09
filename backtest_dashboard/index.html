@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Signull Backtest</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=4" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="logo">◆ SIGNULL</span>
+        <span class="badge">BACKTEST</span>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-run" id="run-btn">▶ Run Backtest</button>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="field">
+        <label for="strategy-select">Strategy</label>
+        <select id="strategy-select"></select>
+        <p class="hint" id="strategy-desc">—</p>
+      </div>
+      <div class="field">
+        <label for="asset-select">Asset</label>
+        <select id="asset-select">
+          <option value="btc" selected>BTC</option>
+          <option value="eth">ETH</option>
+          <option value="sol">SOL</option>
+          <option value="xrp">XRP</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="candle-count">Candles</label>
+        <input id="candle-count" type="number" min="10" max="500" value="100" />
+      </div>
+      <div class="field">
+        <label for="initial-capital">Starting capital ($)</label>
+        <input id="initial-capital" type="number" min="1" step="1" value="100" />
+      </div>
+      <div class="field params-field">
+        <label>Strategy params</label>
+        <div id="params-box" class="params-box"></div>
+      </div>
+    </section>
+
+    <section class="stats-grid" id="stats-grid">
+      <div class="stat"><span class="lbl">Ending balance</span><span class="val" id="stat-ending">—</span></div>
+      <div class="stat"><span class="lbl">Total return</span><span class="val" id="stat-return">—</span></div>
+      <div class="stat"><span class="lbl">Win rate</span><span class="val" id="stat-winrate">—</span></div>
+      <div class="stat"><span class="lbl">Trades</span><span class="val" id="stat-trades">—</span></div>
+      <div class="stat"><span class="lbl">W / L</span><span class="val" id="stat-wl">—</span></div>
+      <div class="stat"><span class="lbl">Max drawdown</span><span class="val" id="stat-dd">—</span></div>
+      <div class="stat"><span class="lbl">Profit factor</span><span class="val" id="stat-pf">—</span></div>
+      <div class="stat"><span class="lbl">Avg win / loss</span><span class="val" id="stat-avg">—</span></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-title">Equity curve</span>
+        <span class="panel-meta" id="run-meta">—</span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="equity-chart"></canvas>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-title">Trade log</span>
+        <span class="panel-meta" id="trade-count">0 trades</span>
+      </div>
+      <div class="trade-head">
+        <span>Candle</span><span>Side</span><span>Entry</span><span>Size</span><span>Stake</span><span>Result</span><span>PnL</span><span>Equity</span>
+      </div>
+      <div class="trade-body" id="trade-body">
+        <div class="placeholder">Run a backtest to see trades</div>
+      </div>
+    </section>
+  </div>
+  <script src="/static/app.js?v=5"></script>
+</body>
+</html>
