@@ -49,6 +49,14 @@ class BotConfig:
     server_port: int
     dashboard_push_ms: int
     bot_poll_interval_sec: float
+    # Signull 1.0 / paper bankroll
+    paper_initial_capital: float
+    strategy_threshold: float
+    strategy_min_risk_pct: float
+    strategy_max_risk_pct: float
+    strategy_trust_lookback: int
+    strategy_btc_align_min: float
+    strategy_big_equity_buffer: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -75,7 +83,25 @@ class BotConfig:
             server_port=int(os.getenv("SERVER_PORT", "8080")),
             dashboard_push_ms=int(os.getenv("DASHBOARD_PUSH_MS", "50")),
             bot_poll_interval_sec=float(os.getenv("BOT_POLL_INTERVAL_SEC", "2")),
+            paper_initial_capital=float(os.getenv("PAPER_INITIAL_CAPITAL", "100")),
+            strategy_threshold=float(os.getenv("SIGNULL_THRESHOLD", "0.70")),
+            strategy_min_risk_pct=float(os.getenv("SIGNULL_MIN_RISK_PCT", "0.05")),
+            strategy_max_risk_pct=float(os.getenv("SIGNULL_MAX_RISK_PCT", "0.50")),
+            strategy_trust_lookback=int(os.getenv("SIGNULL_TRUST_LOOKBACK", "3")),
+            strategy_btc_align_min=float(os.getenv("SIGNULL_BTC_ALIGN_MIN", "0.55")),
+            strategy_big_equity_buffer=float(os.getenv("SIGNULL_BIG_EQUITY_BUFFER", "1.25")),
         )
+
+    def strategy_params(self) -> dict:
+        """Params for strategies.Signull10Strategy."""
+        return {
+            "threshold": self.strategy_threshold,
+            "min_risk_pct": self.strategy_min_risk_pct,
+            "max_risk_pct": self.strategy_max_risk_pct,
+            "trust_lookback": self.strategy_trust_lookback,
+            "btc_align_min": self.strategy_btc_align_min,
+            "big_equity_buffer": self.strategy_big_equity_buffer,
+        }
 
     @property
     def is_live(self) -> bool:

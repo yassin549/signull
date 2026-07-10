@@ -43,6 +43,9 @@ class BotSnapshot:
     feed: dict[str, Any] = field(default_factory=dict)
     btc: dict[str, Any] | None = None
     trades: list[dict[str, Any]] = field(default_factory=list)
+    # Signull 1.0 strategy status (paper + live)
+    strategy: dict[str, Any] | None = None
+    strategy_trades: list[dict[str, Any]] = field(default_factory=list)
 
 
 class BotState:
@@ -124,6 +127,11 @@ class BotState:
         with self._lock:
             return dict(self._snapshot.prices) if self._snapshot.prices else None
 
+    def get_market(self) -> dict[str, Any] | None:
+        """Small feed-owned market read for the latency-sensitive bot loop."""
+        with self._lock:
+            return dict(self._snapshot.market) if self._snapshot.market else None
+
     def is_feed_connected(self) -> bool:
         with self._lock:
             return bool(self._snapshot.feed.get("connected"))
@@ -195,6 +203,14 @@ class BotState:
             })
             self._snapshot.trades = trades[:100]
             self._record_feed_update_locked(now)
+            self._bump()
+
+    def record_strategy_trade(self, trade: dict[str, Any]) -> None:
+        """Append a Signull strategy trade (paper or live) for the dashboard."""
+        with self._lock:
+            trades = list(self._snapshot.strategy_trades)
+            trades.insert(0, trade)
+            self._snapshot.strategy_trades = trades[:100]
             self._bump()
 
     def set_feed_status(self, connected: bool, extra: dict | None = None) -> None:

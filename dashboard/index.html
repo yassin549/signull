@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=11" />
+  <link rel="stylesheet" href="/static/styles.css?v=16" />
 </head>
 <body>
   <div class="app">
@@ -73,6 +73,12 @@
       <div class="hero-signal" id="hero-signal">
         <span class="signal-badge hold" id="signal-side">HOLD</span>
         <span class="signal-reason" id="signal-reason">Analyzing market…</span>
+      </div>
+      <div class="hero-strategy" id="hero-strategy">
+        <span class="strat-name" id="strat-name">Signull 1.0</span>
+        <span class="strat-eq" id="strat-equity">Equity —</span>
+        <span class="strat-ret" id="strat-return">—</span>
+        <span class="strat-pending" id="strat-pending">No position</span>
       </div>
     </section>
 
@@ -170,12 +176,20 @@
           <div class="info-body" id="info-wallet">
             <div class="wallet-hero">
               <div class="wallet-balance-block">
-                <span class="wallet-label">USDC Balance</span>
+                <span class="wallet-label" id="wallet-balance-label">Paper equity</span>
                 <span class="wallet-balance" id="wallet-balance">—</span>
               </div>
               <span class="wallet-pill" id="wallet-status">—</span>
             </div>
             <div class="wallet-grid">
+              <div class="wallet-field">
+                <span class="field-label">Strategy</span>
+                <span class="field-value" id="wallet-strategy">Signull 1.0</span>
+              </div>
+              <div class="wallet-field">
+                <span class="field-label">Threshold</span>
+                <span class="field-value mono" id="wallet-threshold">—</span>
+              </div>
               <div class="wallet-field">
                 <span class="field-label">Funder</span>
                 <span class="field-value mono" id="wallet-funder">—</span>
@@ -194,6 +208,10 @@
               </div>
             </div>
             <div class="wallet-tips hidden" id="wallet-tips"></div>
+            <div class="strat-trades-head">Strategy trades</div>
+            <div class="strat-trades" id="strat-trades">
+              <div class="placeholder">No Signull trades yet</div>
+            </div>
           </div>
 
           <div class="info-body hidden" id="info-log">
@@ -206,6 +224,6 @@
 
     </main>
   </div>
-  <script src="/static/app.js?v=14"></script>
+  <script src="/static/app.js?v=17"></script>
 </body>
 </html>

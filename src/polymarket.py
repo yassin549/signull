@@ -94,6 +94,18 @@ class PolymarketClient:
             logger.exception("Failed to fetch open orders")
             return []
 
+    def get_order(self, order_id: str) -> dict:
+        if not self._authenticated or not order_id:
+            return {}
+        assert self._client is not None
+        return self._client.get_order(order_id) or {}
+
+    def cancel_order(self, order_id: str) -> dict:
+        if not self._authenticated or not order_id:
+            return {}
+        assert self._client is not None
+        return self._client.cancel_order(order_id) or {}
+
     def get_order_book(self, token_id: str):
         assert self._client is not None
         return self._client.get_order_book(token_id)

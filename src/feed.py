@@ -11,10 +11,13 @@ import websockets
 
 from .config import BotConfig
 from .markets import (
+    CANDLE_DURATION,
     CandleMarket,
+    expected_candle_start_ts,
     get_current_candle,
     get_next_candle,
     market_to_dict,
+    provisional_market_dict,
 )
 from .polymarket import PolymarketClient
 from .state import BotState
@@ -23,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 PM_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL = 10
-PREFETCH_SEC = 90
+PREFETCH_SEC = 120  # start prefetching 2 minutes before close
 
 
 class MarketFeed:
@@ -38,6 +41,7 @@ class MarketFeed:
         self._active_market: CandleMarket | None = None
         self._next_market: CandleMarket | None = None
         self._switching = False
+        self._provisional_pushed_for: int | None = None
 
     async def run(self) -> None:
         while not self.state.should_shutdown():
@@ -48,13 +52,15 @@ class MarketFeed:
             except Exception as exc:
                 logger.warning("Feed reconnecting: %s", exc)
                 self.state.set_feed_status(False, {"error": str(exc), "reconnecting": True})
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.35)
 
     async def _connect_and_stream(self) -> None:
         market = await asyncio.to_thread(get_current_candle, self.config.asset)
         if market is None:
-            self.state.set_feed_status(False, {"error": "no active market"})
-            await asyncio.sleep(1)
+            # Still roll the clock so the UI never freezes at 0:00
+            self._push_provisional_now()
+            self.state.set_feed_status(False, {"error": "no active market", "reconnecting": True})
+            await asyncio.sleep(0.5)
             return
 
         if market.slug != self._active_slug:
@@ -100,6 +106,20 @@ class MarketFeed:
                 self.state.set_price_to_beat(beat)
                 return
 
+    def _push_provisional_now(self) -> None:
+        """Publish clock-based market so countdown rolls without waiting on Gamma."""
+        start = expected_candle_start_ts()
+        if self._provisional_pushed_for == start:
+            return
+        self._provisional_pushed_for = start
+        stub = provisional_market_dict(self.config.asset, start)
+        # Don't wipe books if we're still on the same provisional window
+        self.state.update(
+            market=stub,
+            signal={"side": "hold", "reason": "Rolling into new candle…"},
+        )
+        self.state.log("info", f"Provisional candle window {start} (awaiting market listing)")
+
     async def _prefetch_next(self) -> None:
         if self._active_market is None:
             return
@@ -111,35 +131,70 @@ class MarketFeed:
         ):
             return
 
-        nxt = await asyncio.to_thread(get_next_candle, self.config.asset, self._active_market)
+        nxt = await asyncio.to_thread(
+            get_next_candle,
+            self.config.asset,
+            self._active_market,
+            max_wait_sec=0.35,
+        )
         if nxt is not None:
             self._next_market = nxt
+            logger.info("Prefetched next candle %s", nxt.slug)
 
     async def _candle_watch_loop(self, ws) -> None:
-        """Prefetch the next candle, then switch exactly when the current one closes."""
+        """Prefetch next candle; switch the instant the current window ends."""
         while not self.state.should_shutdown():
             market = self._active_market
             if market is None:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.15)
                 continue
 
             await self._prefetch_next()
 
             secs = market.seconds_to_close
-            if secs > 0.15:
-                await asyncio.sleep(min(secs + 0.05, 0.5))
+            # Also watch the wall clock — end_date skew shouldn't trap us
+            clock_start = expected_candle_start_ts()
+            window_rolled = (
+                market.candle_start_ts is not None
+                and clock_start > market.candle_start_ts
+            )
+
+            if secs > 0.2 and not window_rolled:
+                # Near the end, wake more often
+                if secs <= 5:
+                    await asyncio.sleep(0.1)
+                elif secs <= 30:
+                    await asyncio.sleep(0.25)
+                else:
+                    await asyncio.sleep(min(0.5, secs - 0.15))
                 continue
 
+            # Window closed (or clock says it has) — roll UI immediately
+            self._push_provisional_now()
+
             if self._switching:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
             nxt = self._next_market
-            if nxt is None:
-                nxt = await asyncio.to_thread(get_next_candle, self.config.asset, market)
+            if nxt is None or nxt.candle_start_ts < clock_start:
+                nxt = await asyncio.to_thread(
+                    get_next_candle,
+                    self.config.asset,
+                    market,
+                    max_wait_sec=0.5,
+                )
+
+            # If Gamma still lagging, try the exact expected slug once more
+            if nxt is None or nxt.seconds_to_close <= 0:
+                nxt = await asyncio.to_thread(
+                    get_current_candle,
+                    self.config.asset,
+                )
 
             if nxt is None or nxt.slug == self._active_slug:
-                await asyncio.sleep(0.1)
+                # Keep provisional countdown; retry quickly
+                await asyncio.sleep(0.2)
                 continue
 
             self._switching = True
@@ -147,7 +202,10 @@ class MarketFeed:
                 self._next_market = None
                 await self._switch_candle(nxt)
                 self.state.set_feed_status(False, {"reconnecting": True})
-                await ws.close()
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
             finally:
                 self._switching = False
             return
@@ -155,6 +213,7 @@ class MarketFeed:
     async def _switch_candle(self, market: CandleMarket) -> None:
         self._active_slug = market.slug
         self._active_market = market
+        self._provisional_pushed_for = market.candle_start_ts
         self._token_map = {
             market.up_token_id: "up",
             market.down_token_id: "down",

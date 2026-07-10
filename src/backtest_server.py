@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -13,8 +13,7 @@ from pydantic import BaseModel, Field
 from src.backtest.data import fetch_candles, prefetch_progress
 from src.backtest.engine import run_backtest
 from src.backtest.registry import get_strategy, list_strategies
-
-logger = logging.getLogger(__name__)
+from src.config import SERIES_SLUGS
 
 BACKTEST_DIR = Path(__file__).resolve().parent.parent / "backtest_dashboard"
 
@@ -28,8 +27,17 @@ class BacktestRequest(BaseModel):
     use_cache: bool = True
 
 
+def _run_backtest(req: BacktestRequest) -> dict:
+    strategy = get_strategy(req.strategy_id, req.params)
+    candles = fetch_candles(asset=req.asset, count=req.candle_count, use_cache=req.use_cache)
+    if not candles:
+        raise LookupError("No resolved candles found for backtest")
+    return run_backtest(strategy, candles, initial_capital=req.initial_capital).to_dict()
+
+
 def create_backtest_app() -> FastAPI:
     app = FastAPI(title="Signull Backtest", version="0.1.0")
+    run_slots = asyncio.Semaphore(1)
 
     if BACKTEST_DIR.exists():
         app.mount("/static", StaticFiles(directory=BACKTEST_DIR), name="static")
@@ -40,39 +48,26 @@ def create_backtest_app() -> FastAPI:
 
     @app.get("/api/strategies")
     async def strategies():
-        return {"strategies": list_strategies()}
+        return {"strategies": await asyncio.to_thread(list_strategies)}
 
     @app.get("/api/cache")
     async def cache_status(asset: str = "btc", count: int = 100):
-        return prefetch_progress(asset, count)
+        if asset not in SERIES_SLUGS:
+            raise HTTPException(status_code=422, detail="Unsupported asset")
+        return await asyncio.to_thread(prefetch_progress, asset, count)
 
     @app.post("/api/run")
     async def run(req: BacktestRequest):
+        if req.asset not in SERIES_SLUGS:
+            raise HTTPException(status_code=422, detail="Unsupported asset")
+        if run_slots.locked():
+            raise HTTPException(status_code=429, detail="A backtest is already running; try again shortly")
         try:
-            strategy = get_strategy(req.strategy_id, req.params)
+            async with run_slots:
+                return await asyncio.to_thread(_run_backtest, req)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-        logger.info(
-            "Backtest %s — %s candles, $%.2f start",
-            req.strategy_id,
-            req.candle_count,
-            req.initial_capital,
-        )
-
-        candles = fetch_candles(
-            asset=req.asset,
-            count=req.candle_count,
-            use_cache=req.use_cache,
-        )
-        if not candles:
-            raise HTTPException(status_code=404, detail="No resolved candles found for backtest")
-
-        result = run_backtest(
-            strategy,
-            candles,
-            initial_capital=req.initial_capital,
-        )
-        return result.to_dict()
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return app

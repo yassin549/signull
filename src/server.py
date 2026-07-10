@@ -43,7 +43,10 @@ class BroadcastHub:
             version = self.state.version
             if version != self._last_version and self.clients:
                 self._last_version = version
-                payload = self.state.get_snapshot(history_points=300)
+                # The browser retains history between messages; a short tail is
+                # enough for recovery and avoids serializing thousands of chart
+                # points for every market update/client.
+                payload = self.state.get_snapshot(history_points=120)
                 dead: list[WebSocket] = []
                 for ws in list(self.clients):
                     try:
@@ -118,7 +121,7 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.get("/api/status")
     async def status():
-        snap = service.state.get_snapshot(history_points=3000)
+        snap = service.state.get_snapshot(history_points=600)
         snap["bot_thread_alive"] = service.is_running
         return snap
 
@@ -134,6 +137,10 @@ def create_app(config: BotConfig) -> FastAPI:
             "has_wallet": config.has_wallet,
             "signature_type": config.signature_type,
             "signature_label": config.signature_label,
+            "strategy": "signull_1_0",
+            "strategy_name": "Signull 1.0",
+            "paper_initial_capital": config.paper_initial_capital,
+            "strategy_params": config.strategy_params(),
         }
 
     @app.get("/api/wallet/verify")
@@ -156,7 +163,7 @@ def create_app(config: BotConfig) -> FastAPI:
         service.hub.add(ws)
         try:
             # Send immediate full snapshot on connect
-            await ws.send_json(service.state.get_snapshot(history_points=3000))
+            await ws.send_json(service.state.get_snapshot(history_points=600))
             while True:
                 await asyncio.sleep(60)
         except WebSocketDisconnect:

@@ -96,8 +96,9 @@ def window_features(
     Channels: log_return, range_pct, body_pct
     """
     entry_ms = entry_ts * 1000
-    # Keep bars with open_time <= entry_ms
-    bars = sorted([k for k in klines if k[0] <= entry_ms], key=lambda x: x[0])
+    # OHLCV is only final after the one-minute interval closes.  Including an
+    # open bar leaks future high/low/close values into historical backtests.
+    bars = sorted([k for k in klines if k[0] + 60_000 <= entry_ms], key=lambda x: x[0])
     if len(bars) < lookback + 1:
         return None
 

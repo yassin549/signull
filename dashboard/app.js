@@ -14,12 +14,14 @@ let obRenderPending = false;
 const CANDLE_SEC = 300;
 const RING_LEN = 97.4;
 const POLL_MS = 1000;
+const POLL_FAST_MS = 250;
 const smooth = { up: null, down: null, btcDelta: null };
 let needsRedraw = true;
 let lastServerTs = null;
 let countdownBase = null;
 let activeCandleSlug = null;
 let feedReconnecting = false;
+let localWindowStart = null;
 
 function safe(fn) {
   return (...args) => {
@@ -47,7 +49,6 @@ function init() {
     .catch(() => {});
   pollStatus();
   connect();
-  pollTimer = setInterval(pollStatus, POLL_MS);
   setInterval(tickCountdown, 250);
   setInterval(tickSyncAge, 1000);
   requestAnimationFrame(renderLoop);
@@ -78,6 +79,8 @@ function connect() {
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   ws.onopen = () => {
     isLive = true;
+    clearInterval(pollTimer);
+    pollTimer = null;
     setSyncStatus(true);
     pollStatus();
   };
@@ -96,6 +99,7 @@ function connect() {
   ws.onclose = () => {
     isLive = false;
     setSyncStatus(false);
+    if (!pollTimer) pollTimer = setInterval(pollStatus, POLL_MS);
     reconnectTimer = setTimeout(connect, 1500);
   };
 }
@@ -170,9 +174,11 @@ const onUpdate = safe(function onUpdate(d) {
   detectCandleChange(d.market);
   updateTopbar(d);
   updateHero(d);
+  updateStrategy(d);
   updateWallet(d);
   updateOrderbooks(d.orderbooks || {});
   updateTape(d.trades || []);
+  updateStrategyTrades(d.strategy_trades || []);
   updateLog(d.activity || []);
   updateBtcPanel(d.btc);
   updateBotButtons(d.running);
@@ -183,39 +189,69 @@ function detectCandleChange(market) {
   if (!slug || slug === activeCandleSlug) return;
   const isRollover = activeCandleSlug !== null;
   activeCandleSlug = slug;
-  if (isRollover) resetCandleUI();
+  if (isRollover) resetCandleUI(market?.provisional ? "soft" : "full");
   countdownBase = { market };
 }
 
-function resetCandleUI() {
+function resetCandleUI(mode = "full") {
+  // Soft: keep last prices briefly while provisional window loads.
+  // Full: hard clear when a real new market arrives.
   history = [];
   btcHistory = [];
   priceToBeat = null;
-  smooth.up = smooth.down = smooth.btcDelta = null;
-  cachedBooks = {};
   lastTradeId = null;
   needsRedraw = true;
-  setText("price-up", "—");
-  setText("price-down", "—");
-  setText("pct-up", "—");
-  setText("pct-down", "—");
-  setText("prob-delta", "—");
+  if (mode === "full") {
+    smooth.up = smooth.down = smooth.btcDelta = null;
+    cachedBooks = {};
+    setText("price-up", "—");
+    setText("price-down", "—");
+    setText("pct-up", "—");
+    setText("pct-down", "—");
+    setText("prob-delta", "—");
+  }
   setText("hero-btc-beat", "Beat —");
   setText("hero-btc-delta", "Δ —");
   const probEl = document.getElementById("prob-up");
-  if (probEl) probEl.style.width = "50%";
+  if (probEl && mode === "full") probEl.style.width = "50%";
   setText("signal-side", "HOLD");
   setClass("signal-side", "signal-badge hold");
-  setText("signal-reason", "New candle — warming up");
+  setText("signal-reason", mode === "soft" ? "Rolling into new candle…" : "New candle — warming up");
+}
+
+/** UTC 5m window: seconds remaining in the current wall-clock candle. */
+function clockSecsToClose() {
+  const now = Date.now() / 1000;
+  const start = Math.floor(now / CANDLE_SEC) * CANDLE_SEC;
+  return Math.max(0, start + CANDLE_SEC - now);
+}
+
+function clockWindowStart() {
+  return Math.floor(Date.now() / 1000 / CANDLE_SEC) * CANDLE_SEC;
 }
 
 function marketSecsToClose(market) {
-  if (!market) return null;
-  if (market.end_date) {
+  // Prefer market end_date while it's still in the future.
+  if (market?.end_date) {
     const end = new Date(market.end_date).getTime();
-    if (!isNaN(end)) return Math.max(0, (end - Date.now()) / 1000);
+    if (!isNaN(end)) {
+      const secs = (end - Date.now()) / 1000;
+      // Stale previous candle — roll with wall clock immediately (no 0:00 freeze).
+      if (secs <= 0) return clockSecsToClose();
+      return secs;
+    }
   }
-  return market.seconds_to_close != null ? Math.max(0, market.seconds_to_close) : null;
+  if (market?.seconds_to_close != null) {
+    const s = Number(market.seconds_to_close);
+    if (s > 0) return s;
+  }
+  return clockSecsToClose();
+}
+
+function marketIsStale(market) {
+  if (!market?.end_date) return false;
+  const end = new Date(market.end_date).getTime();
+  return !isNaN(end) && end <= Date.now();
 }
 
 function updateTopbar(d) {
@@ -309,6 +345,58 @@ function updateHero(d) {
   }
 }
 
+function updateStrategy(d) {
+  const s = d.strategy || {};
+  setText("strat-name", s.name || "Signull 1.0");
+  if (s.equity != null) {
+    setText("strat-equity", `Equity $${Number(s.equity).toFixed(2)}`);
+  }
+  if (s.return_pct != null) {
+    const r = Number(s.return_pct);
+    const el = document.getElementById("strat-return");
+    if (el) {
+      el.textContent = `${r >= 0 ? "+" : ""}${r.toFixed(1)}%`;
+      el.className = "strat-ret " + (r >= 0 ? "up" : "down");
+    }
+  }
+  const p = s.pending;
+  if (p) {
+    setText(
+      "strat-pending",
+      `${(p.mode || "paper").toUpperCase()} ${String(p.side).toUpperCase()} @ ${Number(p.entry_price).toFixed(2)} · ${p.size_label} $${Number(p.stake).toFixed(2)}`
+    );
+  } else {
+    setText("strat-pending", s.entered_this_candle ? "Entered · waiting resolve" : "No position");
+  }
+}
+
+function updateStrategyTrades(trades) {
+  const el = document.getElementById("strat-trades");
+  if (!el) return;
+  if (!trades.length) {
+    el.innerHTML = '<div class="placeholder">No Signull trades yet</div>';
+    return;
+  }
+  el.innerHTML = trades.slice(0, 20).map(t => {
+    const cls = t.won ? "win" : "loss";
+    const pnl = Number(t.pnl || 0);
+    const tip = [
+      t.won ? "WIN" : "LOSS",
+      `side=${t.side}`,
+      `winner=${t.winner || "?"}`,
+      t.resolve_source ? `via ${t.resolve_source}` : "",
+      t.title || t.slug || "",
+    ].filter(Boolean).join(" · ");
+    return `<div class="strat-trade ${cls}" title="${esc(tip)}">
+      <span class="st-side">${String(t.side || "").toUpperCase()}</span>
+      <span class="st-px">@${Number(t.entry_price).toFixed(2)}</span>
+      <span class="st-sz">${t.size_label || ""} $${Number(t.stake).toFixed(2)}</span>
+      <span class="st-pnl">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>
+      <span class="st-eq">$${Number(t.equity_after).toFixed(2)}</span>
+    </div>`;
+  }).join("");
+}
+
 function flashEl(id) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -318,59 +406,107 @@ function flashEl(id) {
 }
 
 function tickCountdown() {
-  if (!countdownBase?.market) return;
-  const secs = Math.max(0, Math.round(marketSecsToClose(countdownBase.market) || 0));
-  renderCountdown(secs);
-  updateTimerRing(secs, countdownBase.market);
-  // Poll faster in the final seconds so the new candle slug arrives quickly.
-  if (secs <= 10 && !tickCountdown._fast) {
+  // Local 5m boundary — refresh UI even if the server is still on the old slug.
+  const win = clockWindowStart();
+  if (localWindowStart != null && win !== localWindowStart) {
+    if (marketIsStale(countdownBase?.market) || !countdownBase?.market) {
+      // Inject a provisional market so the timer jumps to ~5:00 immediately.
+      const endMs = (win + CANDLE_SEC) * 1000;
+      const provisional = {
+        slug: `local-${win}`,
+        end_date: new Date(endMs).toISOString(),
+        candle_start_ts: win,
+        candle_duration_sec: CANDLE_SEC,
+        seconds_to_close: clockSecsToClose(),
+        provisional: true,
+        title: countdownBase?.market?.title || "New candle",
+      };
+      detectCandleChange(provisional);
+      countdownBase = { market: provisional };
+    }
+  }
+  localWindowStart = win;
+
+  const market = countdownBase?.market;
+  const raw = marketSecsToClose(market);
+  const secs = Math.max(0, Math.round(raw ?? clockSecsToClose()));
+  const stale = marketIsStale(market) || !!market?.provisional;
+  renderCountdown(secs, stale);
+  updateTimerRing(secs, market, stale);
+
+  // Poll hard near boundary / while market is stale so the real slug lands fast.
+  const wantFast = !isLive && (secs <= 20 || stale || feedReconnecting);
+  if (wantFast && !tickCountdown._fast) {
     tickCountdown._fast = true;
     clearInterval(pollTimer);
-    pollTimer = setInterval(pollStatus, 400);
-  } else if (secs > 15 && tickCountdown._fast) {
+    pollTimer = setInterval(pollStatus, POLL_FAST_MS);
+  } else if (!wantFast && tickCountdown._fast) {
     tickCountdown._fast = false;
     clearInterval(pollTimer);
     pollTimer = setInterval(pollStatus, POLL_MS);
   }
 }
 
-function renderCountdown(secs) {
+function renderCountdown(secs, stale) {
   const el = document.getElementById("countdown");
   const label = document.querySelector(".timer-label");
-  const rolling = secs <= 0 && feedReconnecting;
+  // Never freeze on 0:00 for half a minute — clock fallback already gives secs > 0
+  // after rollover. "Loading" only when truly at the exact boundary.
+  const atBoundary = secs <= 0;
+  const loading = !!stale && secs > 290;
 
   if (el) {
-    el.textContent = rolling ? "0:00" : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
-    el.classList.toggle("rolling", rolling);
+    el.textContent = atBoundary
+      ? "0:00"
+      : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    el.classList.toggle("rolling", atBoundary || loading);
   }
-  if (label) label.textContent = rolling ? "rolling over" : "to close";
+  if (label) {
+    if (atBoundary) label.textContent = "rolling over";
+    else if (loading) label.textContent = "loading market";
+    else label.textContent = "to close";
+  }
 }
 
-function updateTimerRing(secs, market) {
+function updateTimerRing(secs, market, stale) {
   const ring = document.getElementById("ring-fg");
   if (!ring) return;
   const total = market?.candle_duration_sec || CANDLE_SEC;
-  const rolling = secs <= 0 && feedReconnecting;
-  const elapsed = rolling ? 1 : Math.max(0, Math.min(1, 1 - secs / total));
+  const atBoundary = secs <= 0;
+  const elapsed = atBoundary ? 1 : Math.max(0, Math.min(1, 1 - secs / total));
   ring.style.strokeDashoffset = String(RING_LEN * (1 - elapsed));
-  ring.classList.toggle("urgent", !rolling && secs < 30);
-  ring.classList.toggle("rolling", rolling);
+  ring.classList.toggle("urgent", !atBoundary && secs < 30);
+  ring.classList.toggle("rolling", atBoundary || !!stale);
 }
 
 function updateWallet(d) {
   const a = d.account || {};
+  const s = d.strategy || {};
   const connected = !!a.connected;
+  const isPaper = (a.mode || d.mode || "paper") !== "live";
 
-  setText("wallet-balance", a.balance_usdc != null ? `$${Number(a.balance_usdc).toFixed(2)}` : "—");
+  const balLabel = document.getElementById("wallet-balance-label");
+  if (balLabel) balLabel.textContent = isPaper ? "Paper equity" : "USDC Balance";
+
+  const equity = a.paper_equity != null ? a.paper_equity : a.balance_usdc;
+  setText("wallet-balance", equity != null ? `$${Number(equity).toFixed(2)}` : "—");
   setText("wallet-funder", fmtAddr(a.funder_address));
   setText("wallet-signer", fmtAddr(a.signer_address));
   setText("wallet-type", a.signature_label || "—");
   setText("wallet-mode", (a.mode || d.mode || "paper").toUpperCase());
+  setText("wallet-strategy", s.name || "Signull 1.0");
+  const thr = s.params?.threshold;
+  setText("wallet-threshold", thr != null ? `${(Number(thr) * 100).toFixed(0)}¢ limit` : "—");
 
   const statusEl = document.getElementById("wallet-status");
   if (statusEl) {
-    statusEl.textContent = connected ? "Connected" : "Not connected";
-    statusEl.className = "wallet-pill " + (connected ? "ok" : "off");
+    if (isPaper) {
+      statusEl.textContent = "Paper · live markets";
+      statusEl.className = "wallet-pill ok";
+    } else {
+      statusEl.textContent = connected ? "Connected" : "Not connected";
+      statusEl.className = "wallet-pill " + (connected ? "ok" : "off");
+    }
   }
 
   const tipsEl = document.getElementById("wallet-tips");

@@ -55,8 +55,7 @@ def _parse_json_field(value) -> list:
 
 def _current_candle_start_ts() -> int:
     """Unix timestamp of the current 5M window's start (slug encodes this value)."""
-    now = datetime.now(timezone.utc).timestamp()
-    return math.floor(now / 300) * 300
+    return expected_candle_start_ts()
 
 
 def _slug_for(asset: str, start_ts: int) -> str:
@@ -118,12 +117,55 @@ def get_candle_at(asset: str, start_ts: int) -> CandleMarket | None:
     return _safe_load_event(_slug_for(asset, start_ts))
 
 
-def get_next_candle(asset: str, current: CandleMarket | None = None) -> CandleMarket | None:
-    """Return the candle after *current*, or the best open window from now."""
+def expected_candle_start_ts(now: float | None = None) -> int:
+    """UTC-aligned 5m window start for *now*."""
+    t = time.time() if now is None else float(now)
+    return math.floor(t / CANDLE_DURATION) * CANDLE_DURATION
+
+
+def provisional_market_dict(asset: str, start_ts: int | None = None) -> dict:
+    """
+    Clock-based market stub so the dashboard can roll the countdown immediately
+    even before Gamma lists the new event / WS resubscribes.
+    """
+    start = int(start_ts if start_ts is not None else expected_candle_start_ts())
+    end_ts = start + CANDLE_DURATION
+    end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    secs = max(0.0, (end - now).total_seconds())
+    return {
+        "slug": _slug_for(asset, start),
+        "title": f"{asset.upper()} Up or Down 5m (loading…)",
+        "end_date": end.isoformat(),
+        "condition_id": "",
+        "up_token_id": "",
+        "down_token_id": "",
+        "up_price": 0.5,
+        "down_price": 0.5,
+        "tick_size": "0.01",
+        "accepting_orders": False,
+        "seconds_to_close": secs,
+        "candle_start_ts": start,
+        "candle_duration_sec": CANDLE_DURATION,
+        "provisional": True,
+    }
+
+
+def get_next_candle(
+    asset: str,
+    current: CandleMarket | None = None,
+    *,
+    max_wait_sec: float = 0.6,
+) -> CandleMarket | None:
+    """Return the candle after *current*, or the best open window from now.
+
+    *max_wait_sec* bounds Gamma polling so the feed/bot never block for tens
+    of seconds waiting for a listing (dashboard uses clock fallback meanwhile).
+    """
     if current is not None:
         targets = [current.candle_start_ts + CANDLE_DURATION]
     else:
-        base = _current_candle_start_ts()
+        base = expected_candle_start_ts()
         targets = [base, base + CANDLE_DURATION]
 
     for start_ts in targets:
@@ -131,13 +173,14 @@ def get_next_candle(asset: str, current: CandleMarket | None = None) -> CandleMa
         if market is not None and market.seconds_to_close > 0:
             return market
 
-    # Aggressive poll — next window is usually listed before the prior one closes.
+    # Short poll — next window is often listed just before/after the rollover.
     start_ts = targets[-1]
-    for _ in range(40):
+    deadline = time.time() + max(0.0, max_wait_sec)
+    while time.time() < deadline:
         market = get_candle_at(asset, start_ts)
         if market is not None:
             return market
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     return _find_imminent_candle(asset)
 
@@ -149,7 +192,7 @@ def get_current_candle(asset: str) -> CandleMarket | None:
     Each candle's event slug is `{asset}-updown-5m-{start_unix_ts}` where the
     timestamp is the window start time aligned to 5-minute boundaries.
     """
-    start_ts = _current_candle_start_ts()
+    start_ts = expected_candle_start_ts()
 
     # Prefer the window that should be open right now.
     for candidate_ts in (start_ts, start_ts - CANDLE_DURATION):
@@ -157,8 +200,8 @@ def get_current_candle(asset: str) -> CandleMarket | None:
         if market is not None and market.seconds_to_close > 0:
             return market
 
-    # Current window ended — jump to the next one immediately.
-    next_market = get_next_candle(asset)
+    # Current window ended — jump to the next one immediately (short wait).
+    next_market = get_next_candle(asset, max_wait_sec=0.4)
     if next_market is not None:
         return next_market
 
@@ -210,3 +253,93 @@ def market_to_dict(market: CandleMarket) -> dict:
     data["candle_start_ts"] = market.candle_start_ts
     data["candle_duration_sec"] = market.candle_duration_sec
     return data
+
+
+def resolve_candle_winner(
+    asset: str,
+    start_ts: int,
+    *,
+    require_resolved: bool = True,
+) -> str | None:
+    """
+    Resolve a closed 5m candle to "up" or "down" via Gamma outcome prices.
+
+    When *require_resolved* is True (default), only accept a winner once a side
+    is clearly settled (≥0.95). Mid-candle / pre-resolution prices like 0.67/0.33
+    intentionally return None so callers can wait or use a better fallback.
+    """
+    slug = _slug_for(asset, int(start_ts))
+    try:
+        resp = requests.get(
+            f"{GAMMA_HOST}/events/slug/{slug}",
+            headers=HEADERS,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        event = resp.json()
+        markets = event.get("markets") or []
+        if not markets:
+            return None
+        m = markets[0]
+        outcomes = _parse_json_field(m.get("outcomes"))
+        prices = _parse_json_field(m.get("outcomePrices"))
+        if len(outcomes) != 2 or len(prices) != 2:
+            return None
+        up_idx = outcomes.index("Up") if "Up" in outcomes else 0
+        down_idx = 1 - up_idx
+        up_p = float(prices[up_idx])
+        down_p = float(prices[down_idx])
+        closed = bool(event.get("closed") or m.get("closed"))
+        return _winner_from_prices(
+            up_p,
+            down_p,
+            strict=require_resolved and not closed,
+        )
+    except (requests.RequestException, ValueError, TypeError, IndexError, KeyError):
+        return None
+
+
+def _winner_from_prices(
+    up: float,
+    down: float,
+    *,
+    strict: bool = True,
+) -> str | None:
+    """
+    Map outcome prices to a winner.
+
+    *strict*: only accept near-binary settlement (≥0.95). Soft mode (closed
+    markets) still requires a clear lead (≥0.90) — never treat 0.67/0.33 as final.
+    """
+    if up >= 0.95 and down <= 0.05:
+        return "up"
+    if down >= 0.95 and up <= 0.05:
+        return "down"
+    if not strict:
+        if up >= 0.90 and up > down:
+            return "up"
+        if down >= 0.90 and down > up:
+            return "down"
+    return None
+
+
+def winner_from_ticks(ticks: list[tuple[int, float, float]]) -> str | None:
+    """Infer winner from the last path prints of a candle (near-close mids)."""
+    if not ticks:
+        return None
+    # Prefer the last few samples in case the final print is noisy
+    tail = ticks[-5:]
+    up = sum(t[1] for t in tail) / len(tail)
+    down = sum(t[2] for t in tail) / len(tail)
+    if up >= 0.90 and up > down:
+        return "up"
+    if down >= 0.90 and down > up:
+        return "down"
+    # Extreme last print
+    _t, lu, ld = ticks[-1]
+    if lu >= 0.95 and lu > ld:
+        return "up"
+    if ld >= 0.95 and ld > lu:
+        return "down"
+    return None

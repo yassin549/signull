@@ -46,9 +46,17 @@ function onStrategyChange() {
 function gatherParams() {
   const params = {};
   document.querySelectorAll("[data-param]").forEach(el => {
-    params[el.dataset.param] = parseFloat(el.value);
+    const v = parseFloat(el.value);
+    if (!Number.isNaN(v)) params[el.dataset.param] = v;
   });
   return params;
+}
+
+function formatParams(params) {
+  if (!params || typeof params !== "object") return "";
+  return Object.entries(params)
+    .map(([k, v]) => `${k}=${typeof v === "number" ? Number(v.toPrecision(4)) : v}`)
+    .join(" · ");
 }
 
 async function runBacktest() {
@@ -100,25 +108,36 @@ function renderResult(r) {
   setText("stat-dd", `-${r.max_drawdown_pct.toFixed(2)}%`, "down");
   setText("stat-pf", r.profit_factor >= 999 ? "∞" : r.profit_factor.toFixed(2));
   setText("stat-avg", `+$${r.avg_win.toFixed(2)} / -$${Math.abs(r.avg_loss).toFixed(2)}`);
-  setText("run-meta", `${r.elapsed_ms.toFixed(0)} ms · ${r.candles_loaded} candles · ${r.strategy_name}`);
+  const paramStr = formatParams(r.params);
+  setText(
+    "run-meta",
+    `${r.elapsed_ms.toFixed(0)} ms · ${r.candles_loaded} candles · ${r.strategy_name}`
+      + (paramStr ? ` · ${paramStr}` : "")
+  );
   setText("trade-count", `${r.trades.length} trades`);
 
   const body = document.getElementById("trade-body");
   if (!r.trades.length) {
     body.innerHTML = '<div class="placeholder">No trades triggered</div>';
   } else {
-    body.innerHTML = r.trades.slice().reverse().map(t => `
-      <div class="trade-row ${t.won ? "win" : "loss"}">
-        <span title="${t.candle_title}">${shortTitle(t.candle_title)}</span>
+    body.innerHTML = r.trades.slice().reverse().map(t => {
+      // Binary win PnL = stake * (1 - entry) / entry  (e.g. $50 @ 0.70 → +$21.43)
+      const expWin = t.entry_price > 0 ? t.stake * (1 - t.entry_price) / t.entry_price : 0;
+      const pnlTitle = t.won
+        ? `Win @ ${t.entry_price}: stake/price shares settle at $1 → +$${expWin.toFixed(2)}`
+        : `Loss @ ${t.entry_price}: stake lost → -$${Number(t.stake).toFixed(2)}`;
+      return `
+      <div class="trade-row ${t.won ? "win" : "loss"}" title="${escapeAttr(t.reason || "")}">
+        <span title="${escapeAttr(t.candle_title)}">${shortTitle(t.candle_title)}</span>
         <span class="side ${t.side}">${t.side.toUpperCase()}</span>
-        <span>${t.entry_price.toFixed(3)}</span>
+        <span title="Limit fill price">${Number(t.entry_price).toFixed(2)}</span>
         <span class="size ${t.size_label || ""}" title="${t.risk_pct != null ? t.risk_pct + "% of initial" : ""}">${formatSize(t)}</span>
-        <span>$${t.stake.toFixed(2)}</span>
+        <span>$${Number(t.stake).toFixed(2)}</span>
         <span>${t.won ? "WIN" : "LOSS"}</span>
-        <span class="pnl">${t.pnl >= 0 ? "+" : ""}$${t.pnl.toFixed(2)}</span>
-        <span>$${t.equity_after.toFixed(2)}</span>
-      </div>
-    `).join("");
+        <span class="pnl" title="${pnlTitle}">${t.pnl >= 0 ? "+" : ""}$${Number(t.pnl).toFixed(2)}</span>
+        <span>$${Number(t.equity_after).toFixed(2)}</span>
+      </div>`;
+    }).join("");
   }
 
   requestAnimationFrame(() => drawEquity(r.equity_curve, r.initial_capital));
@@ -133,6 +152,14 @@ function formatSize(t) {
 function shortTitle(title) {
   const m = title.match(/(\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M\s*ET)/i);
   return m ? m[1] : title.slice(0, 28);
+}
+
+function escapeAttr(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function setText(id, val, cls) {
