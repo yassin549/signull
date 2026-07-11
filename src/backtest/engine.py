@@ -49,6 +49,7 @@ def run_backtest(
     trades: list[TradeRecord] = []
     equity_curve: list[dict[str, float]] = [{"idx": 0, "equity": capital}]
     recent_outcomes: list[bool] = []
+    wins_streak = 0
     losses_streak = 0
     equity_hist: list[float] = [capital]
 
@@ -63,6 +64,7 @@ def run_backtest(
             initial_capital,
             peak,
             wins_recent=wins_recent,
+            wins_streak=wins_streak,
             losses_streak=losses_streak,
             equity_momentum=mom,
         )
@@ -125,8 +127,10 @@ def run_backtest(
             reason = f"{reason} · {size_label} ({risk_frac:.0%} of initial)"
 
         if won:
+            wins_streak += 1
             losses_streak = 0
         else:
+            wins_streak = 0
             losses_streak += 1
         recent_outcomes.append(won)
         if len(recent_outcomes) > 10:

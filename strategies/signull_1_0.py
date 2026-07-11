@@ -22,6 +22,9 @@ Size big only when ALL hold:
 
 from __future__ import annotations
 
+import threading
+import time
+
 from strategies.base import CandleContext, Strategy, StrategyMeta, TickContext, TradeSignal
 from src.ml.btc_features import btc_momentum_align, fetch_klines, window_features
 
@@ -151,12 +154,13 @@ class Signull10Strategy(Strategy):
         description=(
             "Signull 1.0: resting limit at 70¢ (default). Favorite thr (≥50¢): "
             "fill only when a side RISES to ≥ thr. Underdog thr (<50¢): fill only "
-            "when a side DROPS to ≤ thr. Binary sizing via BTC align + path trust "
-            "+ equity buffer."
+            "when a side DROPS to ≤ thr. Binary sizing via spot-chart align + path "
+            "trust + equity buffer."
         ),
         default_params={
             "threshold": 0.70,
             "min_risk_pct": 0.05,
+            "hot_streak_risk_pct": 0.25,
             "max_risk_pct": 0.50,
             "trust_lookback": 3,
             "btc_align_min": 0.55,
@@ -165,15 +169,38 @@ class Signull10Strategy(Strategy):
         },
     )
 
-    def __init__(self, params: dict | None = None):
+    def __init__(self, params: dict | None = None, *, asset: str = "btc"):
         super().__init__(params)
         self._normalize_params()
+        self._asset = (asset or "btc").lower()
         self._klines: list | None = None
         self._klines_fetched_at: float = 0.0
+        self._klines_lock = threading.Lock()
+        self._klines_refreshing = False
         self._noisy_by_slug: dict[str, bool] = {}
         self._slug_order: list[str] = []
         self._slug_to_idx: dict[str, int] = {}
         self._last_size_label: str = "small"
+
+    def _klines_are_fresh_locked(self, now: float | None = None) -> bool:
+        """Caller must hold `_klines_lock`. Empty/None is never fresh."""
+        t = time.time() if now is None else now
+        return bool(self._klines) and (t - self._klines_fetched_at) < 45
+
+    def _store_klines_result_locked(self, rows: list | None) -> None:
+        """Caller must hold `_klines_lock`. Only non-empty series is cached."""
+        if rows:
+            self._klines = rows
+            self._klines_fetched_at = time.time()
+        else:
+            self._klines = None
+            self._klines_fetched_at = 0.0
+
+    def _fetch_klines_rows(self, around_ts: int | None) -> list:
+        btc_lb = int(self.params.get("btc_lookback", BTC_LOOKBACK))
+        end = int(around_ts if around_ts is not None else time.time())
+        start = end - btc_lb * 60 - 180
+        return fetch_klines(start, end + 60, asset=self._asset) or []
 
     def register_closed_candle(
         self,
@@ -211,16 +238,48 @@ class Signull10Strategy(Strategy):
         self._noisy_by_slug.setdefault(slug, False)
 
     def refresh_btc_klines(self, around_ts: int | None = None) -> None:
-        import time
+        """Synchronous kline fetch. Empty/failed results are not cached."""
+        with self._klines_lock:
+            if self._klines_are_fresh_locked():
+                return
+            if self._klines_refreshing:
+                return
+            self._klines_refreshing = True
+        try:
+            rows = self._fetch_klines_rows(around_ts)
+            with self._klines_lock:
+                self._store_klines_result_locked(rows)
+        finally:
+            with self._klines_lock:
+                self._klines_refreshing = False
 
-        now = time.time()
-        if self._klines is not None and (now - self._klines_fetched_at) < 45:
-            return
-        btc_lb = int(self.params.get("btc_lookback", BTC_LOOKBACK))
-        end = int(around_ts or now)
-        start = end - btc_lb * 60 - 180
-        self._klines = fetch_klines(start, end + 60)
-        self._klines_fetched_at = now
+    def schedule_klines_refresh(self, around_ts: int | None = None) -> None:
+        """Kick a background kline refresh so the trading tick never blocks on HTTP.
+
+        At most one refresh thread is in flight; empty/failed caches do not
+        suppress retries (see refresh_btc_klines / _store_klines_result_locked).
+        """
+        with self._klines_lock:
+            if self._klines_are_fresh_locked():
+                return
+            if self._klines_refreshing:
+                return
+            self._klines_refreshing = True
+
+        def _worker() -> None:
+            try:
+                rows = self._fetch_klines_rows(around_ts)
+                with self._klines_lock:
+                    self._store_klines_result_locked(rows)
+            finally:
+                with self._klines_lock:
+                    self._klines_refreshing = False
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="signull-klines",
+        ).start()
 
     def _normalize_params(self) -> None:
         p = self.params
@@ -235,6 +294,7 @@ class Signull10Strategy(Strategy):
 
         for key, default in (
             ("min_risk_pct", 0.05),
+            ("hot_streak_risk_pct", 0.25),
             ("max_risk_pct", 0.50),
             ("btc_align_min", 0.55),
             ("big_equity_buffer", 1.25),
@@ -278,7 +338,10 @@ class Signull10Strategy(Strategy):
         btc_lb = int(self.params.get("btc_lookback", BTC_LOOKBACK))
         t_min = candles[0].start_ts - btc_lb * 60 - 120
         t_max = candles[-1].end_ts + 60
-        self._klines = fetch_klines(t_min, t_max)
+        rows = fetch_klines(t_min, t_max, asset=self._asset)
+        with self._klines_lock:
+            self._store_klines_result_locked(rows)
+            self._klines_refreshing = False
 
     def _recent_trustworthy(self, candle: CandleContext) -> tuple[bool, int, int]:
         lookback = int(self.params["trust_lookback"])
@@ -297,15 +360,20 @@ class Signull10Strategy(Strategy):
 
     def _btc_aligned(self, entry_ts: int, side: str) -> tuple[bool, float]:
         btc_lb = int(self.params.get("btc_lookback", BTC_LOOKBACK))
-        if self._klines is None:
-            self.refresh_btc_klines(entry_ts)
+        with self._klines_lock:
+            klines = list(self._klines) if self._klines else None
+        if not klines:
+            # Avoid blocking the hot path: schedule refresh; size small until ready.
+            self.schedule_klines_refresh(entry_ts)
+            return False, 0.5
 
-        feats = window_features(self._klines or [], entry_ts, lookback=btc_lb)
+        feats = window_features(klines, entry_ts, lookback=btc_lb)
         if feats is None:
-            self._klines = None
-            self.refresh_btc_klines(entry_ts)
-            feats = window_features(self._klines or [], entry_ts, lookback=btc_lb)
-        if feats is None:
+            # Stale/insufficient series — drop cache so refresh can recover.
+            with self._klines_lock:
+                self._klines = None
+                self._klines_fetched_at = 0.0
+            self.schedule_klines_refresh(entry_ts)
             return False, 0.5
 
         align = btc_momentum_align(feats, side)
@@ -355,7 +423,18 @@ class Signull10Strategy(Strategy):
         candle: CandleContext,
     ) -> float:
         lo = float(self.params["min_risk_pct"])
+        hot_streak_risk = float(self.params["hot_streak_risk_pct"])
         hi = float(self.params["max_risk_pct"])
+
+        # This is deliberately an exact streak, not a count of wins in a
+        # rolling window.  The higher stake applies to wins 4 and 5 only.
+        if self._wins_streak in (3, 4):
+            self._last_size_label = "hot-streak"
+            signal.reason = (
+                f"{signal.reason} · {self._wins_streak}-win streak "
+                f"→ {hot_streak_risk:.0%} of initial"
+            )
+            return hot_streak_risk
 
         trustworthy, noisy_n, looked = self._recent_trustworthy(candle)
         btc_ok, align = self._btc_aligned(tick.t, signal.side)

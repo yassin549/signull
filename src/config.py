@@ -9,6 +9,8 @@ CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
 
+# Supported Up/Down 5m series. Price feed + Binance klines map to the same keys
+# (btc/eth/sol/xrp); unknown ASSET values are rejected at config load.
 SERIES_SLUGS = {
     "btc": "btc-up-or-down-5m",
     "eth": "eth-up-or-down-5m",

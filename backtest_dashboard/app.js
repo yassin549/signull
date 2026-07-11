@@ -69,7 +69,7 @@ async function runBacktest() {
   const body = {
     strategy_id: selectedId,
     asset: document.getElementById("asset-select").value,
-    candle_count: parseInt(document.getElementById("candle-count").value, 10),
+    candle_count: parseInt(document.getElementById("data-period").value, 10),
     initial_capital: parseFloat(document.getElementById("initial-capital").value),
     params: gatherParams(),
     use_cache: true,
@@ -109,9 +109,10 @@ function renderResult(r) {
   setText("stat-pf", r.profit_factor >= 999 ? "∞" : r.profit_factor.toFixed(2));
   setText("stat-avg", `+$${r.avg_win.toFixed(2)} / -$${Math.abs(r.avg_loss).toFixed(2)}`);
   const paramStr = formatParams(r.params);
+  const dataWindow = formatDataWindow(r.data_start_ts, r.data_end_ts);
   setText(
     "run-meta",
-    `${r.elapsed_ms.toFixed(0)} ms · ${r.candles_loaded} candles · ${r.strategy_name}`
+    `${dataWindow} · ${r.candles_loaded} candles · ${r.strategy_name} · ${r.elapsed_ms.toFixed(0)} ms`
       + (paramStr ? ` · ${paramStr}` : "")
   );
   setText("trade-count", `${r.trades.length} trades`);
@@ -147,6 +148,17 @@ function formatSize(t) {
   if (t.size_label) return `${t.size_label} · ${t.risk_pct}%`;
   if (t.risk_pct != null) return `${t.risk_pct}%`;
   return "—";
+}
+
+function formatDataWindow(startTs, endTs) {
+  if (!Number.isFinite(startTs) || !Number.isFinite(endTs)) return "Data window unavailable";
+  const options = {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    hour12: false,
+  };
+  const start = new Date(startTs * 1000).toLocaleString([], options);
+  const end = new Date(endTs * 1000).toLocaleString([], options);
+  return `${start} – ${end}`;
 }
 
 function shortTitle(title) {

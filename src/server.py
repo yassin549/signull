@@ -46,7 +46,9 @@ class BroadcastHub:
                 # The browser retains history between messages; a short tail is
                 # enough for recovery and avoids serializing thousands of chart
                 # points for every market update/client.
-                payload = self.state.get_snapshot(history_points=120)
+                # 240 pts @ ~20 Hz ≈ 12s tail — enough for client merge recovery
+                # without shipping multi-minute series every 50ms.
+                payload = self.state.get_snapshot(history_points=240)
                 dead: list[WebSocket] = []
                 for ws in list(self.clients):
                     try:
@@ -64,7 +66,7 @@ class BotService:
         self.state = BotState()
         self.hub = BroadcastHub(self.state, config.dashboard_push_ms)
         self.feed = MarketFeed(config, self.state)
-        self.btc_feed = BtcPriceFeed(self.state)
+        self.btc_feed = BtcPriceFeed(self.state, asset=config.asset)
         self._bot: TradingBot | None = None
         self._thread: threading.Thread | None = None
         self._feed_task: asyncio.Task | None = None

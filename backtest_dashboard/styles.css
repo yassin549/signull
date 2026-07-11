@@ -244,6 +244,7 @@ body {
 .trade-row .size.small { color: var(--muted); }
 .trade-row .size.medium { color: var(--amber); }
 .trade-row .size.big { color: var(--blue); font-weight: 600; }
+.trade-row .size.hot-streak { color: var(--purple); font-weight: 700; }
 
 .placeholder {
   padding: 24px;

@@ -103,7 +103,12 @@ class MarketFeed:
             await asyncio.sleep(0.25)
             beat = self.state.get_btc_price()
             if beat is not None:
-                self.state.set_price_to_beat(beat)
+                start = (
+                    self._active_market.candle_start_ts
+                    if self._active_market is not None
+                    else None
+                )
+                self.state.set_price_to_beat(beat, candle_start_ts=start)
                 return
 
     def _push_provisional_now(self) -> None:
@@ -211,6 +216,9 @@ class MarketFeed:
             return
 
     async def _switch_candle(self, market: CandleMarket) -> None:
+        prev_start = (
+            self._active_market.candle_start_ts if self._active_market is not None else None
+        )
         self._active_slug = market.slug
         self._active_market = market
         self._provisional_pushed_for = market.candle_start_ts
@@ -219,9 +227,14 @@ class MarketFeed:
             market.down_token_id: "down",
         }
         beat = self.state.get_btc_price()
-        self.state.clear_market_data()
+        # Freeze closed-window beat/oracle before wiping price_to_beat so
+        # bot settlement never reads the next open (feed may roll first).
+        self.state.clear_market_data(closing_start_ts=prev_start)
         if beat is not None:
-            self.state.set_price_to_beat(beat)
+            # Lock beat to this candle start — bot must not overwrite later.
+            self.state.set_price_to_beat(
+                beat, candle_start_ts=market.candle_start_ts
+            )
         else:
             asyncio.create_task(self._capture_beat_when_ready())
         self.state.update(

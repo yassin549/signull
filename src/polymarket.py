@@ -25,10 +25,27 @@ class PolymarketClient:
         self.config = config
         self._client: ClobClient | None = None
         self._authenticated = False
+        self.auth_error: str | None = None
 
-        if config.has_wallet:
-            self._client = self._build_trading_client()
-            self._authenticated = True
+        # Paper trading only needs the public market-data client.  In
+        # particular, do not derive CLOB credentials at server startup just
+        # because a developer happens to have wallet variables in ``.env``.
+        # Credential derivation is a network call and a transient failure used
+        # to prevent even the paper dashboard from starting.
+        if config.has_wallet and (config.is_live or force_auth):
+            try:
+                self._client = self._build_trading_client()
+                self._authenticated = True
+            except Exception as exc:
+                # Keep the market-data server and dashboard available when the
+                # CLOB is slow or wallet settings are invalid.  The bot will
+                # refuse live orders while unauthenticated.  Explicit wallet
+                # verification still raises so it can report the real cause.
+                if force_auth:
+                    raise
+                self.auth_error = str(exc)
+                logger.warning("CLOB authentication unavailable: %s", exc)
+                self._client = ClobClient(CLOB_HOST, chain_id=CHAIN_ID)
         else:
             self._client = ClobClient(CLOB_HOST, chain_id=CHAIN_ID)
 

@@ -32,7 +32,12 @@ def _run_backtest(req: BacktestRequest) -> dict:
     candles = fetch_candles(asset=req.asset, count=req.candle_count, use_cache=req.use_cache)
     if not candles:
         raise LookupError("No resolved candles found for backtest")
-    return run_backtest(strategy, candles, initial_capital=req.initial_capital).to_dict()
+    result = run_backtest(strategy, candles, initial_capital=req.initial_capital).to_dict()
+    # A requested period can contain gaps when a historical event is unavailable,
+    # so return the exact resolved window that the engine received.
+    result["data_start_ts"] = candles[0].start_ts
+    result["data_end_ts"] = candles[-1].end_ts
+    return result
 
 
 def create_backtest_app() -> FastAPI:

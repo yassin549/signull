@@ -215,10 +215,12 @@ def fetch_candles(
     to_fetch: list[int] = []
 
     for start_ts in starts:
-        if use_cache and _load_cache(asset, start_ts) is not None:
-            candles.append(_load_cache(asset, start_ts))  # type: ignore[arg-type]
-        else:
-            to_fetch.append(start_ts)
+        if use_cache:
+            cached = _load_cache(asset, start_ts)
+            if cached is not None:
+                candles.append(cached)
+                continue
+        to_fetch.append(start_ts)
 
     if to_fetch:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:

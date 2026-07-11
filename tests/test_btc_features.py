@@ -12,6 +12,21 @@ class WindowFeaturesTests(unittest.TestCase):
         self.assertIsNotNone(features)
         self.assertEqual(float(features[-1, 0]), 0.0)
 
+    def test_sorted_bulk_path_matches_unsorted(self):
+        bars = []
+        for i in range(70):
+            c = 1000.0 + i
+            bars.append((i * 60_000, c, c + 1, c - 1, c + 0.5, 2.0))
+        entry = 65 * 60
+        a = window_features(bars, entry, lookback=60)
+        b = window_features(list(reversed(bars)), entry, lookback=60)
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(b)
+        self.assertEqual(a.shape, b.shape)
+        for i in range(a.shape[0]):
+            for j in range(a.shape[1]):
+                self.assertAlmostEqual(float(a[i, j]), float(b[i, j]), places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

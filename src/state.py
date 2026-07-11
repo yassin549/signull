@@ -48,6 +48,17 @@ class BotSnapshot:
     strategy_trades: list[dict[str, Any]] = field(default_factory=list)
 
 
+def slice_history_tail(history: list | deque, history_points: int) -> list:
+    """Return the last *history_points* items; non-positive length → empty list.
+
+    Python's ``seq[-0:]`` is the full sequence, so callers must not use a bare
+    negative slice when ``history_points`` may be 0.
+    """
+    if history_points is None or history_points <= 0:
+        return []
+    return list(history)[-history_points:]
+
+
 class BotState:
     def __init__(self, max_log_entries: int = 200, max_history: int = 7200, max_trades: int = 100):
         self._lock = threading.Lock()
@@ -55,6 +66,9 @@ class BotState:
         self._log: deque[ActivityEntry] = deque(maxlen=max_log_entries)
         self._price_history: deque[dict] = deque(maxlen=max_history)
         self._btc_history: deque[dict] = deque(maxlen=max_history)
+        # Account values are sparse compared with market data. Keeping a
+        # separate bounded series provides the dashboard equity curve.
+        self._equity_history: deque[dict] = deque(maxlen=max_history)
         self._price_to_beat: float | None = None
         self._bot_stop = threading.Event()
         self._shutdown = threading.Event()
@@ -64,10 +78,15 @@ class BotState:
         self._feed_window_count = 0
         self._last_history_append = 0.0
         self._last_btc_append = 0.0
+        self._last_equity_append = 0.0
         self._history_interval = 0.05  # 20 chart points/sec
         self._btc_history_interval = 0.05  # 20 chart points/sec
         self._last_btc_display: float | None = None
         self._last_chainlink: float | None = None
+        self._binance_wall_ts: float = 0.0  # wall clock of last Binance tick
+        self._beat_candle_start: int | None = None  # beat locked to this window
+        # Closed-candle beat/oracle keyed by candle start_ts (survives clear).
+        self._frozen_resolution_refs: dict[int, dict[str, float | None]] = {}
 
     def request_bot_stop(self) -> None:
         self._bot_stop.set()
@@ -114,8 +133,27 @@ class BotState:
             for key, value in kwargs.items():
                 if hasattr(self._snapshot, key):
                     setattr(self._snapshot, key, value)
+            if "account" in kwargs and kwargs["account"]:
+                self._append_equity_locked(kwargs["account"])
             self._bump()
             return self._snapshot
+
+    def _append_equity_locked(self, account: dict[str, Any]) -> None:
+        """Record paper equity or the latest observed live USDC balance."""
+        mode = str(account.get("mode") or self._snapshot.mode).lower()
+        raw = account.get("balance_usdc") if mode == "live" else account.get("paper_equity")
+        try:
+            equity = float(raw)
+        except (TypeError, ValueError):
+            return
+
+        now = time.time()
+        previous = self._equity_history[-1] if self._equity_history else None
+        # Preserve every balance move; otherwise retain a five-second sample.
+        if previous and previous["v"] == equity and now - self._last_equity_append < 5.0:
+            return
+        self._equity_history.append({"t": now, "v": round(equity, 4), "mode": mode})
+        self._last_equity_append = now
 
     def increment(self, field_name: str, amount: int = 1) -> None:
         with self._lock:
@@ -233,14 +271,95 @@ class BotState:
                     return float(val)
             return None
 
-    def set_price_to_beat(self, price: float) -> None:
+    def get_resolution_refs(self) -> dict[str, float | None]:
+        """Beat / chainlink / spot only — never copies price history."""
         with self._lock:
-            self._price_to_beat = price
+            return self._resolution_refs_locked()
+
+    def _resolution_refs_locked(self) -> dict[str, float | None]:
+        beat = self._price_to_beat
+        chainlink = self._last_chainlink
+        spot = self._last_btc_display
+        btc = self._snapshot.btc or {}
+        if chainlink is None and btc.get("chainlink") is not None:
+            chainlink = float(btc["chainlink"])
+        if spot is None and btc.get("price") is not None:
+            spot = float(btc["price"])
+        if beat is None and btc.get("price_to_beat") is not None:
+            beat = float(btc["price_to_beat"])
+        return {
+            "beat": float(beat) if beat is not None else None,
+            "chainlink": float(chainlink) if chainlink is not None else None,
+            "spot": float(spot) if spot is not None else None,
+        }
+
+    def freeze_resolution_refs(self, candle_start_ts: int) -> dict[str, float | None]:
+        """
+        Snapshot beat/oracle for a closing candle *before* clear_market_data.
+
+        Safe to call from feed and bot independently; first freeze wins so a
+        later rollover cannot overwrite closed-window refs with the next open.
+        """
+        key = int(candle_start_ts)
+        with self._lock:
+            existing = self._frozen_resolution_refs.get(key)
+            if existing is not None:
+                return dict(existing)
+            refs = self._resolution_refs_locked()
+            self._frozen_resolution_refs[key] = dict(refs)
+            # Bound memory: keep a few hours of 5m windows
+            if len(self._frozen_resolution_refs) > 120:
+                for old in sorted(self._frozen_resolution_refs.keys())[:-80]:
+                    self._frozen_resolution_refs.pop(old, None)
+            return dict(refs)
+
+    def get_frozen_resolution_refs(self, candle_start_ts: int) -> dict[str, float | None] | None:
+        with self._lock:
+            refs = self._frozen_resolution_refs.get(int(candle_start_ts))
+            return dict(refs) if refs is not None else None
+
+    def set_price_to_beat(
+        self,
+        price: float,
+        *,
+        candle_start_ts: int | None = None,
+        force: bool = False,
+        estimated: bool = False,
+    ) -> bool:
+        """
+        Lock the candle-open reference price for Δ charting / resolution UI.
+
+        Once set for a given *candle_start_ts*, further calls are ignored so the
+        bot cannot overwrite the feed's open beat a few seconds later (which
+        pinned Δ ≈ 0 for the rest of the candle).
+        """
+        with self._lock:
+            cs = int(candle_start_ts) if candle_start_ts is not None else None
+            if not force:
+                if (
+                    cs is not None
+                    and self._beat_candle_start == cs
+                    and self._price_to_beat is not None
+                ):
+                    return False
+                # Without a window id, never clobber an existing beat mid-candle.
+                if cs is None and self._price_to_beat is not None:
+                    return False
+
+            self._price_to_beat = float(price)
+            if cs is not None:
+                self._beat_candle_start = cs
             btc = dict(self._snapshot.btc or {})
-            btc.pop("beat_estimated", None)
+            if estimated:
+                btc["beat_estimated"] = True
+            else:
+                btc.pop("beat_estimated", None)
             self._snapshot.btc = btc
             self._sync_btc_locked()
+            # Seed chart immediately so the series never blanks at candle open.
+            self._append_btc_history_locked(time.time(), force=True)
             self._bump()
+            return True
 
     def set_btc_feed_status(self, connected: bool, error: str | None = None) -> None:
         with self._lock:
@@ -248,57 +367,103 @@ class BotState:
             self._bump()
 
     def update_btc_price(self, value: float, ts_ms: int) -> None:
-        """Fast display price (Polymarket Binance RTDS)."""
-        now = ts_ms / 1000.0
+        """Fast display price (Polymarket Binance RTDS) — drives the live chart.
+
+        Uses wall-clock timestamps (same clock as outcome price history) so the
+        two charts stay time-aligned. Exchange ``ts_ms`` is stored for lag UI.
+        """
+        wall = time.time()
         with self._lock:
             changed = self._last_btc_display != value
-            self._last_btc_display = value
-            self._append_btc_history_locked(now)
-            self._sync_btc_locked(price=value, updated_at=now)
-            if changed:
+            self._last_btc_display = float(value)
+            self._binance_wall_ts = wall
+            appended = self._append_btc_history_locked(wall, spot=float(value))
+            self._sync_btc_locked(
+                price=float(value),
+                updated_at=wall,
+                source_ts_ms=int(ts_ms),
+            )
+            # Bump on move *or* history sample so the dashboard keeps streaming
+            # even when the spot price is flat for a stretch.
+            if changed or appended:
                 self._bump()
 
     def update_btc_chainlink(self, value: float, ts_ms: int) -> None:
-        """Resolution oracle price — used for beat delta."""
-        now = ts_ms / 1000.0
+        """Resolution oracle — also backfills the chart if Binance goes silent."""
+        wall = time.time()
         with self._lock:
             if self._price_to_beat is None:
-                self._maybe_set_initial_beat_locked(value, now)
+                self._maybe_set_initial_beat_locked(float(value), wall)
             changed = self._last_chainlink != value
-            self._last_chainlink = value
-            self._append_btc_history_locked(now)
-            self._sync_btc_locked(chainlink=value, chainlink_at=now)
-            if changed:
+            self._last_chainlink = float(value)
+            # Chart from oracle when Binance has never ticked or is stale (>2s).
+            binance_stale = (
+                self._last_btc_display is None
+                or (wall - self._binance_wall_ts) > 2.0
+            )
+            appended = False
+            if binance_stale:
+                appended = self._append_btc_history_locked(wall, spot=float(value))
+            self._sync_btc_locked(
+                chainlink=float(value),
+                chainlink_at=wall,
+                source_ts_ms=int(ts_ms),
+            )
+            if changed or appended:
                 self._bump()
 
-    def _append_btc_history_locked(self, now: float) -> None:
-        if now - self._last_btc_append < self._btc_history_interval:
-            return
+    def _append_btc_history_locked(
+        self,
+        now: float,
+        *,
+        force: bool = False,
+        spot: float | None = None,
+    ) -> bool:
+        """
+        Append a chart sample.
+
+        Prefer explicit *spot* (caller-chosen Binance or stale-fallback Chainlink).
+        Always stores absolute ``v``; ``d`` when beat is known.
+        """
+        if not force and now - self._last_btc_append < self._btc_history_interval:
+            return False
+
+        if spot is None:
+            # Prefer fresh Binance; else last known Chainlink.
+            if self._last_btc_display is not None and (now - self._binance_wall_ts) <= 2.0:
+                spot = self._last_btc_display
+            else:
+                spot = self._last_btc_display if self._last_btc_display is not None else self._last_chainlink
+        if spot is None:
+            return False
+
+        point: dict[str, float] = {"t": now, "v": round(float(spot), 2)}
         beat = self._price_to_beat
-        if beat is None:
-            return
-        ref = self._last_chainlink if self._last_chainlink is not None else self._last_btc_display
-        if ref is None:
-            return
-        point: dict = {"t": now, "d": round(ref - beat, 2)}
-        if self._last_btc_display is not None:
-            point["v"] = self._last_btc_display
+        if beat is not None:
+            point["d"] = round(float(spot) - float(beat), 2)
+
         self._btc_history.append(point)
         self._last_btc_append = now
+        return True
 
     def _maybe_set_initial_beat_locked(self, price: float, now: float) -> None:
+        """Only when beat is still unset — lock to market candle window if known."""
+        if self._price_to_beat is not None:
+            return
         market = self._snapshot.market
-        if not market:
-            return
-        start = market.get("candle_start_ts")
-        if not start:
-            return
-        self._price_to_beat = price
-        elapsed = now - float(start)
-        if elapsed > 30:
+        start = market.get("candle_start_ts") if market else None
+        if start is not None:
+            start = int(start)
+            if self._beat_candle_start == start and self._price_to_beat is not None:
+                return
+            self._beat_candle_start = start
+        self._price_to_beat = float(price)
+        elapsed = (now - float(start)) if start else 0.0
+        if start and elapsed > 30:
             btc = dict(self._snapshot.btc or {})
             btc["beat_estimated"] = True
             self._snapshot.btc = btc
+        self._append_btc_history_locked(now, force=True, spot=float(price))
 
     def _sync_btc_locked(
         self,
@@ -309,6 +474,7 @@ class BotState:
         chainlink_at: float | None = None,
         connected: bool | None = None,
         error: str | None = None,
+        source_ts_ms: int | None = None,
     ) -> None:
         btc = dict(self._snapshot.btc or {})
         if price is not None:
@@ -325,20 +491,35 @@ class BotState:
             btc["error"] = error
         elif connected:
             btc.pop("error", None)
+        if source_ts_ms is not None:
+            btc["source_ts_ms"] = source_ts_ms
 
         beat = self._price_to_beat
         btc["price_to_beat"] = beat
         btc["source"] = "binance+chainlink"
         if beat is not None and not btc.get("beat_estimated"):
             btc.pop("beat_estimated", None)
-        ref = btc.get("chainlink", btc.get("price"))
-        if ref is not None and beat is not None:
-            delta = float(ref) - beat
+
+        # Live Δ uses fast Binance spot vs beat so UI tracks odds movement.
+        spot = btc.get("price")
+        if spot is None:
+            spot = btc.get("chainlink")
+        if spot is not None and beat is not None:
+            delta = float(spot) - float(beat)
             btc["delta"] = round(delta, 2)
             btc["delta_pct"] = round((delta / beat) * 100, 4) if beat else None
         else:
             btc.pop("delta", None)
             btc.pop("delta_pct", None)
+
+        # Separate oracle Δ (Chainlink) for settlement-aware UI if present.
+        oracle = btc.get("chainlink")
+        if oracle is not None and beat is not None:
+            odelta = float(oracle) - float(beat)
+            btc["oracle_delta"] = round(odelta, 2)
+        else:
+            btc.pop("oracle_delta", None)
+
         self._snapshot.btc = btc
 
     def _append_history_locked(self, now: float, prices: dict, books: dict) -> None:
@@ -374,13 +555,25 @@ class BotState:
         })
         self._snapshot.feed = feed
 
-    def clear_market_data(self) -> None:
+    def clear_market_data(self, *, closing_start_ts: int | None = None) -> None:
+        """
+        Reset books/history/beat for a new candle.
+
+        If *closing_start_ts* is set, freeze resolution refs for that window
+        first so settlement never sees the next open's beat.
+        """
+        if closing_start_ts is not None:
+            self.freeze_resolution_refs(int(closing_start_ts))
         with self._lock:
             self._snapshot.orderbooks = {}
             self._snapshot.trades = []
             self._price_history.clear()
             self._btc_history.clear()
+            self._last_btc_append = 0.0
             self._price_to_beat = None
+            self._beat_candle_start = None
+            # Keep last Binance/Chainlink ticks so the chart can reseed the
+            # moment a new beat is set (instead of waiting for the next WS tick).
             self._sync_btc_locked()
             self._bump()
 
@@ -388,7 +581,8 @@ class BotState:
         with self._lock:
             data = asdict(self._snapshot)
             data["activity"] = [e.to_dict() for e in list(self._log)]
-            data["price_history"] = list(self._price_history)[-history_points:]
-            data["btc_history"] = list(self._btc_history)[-history_points:]
+            data["price_history"] = slice_history_tail(self._price_history, history_points)
+            data["btc_history"] = slice_history_tail(self._btc_history, history_points)
+            data["equity_history"] = slice_history_tail(self._equity_history, history_points)
             data["version"] = self._version
             return data

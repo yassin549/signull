@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=16" />
+  <link rel="stylesheet" href="/static/styles.css?v=18" />
 </head>
 <body>
   <div class="app">
@@ -67,7 +67,7 @@
           <span class="meta-sep">·</span>
           <span id="hero-btc-delta">Δ —</span>
         </span>
-        <span class="hero-btc-src">Binance live · Chainlink beat</span>
+        <span class="hero-btc-src">Binance spot · open beat</span>
       </div>
 
       <div class="hero-signal" id="hero-signal">
@@ -104,7 +104,7 @@
             <div class="card-bar">
               <div class="card-title-group">
                 <span class="card-title">Δ vs beat</span>
-                <span class="card-subtitle">Distance from candle open · Chainlink</span>
+                <span class="card-subtitle">Binance live vs candle open · tracks odds</span>
               </div>
               <div class="card-meta card-meta-split">
                 <span id="btc-spot" class="btc-spot">—</span>
@@ -181,6 +181,15 @@
               </div>
               <span class="wallet-pill" id="wallet-status">—</span>
             </div>
+            <div class="equity-chart-section">
+              <div class="equity-chart-head">
+                <span>Equity curve</span>
+                <span id="equity-chart-meta">Waiting for balance data</span>
+              </div>
+              <div class="equity-chart-area">
+                <canvas id="equity-chart"></canvas>
+              </div>
+            </div>
             <div class="wallet-grid">
               <div class="wallet-field">
                 <span class="field-label">Strategy</span>
@@ -224,6 +233,6 @@
 
     </main>
   </div>
-  <script src="/static/app.js?v=17"></script>
+  <script src="/static/app.js?v=21"></script>
 </body>
 </html>

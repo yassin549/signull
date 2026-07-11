@@ -826,6 +826,35 @@ body {
   color: var(--muted);
 }
 
+.equity-chart-section {
+  border-bottom: 1px solid var(--border);
+  background: #06090f;
+  overflow: hidden;
+}
+.equity-chart-head {
+  display: flex; justify-content: space-between; gap: 8px;
+  padding: 8px 12px 4px; color: var(--muted); font-size: 9px;
+  font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+}
+.equity-chart-head span:last-child {
+  font-family: var(--mono); font-size: 9px; font-weight: 500;
+  letter-spacing: 0; text-transform: none;
+}
+.equity-chart-area {
+  position: relative;
+  height: 150px;
+  min-height: 150px;
+  max-height: 150px;
+  flex: 0 0 150px;
+  overflow: hidden;
+  contain: layout paint;
+}
+.equity-chart-area canvas {
+  position: absolute; inset: 0; display: block;
+  width: 100% !important; height: 150px !important;
+  max-height: 150px !important;
+}
+
 .wallet-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

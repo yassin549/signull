@@ -4,10 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Signull Backtest</title>
+  <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <link rel="stylesheet" href="/static/styles.css?v=8" />
 </head>
 <body>
   <div class="app">
@@ -37,8 +38,16 @@
         </select>
       </div>
       <div class="field">
-        <label for="candle-count">Candles</label>
-        <input id="candle-count" type="number" min="10" max="500" value="100" />
+        <label for="data-period">Data period</label>
+        <select id="data-period">
+          <option value="12">Last 1 hour</option>
+          <option value="72">Last 6 hours</option>
+          <option value="100" selected>Last ~8 hours</option>
+          <option value="144">Last 12 hours</option>
+          <option value="288">Last 24 hours</option>
+          <option value="432">Last 36 hours</option>
+        </select>
+        <p class="hint">Ends at the latest resolved 5-minute market.</p>
       </div>
       <div class="field">
         <label for="initial-capital">Starting capital ($)</label>
@@ -84,6 +93,6 @@
       </div>
     </section>
   </div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

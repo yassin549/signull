@@ -58,6 +58,7 @@ class Strategy(ABC):
         self._initial_capital: float = 100.0
         self._peak_equity: float = 100.0
         self._wins_recent: int = 0
+        self._wins_streak: int = 0
         self._losses_streak: int = 0
         self._equity_momentum: float = 0.0
 
@@ -68,6 +69,7 @@ class Strategy(ABC):
         peak_equity: float,
         *,
         wins_recent: int = 0,
+        wins_streak: int = 0,
         losses_streak: int = 0,
         equity_momentum: float = 0.0,
     ) -> None:
@@ -76,6 +78,7 @@ class Strategy(ABC):
         self._initial_capital = initial_capital
         self._peak_equity = peak_equity
         self._wins_recent = wins_recent
+        self._wins_streak = wins_streak
         self._losses_streak = losses_streak
         self._equity_momentum = equity_momentum
 
