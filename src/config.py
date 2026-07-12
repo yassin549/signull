@@ -51,7 +51,7 @@ class BotConfig:
     server_port: int
     dashboard_push_ms: int
     bot_poll_interval_sec: float
-    # Signull 1.0 / paper bankroll
+    # Strategy / paper bankroll
     paper_initial_capital: float
     strategy_threshold: float
     strategy_min_risk_pct: float
@@ -59,6 +59,7 @@ class BotConfig:
     strategy_trust_lookback: int
     strategy_btc_align_min: float
     strategy_big_equity_buffer: float
+    strategy_id: str = "signull_1_1"
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -69,6 +70,9 @@ class BotConfig:
         mode = os.getenv("TRADING_MODE", "paper").lower()
         if mode not in ("paper", "live"):
             raise ValueError("TRADING_MODE must be 'paper' or 'live'")
+        strategy_id = os.getenv("BOT_STRATEGY", "signull_1_1").lower()
+        if strategy_id not in ("signull_1_0", "signull_1_1"):
+            raise ValueError("BOT_STRATEGY must be 'signull_1_0' or 'signull_1_1'")
 
         funder = os.getenv("FUNDER_ADDRESS") or os.getenv("DEPOSIT_WALLET_ADDRESS")
 
@@ -92,10 +96,17 @@ class BotConfig:
             strategy_trust_lookback=int(os.getenv("SIGNULL_TRUST_LOOKBACK", "3")),
             strategy_btc_align_min=float(os.getenv("SIGNULL_BTC_ALIGN_MIN", "0.55")),
             strategy_big_equity_buffer=float(os.getenv("SIGNULL_BIG_EQUITY_BUFFER", "1.25")),
+            strategy_id=strategy_id,
         )
 
     def strategy_params(self) -> dict:
-        """Params for strategies.Signull10Strategy."""
+        """Parameters for the configured live strategy."""
+        if self.strategy_id == "signull_1_1":
+            return {
+                "threshold": self.strategy_threshold,
+                # Keep calibration independent from paper/backtest sessions.
+                "persist_calibration": self.is_live,
+            }
         return {
             "threshold": self.strategy_threshold,
             "min_risk_pct": self.strategy_min_risk_pct,

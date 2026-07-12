@@ -2,6 +2,9 @@ let strategies = [];
 let selectedId = null;
 let running = false;
 let lastResult = null;
+let allHistory = false;
+let liveRun = null;
+let liveDrawQueued = false;
 
 async function init() {
   const res = await fetch("/api/strategies");
@@ -11,12 +14,78 @@ async function init() {
   sel.innerHTML = strategies.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
   sel.addEventListener("change", onStrategyChange);
   document.getElementById("run-btn").addEventListener("click", runBacktest);
+  document.querySelectorAll(".period-btn[data-days]").forEach(btn => btn.addEventListener("click", () => setRecentRange(Number(btn.dataset.days))));
+  document.getElementById("all-history-btn").addEventListener("click", enableAllHistory);
+  document.getElementById("start-date").addEventListener("change", () => { allHistory = false; updateCandleEstimate(); });
+  document.getElementById("end-date").addEventListener("change", () => { allHistory = false; updateCandleEstimate(); });
+  document.getElementById("asset-select").addEventListener("change", updateCandleEstimate);
+  setRecentRange(7);
   if (strategies.length) {
     const preferred = strategies.find(s => s.id === "signull_1_0");
     selectedId = preferred ? preferred.id : strategies[0].id;
     sel.value = selectedId;
     onStrategyChange();
   }
+}
+
+function utcDateTimeInput(date) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+    + `T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+function utcInputToUnix(value) {
+  const ts = Date.parse(`${value}:00Z`);
+  return Number.isFinite(ts) ? Math.floor(ts / 1000) : NaN;
+}
+
+function setRecentRange(days) {
+  allHistory = false;
+  const end = new Date();
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - days);
+  document.getElementById("start-date").value = utcDateTimeInput(start);
+  document.getElementById("end-date").value = utcDateTimeInput(end);
+  document.getElementById("date-range-hint").textContent = `Running the last ${days} UTC day${days === 1 ? "" : "s"}, to the minute.`;
+  updateCandleEstimate();
+}
+
+async function enableAllHistory() {
+  allHistory = true;
+  const hint = document.getElementById("date-range-hint");
+  hint.textContent = "Finding the earliest retained Polymarket market…";
+  try {
+    const asset = document.getElementById("asset-select").value;
+    const res = await fetch(`/api/availability?asset=${encodeURIComponent(asset)}`);
+    const data = await res.json();
+    if (!res.ok || !data.first_available_start_ts) throw new Error(data.detail || "No history found");
+    document.getElementById("start-date").value = utcDateTimeInput(new Date(data.first_available_start_ts * 1000));
+    document.getElementById("end-date").value = utcDateTimeInput(new Date());
+    hint.textContent = "All retained Polymarket history selected. Large first-time downloads can take a while.";
+    document.getElementById("candle-estimate").textContent = "All retained history selected; the exact total will appear while data loads.";
+  } catch (e) {
+    allHistory = false;
+    hint.textContent = "Could not find the earliest available history. Choose a date range instead.";
+  }
+}
+
+function updateCandleEstimate() {
+  const el = document.getElementById("candle-estimate");
+  if (!el) return;
+  if (allHistory) {
+    el.textContent = "All retained history selected; the exact total will appear while data loads.";
+    return;
+  }
+  const start = utcInputToUnix(document.getElementById("start-date").value);
+  const end = utcInputToUnix(document.getElementById("end-date").value);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    el.textContent = "Choose a valid start and end time.";
+    return;
+  }
+  const first = Math.ceil(start / 300) * 300;
+  const last = Math.floor((end - 300) / 300) * 300;
+  const estimate = Math.max(0, Math.floor((last - first) / 300) + 1);
+  el.textContent = `Estimated ${estimate.toLocaleString()} five-minute candles (before unavailable markets).`;
 }
 
 function currentStrategy() {
@@ -69,14 +138,25 @@ async function runBacktest() {
   const body = {
     strategy_id: selectedId,
     asset: document.getElementById("asset-select").value,
-    candle_count: parseInt(document.getElementById("data-period").value, 10),
     initial_capital: parseFloat(document.getElementById("initial-capital").value),
     params: gatherParams(),
     use_cache: true,
   };
+  if (allHistory) body.all_history = true;
+  else {
+    body.start_ts = utcInputToUnix(document.getElementById("start-date").value);
+    body.end_ts = utcInputToUnix(document.getElementById("end-date").value);
+    if (!Number.isFinite(body.start_ts) || !Number.isFinite(body.end_ts)) {
+      alert("Choose both start and end times.");
+      running = false;
+      btn.disabled = false;
+      btn.textContent = "▶ Run Backtest";
+      return;
+    }
+  }
 
   try {
-    const res = await fetch("/api/run", {
+    const res = await fetch("/api/run/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -86,16 +166,116 @@ async function runBacktest() {
       alert(err.detail || "Backtest failed");
       return;
     }
-    const result = await res.json();
-    lastResult = result;
-    renderResult(result);
+    const started = await res.json();
+    beginLiveRun(body);
+    const source = new EventSource(`/api/run/${encodeURIComponent(started.job_id)}/events`);
+    source.onmessage = event => {
+      const update = JSON.parse(event.data);
+      if (update.type === "progress" || update.type === "status") {
+        renderLiveProgress(update);
+        return;
+      }
+      source.close();
+      if (update.type === "complete") {
+        lastResult = update.result;
+        renderResult(update.result);
+      } else {
+        alert(update.message || "Backtest failed");
+      }
+      finishLiveRun();
+    };
+    source.onerror = () => {
+      source.close();
+      if (running) alert("Lost the live backtest connection.");
+      finishLiveRun();
+    };
+    return;
   } catch (e) {
     alert("Backtest error: " + e.message);
+    finishLiveRun();
   } finally {
-    running = false;
-    btn.disabled = false;
-    btn.textContent = "▶ Run Backtest";
+    if (!running) return;
+    // The live event stream owns completion and re-enables the button.
   }
+}
+
+function finishLiveRun() {
+  running = false;
+  const btn = document.getElementById("run-btn");
+  btn.disabled = false;
+  btn.textContent = "▶ Run Backtest";
+}
+
+function beginLiveRun(body) {
+  const initial = Number(body.initial_capital) || 0;
+  liveRun = { initial_capital: initial, equity_curve: [{ idx: 0, equity: initial }], trades: [] };
+  setText("stat-ending", `$${initial.toFixed(2)}`);
+  setText("stat-return", "+0.00%");
+  setText("stat-trades", "0 / 0");
+  setText("stat-wl", "0 / 0");
+  setText("run-meta", "Preparing backtest…");
+  renderTradeList([]);
+  scheduleLiveDraw();
+}
+
+function renderLiveProgress(update) {
+  if (!liveRun) return;
+  if (update.phase === "loading") {
+    const resolved = update.candles_resolved || 0;
+    setText("run-meta", `Loading market data: ${update.candles_completed || 0} / ${update.candles_total || 0} checked · ${resolved} resolved`);
+    return;
+  }
+  if (update.phase !== "backtesting") return;
+  const point = update.equity_point;
+  if (point) liveRun.equity_curve.push(point);
+  if (update.trade) {
+    liveRun.trades.push(update.trade);
+    renderTradeList(liveRun.trades);
+  }
+  const equity = Number(update.equity || liveRun.initial_capital);
+  const pct = liveRun.initial_capital ? ((equity / liveRun.initial_capital) - 1) * 100 : 0;
+  const wins = liveRun.trades.filter(t => t.won).length;
+  setText("stat-ending", `$${equity.toFixed(2)}`, equity >= liveRun.initial_capital ? "up" : "down");
+  setText("stat-return", `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`, pct >= 0 ? "up" : "down");
+  setText("stat-trades", `${liveRun.trades.length} / ${update.candles_completed}`);
+  setText("stat-wl", `${wins} / ${liveRun.trades.length - wins}`);
+  setText("run-meta", `Backtesting ${update.candles_completed} / ${update.candles_total} candles · ${liveRun.trades.length} trades`);
+  scheduleLiveDraw();
+}
+
+function scheduleLiveDraw() {
+  if (liveDrawQueued || !liveRun) return;
+  liveDrawQueued = true;
+  requestAnimationFrame(() => {
+    liveDrawQueued = false;
+    if (liveRun) drawEquity(liveRun.equity_curve, liveRun.initial_capital);
+  });
+}
+
+function renderTradeList(trades) {
+  const body = document.getElementById("trade-body");
+  setText("trade-count", `${trades.length} trades`);
+  if (!trades.length) {
+    body.innerHTML = '<div class="placeholder">No trades triggered yet</div>';
+    return;
+  }
+  body.innerHTML = trades.slice().reverse().map(t => {
+    const expWin = t.entry_price > 0 ? t.stake * (1 - t.entry_price) / t.entry_price : 0;
+    const pnlTitle = t.won
+      ? `Win @ ${t.entry_price}: stake/price shares settle at $1 → +$${expWin.toFixed(2)}`
+      : `Loss @ ${t.entry_price}: stake lost → -$${Number(t.stake).toFixed(2)}`;
+    return `
+      <div class="trade-row ${t.won ? "win" : "loss"}" title="${escapeAttr(t.reason || "")}">
+        <span title="${escapeAttr(t.candle_title)}">${shortTitle(t.candle_title)}</span>
+        <span class="side ${t.side}">${t.side.toUpperCase()}</span>
+        <span title="Limit fill price">${Number(t.entry_price).toFixed(2)}</span>
+        <span class="size ${t.size_label || ""}" title="${t.risk_pct != null ? t.risk_pct + "% of initial" : ""}">${formatSize(t)}</span>
+        <span>$${Number(t.stake).toFixed(2)}</span>
+        <span>${t.won ? "WIN" : "LOSS"}</span>
+        <span class="pnl" title="${pnlTitle}">${t.pnl >= 0 ? "+" : ""}$${Number(t.pnl).toFixed(2)}</span>
+        <span>$${Number(t.equity_after).toFixed(2)}</span>
+      </div>`;
+  }).join("");
 }
 
 function renderResult(r) {
@@ -112,34 +292,12 @@ function renderResult(r) {
   const dataWindow = formatDataWindow(r.data_start_ts, r.data_end_ts);
   setText(
     "run-meta",
-    `${dataWindow} · ${r.candles_loaded} candles · ${r.strategy_name} · ${r.elapsed_ms.toFixed(0)} ms`
+    `${dataWindow} · ${r.candles_loaded}${r.candles_requested != null ? ` / ${r.candles_requested}` : ""} candles`
+      + (r.candles_missing ? ` (${r.candles_missing} unavailable)` : "")
+      + ` · ${r.strategy_name} · ${r.elapsed_ms.toFixed(0)} ms`
       + (paramStr ? ` · ${paramStr}` : "")
   );
-  setText("trade-count", `${r.trades.length} trades`);
-
-  const body = document.getElementById("trade-body");
-  if (!r.trades.length) {
-    body.innerHTML = '<div class="placeholder">No trades triggered</div>';
-  } else {
-    body.innerHTML = r.trades.slice().reverse().map(t => {
-      // Binary win PnL = stake * (1 - entry) / entry  (e.g. $50 @ 0.70 → +$21.43)
-      const expWin = t.entry_price > 0 ? t.stake * (1 - t.entry_price) / t.entry_price : 0;
-      const pnlTitle = t.won
-        ? `Win @ ${t.entry_price}: stake/price shares settle at $1 → +$${expWin.toFixed(2)}`
-        : `Loss @ ${t.entry_price}: stake lost → -$${Number(t.stake).toFixed(2)}`;
-      return `
-      <div class="trade-row ${t.won ? "win" : "loss"}" title="${escapeAttr(t.reason || "")}">
-        <span title="${escapeAttr(t.candle_title)}">${shortTitle(t.candle_title)}</span>
-        <span class="side ${t.side}">${t.side.toUpperCase()}</span>
-        <span title="Limit fill price">${Number(t.entry_price).toFixed(2)}</span>
-        <span class="size ${t.size_label || ""}" title="${t.risk_pct != null ? t.risk_pct + "% of initial" : ""}">${formatSize(t)}</span>
-        <span>$${Number(t.stake).toFixed(2)}</span>
-        <span>${t.won ? "WIN" : "LOSS"}</span>
-        <span class="pnl" title="${pnlTitle}">${t.pnl >= 0 ? "+" : ""}$${Number(t.pnl).toFixed(2)}</span>
-        <span>$${Number(t.equity_after).toFixed(2)}</span>
-      </div>`;
-    }).join("");
-  }
+  renderTradeList(r.trades);
 
   requestAnimationFrame(() => drawEquity(r.equity_curve, r.initial_capital));
 }

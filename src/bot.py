@@ -14,6 +14,7 @@ from eth_account import Account
 
 from strategies.base import CandleContext, TickContext
 from strategies.signull_1_0 import Signull10Strategy
+from strategies.signull_1_1 import Signull11Strategy
 
 from .account import fetch_positions
 from .config import BotConfig
@@ -76,10 +77,13 @@ class TradingBot:
         self.state = state or BotState()
         self.client = PolymarketClient(config)
 
-        self.strategy = Signull10Strategy(
-            config.strategy_params(),
-            asset=config.asset,
-        )
+        if config.strategy_id == "signull_1_1":
+            self.strategy = Signull11Strategy(config.strategy_params())
+        else:
+            self.strategy = Signull10Strategy(
+                config.strategy_params(),
+                asset=config.asset,
+            )
         self._initial = float(config.paper_initial_capital)
         self._equity = float(config.paper_initial_capital)
         self._peak = float(config.paper_initial_capital)
@@ -113,7 +117,7 @@ class TradingBot:
         mode = "LIVE" if self.config.is_live else "PAPER"
         thr = self.strategy.params["threshold"]
         msg = (
-            f"Bot started [{mode}] Signull 1.0 — {self.config.asset.upper()}, "
+            f"Bot started [{mode}] {self.strategy.meta.name} — {self.config.asset.upper()}, "
             f"limit @{thr:.0%}, paper bankroll ${self._initial:.2f}"
         )
         logger.info(msg)
@@ -316,9 +320,14 @@ class TradingBot:
                 name="signull-settle",
             ).start()
 
-        self.strategy.ensure_current_candle(market.slug)
-        # Non-blocking: kline HTTP must not stall the entry loop at open.
-        self.strategy.schedule_klines_refresh(int(time.time()))
+        # These 1.0-only helpers maintain its BTC/noise cache. Simpler
+        # strategies such as 1.1 intentionally do not need them.
+        ensure_candle = getattr(self.strategy, "ensure_current_candle", None)
+        if callable(ensure_candle):
+            ensure_candle(market.slug)
+        refresh_klines = getattr(self.strategy, "schedule_klines_refresh", None)
+        if callable(refresh_klines):
+            refresh_klines(int(time.time()))
 
         # Feed usually already switched this candle (cleared books + locked beat).
         # Re-clearing here wiped history and re-pinned beat to a *later* spot
@@ -349,7 +358,7 @@ class TradingBot:
         self.state.update(
             market=market_to_dict(market),
             prices=None,
-            signal={"side": "hold", "reason": "New candle — Signull 1.0 watching"},
+            signal={"side": "hold", "reason": f"New candle — {self.strategy.meta.name} watching"},
         )
         msg = f"New candle: {market.title}"
         logger.info("%s (closes in %.0fs)", msg, market.seconds_to_close)
@@ -444,16 +453,19 @@ class TradingBot:
 
         won = pending.side == result.winner
         pnl = _settle_pnl(stake, pending.entry_price, won)
+        self.strategy.on_trade_settled(won)
 
         with self._bankroll_lock:
             if pending.mode == "paper":
                 self._equity += pnl
                 self._peak = max(self._peak, self._equity)
+                self._losses_streak = 0 if won else self._losses_streak + 1
+                self._wins_recent.append(won)
+                if len(self._wins_recent) > 10:
+                    self._wins_recent.pop(0)
+            # A confirmed live settlement is as valid as a paper settlement
+            # for the strategy's consecutive-win sizing rule.
             self._wins_streak = self._wins_streak + 1 if won else 0
-            self._losses_streak = 0 if won else self._losses_streak + 1
-            self._wins_recent.append(won)
-            if len(self._wins_recent) > 10:
-                self._wins_recent.pop(0)
             equity_after = self._equity
 
         trade_rec = {
@@ -707,8 +719,8 @@ class TradingBot:
             wins = sum(self._wins_recent)
         self.state.update(
             strategy={
-                "id": "signull_1_0",
-                "name": "Signull 1.0",
+                "id": self.strategy.meta.id,
+                "name": self.strategy.meta.name,
                 "mode": self.config.trading_mode,
                 "params": dict(self.strategy.params),
                 "equity": round(equity, 4),

@@ -78,7 +78,7 @@ body {
 
 .controls {
   display: grid;
-  grid-template-columns: minmax(200px, 2.2fr) repeat(3, minmax(100px, 1fr)) minmax(200px, 2fr);
+  grid-template-columns: minmax(220px, 1.35fr) 110px minmax(330px, 2.2fr) 155px minmax(240px, 1.5fr);
   gap: 14px;
   padding: 16px var(--page-pad);
   background: var(--surface2);
@@ -113,6 +113,23 @@ body {
   color: var(--muted);
   line-height: 1.35;
 }
+
+.date-range-field { min-width: 250px; }
+.capital-field { min-width: 155px; }
+.candle-estimate {
+  margin-top: 7px;
+  color: var(--amber);
+  font: 11px var(--mono);
+}
+.date-inputs, .date-actions { display: flex; align-items: center; gap: 6px; }
+.date-inputs span { color: var(--muted); font-family: var(--mono); }
+.date-actions { margin-top: 7px; flex-wrap: wrap; }
+.period-btn {
+  appearance: none; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface); color: var(--muted); padding: 4px 7px;
+  font: 10px var(--mono); cursor: pointer;
+}
+.period-btn:hover { color: var(--text); border-color: var(--blue); }
 
 .params-box {
   display: flex;
@@ -244,7 +261,9 @@ body {
 .trade-row .size.small { color: var(--muted); }
 .trade-row .size.medium { color: var(--amber); }
 .trade-row .size.big { color: var(--blue); font-weight: 600; }
-.trade-row .size.hot-streak { color: var(--purple); font-weight: 700; }
+.trade-row .size.explore { color: var(--amber); }
+.trade-row .size.kelly { color: var(--purple); font-weight: 700; }
+.trade-row .size.no-edge { color: var(--muted); }
 
 .placeholder {
   padding: 24px;
@@ -260,5 +279,6 @@ body {
 @media (max-width: 720px) {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .controls { grid-template-columns: 1fr 1fr; }
+  .date-range-field, .params-field { grid-column: 1 / -1; }
   :root { --chart-h: 260px; --page-pad: 12px; }
 }

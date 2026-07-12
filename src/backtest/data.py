@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -22,6 +23,31 @@ HEADERS = {"User-Agent": "signull-backtest/0.1"}
 CLOB_HOST = "https://clob.polymarket.com"
 CANDLE_DURATION = 300
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "backtest_cache"
+REQUEST_ATTEMPTS = 3
+
+
+def _get(url: str, **kwargs) -> requests.Response | None:
+    """Fetch without turning a temporary 429/5xx into a missing candle."""
+    for attempt in range(REQUEST_ATTEMPTS):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=20, **kwargs)
+            if response.status_code == 404:
+                return response
+            if response.status_code not in (408, 429) and response.status_code < 500:
+                response.raise_for_status()
+                return response
+            logger.debug("Transient HTTP %s from %s", response.status_code, url)
+        except requests.RequestException as exc:
+            logger.debug("Request failed %s: %s", url, exc)
+        if attempt + 1 < REQUEST_ATTEMPTS:
+            time.sleep(0.25 * (2**attempt))
+    return None
+
+
+def _latest_resolved_start(*, skip_open: int = 2) -> int:
+    """Latest 5-minute market that is safely resolved and indexable."""
+    now = datetime.now(timezone.utc).timestamp()
+    return int(math.floor(now / CANDLE_DURATION) * CANDLE_DURATION - skip_open * CANDLE_DURATION)
 
 
 def _parse_json_field(value) -> list:
@@ -46,20 +72,18 @@ def _winner_from_market(market: dict) -> str | None:
 
 
 def _fetch_event(slug: str) -> dict | None:
+    resp = _get(f"{GAMMA_HOST}/events/slug/{slug}")
+    if resp is None or resp.status_code == 404:
+        return None
     try:
-        resp = requests.get(f"{GAMMA_HOST}/events/slug/{slug}", headers=HEADERS, timeout=12)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as exc:
-        logger.debug("Gamma fetch failed %s: %s", slug, exc)
+    except ValueError:
         return None
 
 
 def _fetch_price_history(token_id: str, start_ts: int, end_ts: int) -> list[tuple[int, float]]:
     try:
-        resp = requests.get(
+        resp = _get(
             f"{CLOB_HOST}/prices-history",
             params={
                 "market": token_id,
@@ -67,27 +91,25 @@ def _fetch_price_history(token_id: str, start_ts: int, end_ts: int) -> list[tupl
                 "endTs": end_ts,
                 "fidelity": 1,
             },
-            headers=HEADERS,
-            timeout=20,
         )
-        resp.raise_for_status()
+        if resp is None:
+            return []
         history = resp.json().get("history", [])
         points = [(int(p["t"]), float(p["p"])) for p in history if start_ts <= int(p["t"]) <= end_ts]
         if len(points) >= 3:
             return sorted(points, key=lambda x: x[0])
 
         # Fallback: pull max range and filter locally.
-        resp = requests.get(
+        resp = _get(
             f"{CLOB_HOST}/prices-history",
             params={"market": token_id, "interval": "max", "fidelity": 1},
-            headers=HEADERS,
-            timeout=20,
         )
-        resp.raise_for_status()
+        if resp is None:
+            return []
         history = resp.json().get("history", [])
         points = [(int(p["t"]), float(p["p"])) for p in history if start_ts <= int(p["t"]) <= end_ts]
         return sorted(points, key=lambda x: x[0])
-    except requests.RequestException as exc:
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
         logger.debug("Price history failed %s: %s", token_id[:12], exc)
         return []
 
@@ -197,28 +219,87 @@ def _build_candle(asset: str, start_ts: int, *, use_cache: bool) -> CandleDatase
 
 def list_candidate_starts(asset: str, count: int, *, skip_open: int = 2) -> list[int]:
     """Return recent candle start timestamps (oldest first)."""
-    now = datetime.now(timezone.utc).timestamp()
-    base = math.floor(now / CANDLE_DURATION) * CANDLE_DURATION
-    return [int(base - (skip_open + i) * CANDLE_DURATION) for i in range(count - 1, -1, -1)]
+    base = _latest_resolved_start(skip_open=skip_open)
+    return [int(base - i * CANDLE_DURATION) for i in range(count - 1, -1, -1)]
+
+
+def list_candidate_starts_in_range(start_ts: int, end_ts: int, *, skip_open: int = 2) -> list[int]:
+    """Return every fully resolved 5-minute market in [start_ts, end_ts)."""
+    if end_ts <= start_ts:
+        return []
+    first = math.ceil(start_ts / CANDLE_DURATION) * CANDLE_DURATION
+    last_requested = math.floor((end_ts - CANDLE_DURATION) / CANDLE_DURATION) * CANDLE_DURATION
+    last = min(last_requested, _latest_resolved_start(skip_open=skip_open))
+    if first > last:
+        return []
+    return list(range(int(first), int(last) + 1, CANDLE_DURATION))
+
+
+def first_available_start(asset: str, *, skip_open: int = 2) -> int | None:
+    """Find the first retained 5-minute event for an asset without a data cap."""
+    latest = _latest_resolved_start(skip_open=skip_open)
+    low = 0
+    high = latest
+    if _fetch_event(_slug_for(asset, high)) is None:
+        return None
+    while low < high:
+        mid = ((low + high) // (2 * CANDLE_DURATION)) * CANDLE_DURATION
+        if mid <= low:
+            mid = low + CANDLE_DURATION
+        if _fetch_event(_slug_for(asset, mid)) is None:
+            low = mid
+        else:
+            high = mid
+    return high if _fetch_event(_slug_for(asset, high)) is not None else None
 
 
 def fetch_candles(
     asset: str = "btc",
     count: int = 100,
     *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    all_history: bool = False,
     use_cache: bool = True,
     max_workers: int = 8,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> list[CandleDataset]:
-    """Load *count* resolved candles, using disk cache when available."""
-    starts = list_candidate_starts(asset, count)
+    """Load resolved candles, using disk cache when available."""
+    if all_history:
+        start_ts = first_available_start(asset)
+        end_ts = _latest_resolved_start() + CANDLE_DURATION
+        if start_ts is None:
+            return []
+    if (start_ts is None) != (end_ts is None):
+        raise ValueError("start_ts and end_ts must be supplied together")
+    starts = (
+        list_candidate_starts_in_range(start_ts, end_ts)
+        if start_ts is not None and end_ts is not None
+        else list_candidate_starts(asset, count)
+    )
     candles: list[CandleDataset] = []
     to_fetch: list[int] = []
+    total = len(starts)
+    completed = 0
+    resolved = 0
+
+    def report() -> None:
+        if progress_callback is not None:
+            progress_callback({
+                "type": "progress", "phase": "loading",
+                "candles_completed": completed, "candles_total": total,
+                "candles_resolved": resolved,
+            })
 
     for start_ts in starts:
         if use_cache:
             cached = _load_cache(asset, start_ts)
             if cached is not None:
                 candles.append(cached)
+                completed += 1
+                resolved += 1
+                if completed == total or completed % 10 == 0:
+                    report()
                 continue
         to_fetch.append(start_ts)
 
@@ -235,14 +316,19 @@ def fetch_candles(
                     ds = fut.result()
                     if ds is not None:
                         built[ts] = ds
+                        resolved += 1
                 except Exception:
                     logger.exception("Failed building candle %s", ts)
+                completed += 1
+                if completed == total or completed % 10 == 0:
+                    report()
 
             for start_ts in to_fetch:
                 if start_ts in built:
                     candles.append(built[start_ts])
 
     candles.sort(key=lambda c: c.start_ts)
+    report()
     return candles
 
 

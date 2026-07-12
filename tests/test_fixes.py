@@ -107,6 +107,19 @@ class ClientStartupTests(unittest.TestCase):
         self.assertEqual(client_cls.call_count, 2)
 
 
+class MarketFeedResilienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bootstrap_failure_is_a_warning_not_a_traceback(self):
+        from src.feed import MarketFeed
+
+        feed = MarketFeed(_paper_config(), BotState())
+        feed._client.get_order_book = mock.Mock(side_effect=RuntimeError("disconnected"))
+
+        with self.assertLogs("src.feed", level="WARNING") as logs:
+            await feed._bootstrap_book("token", "up")
+
+        self.assertIn("REST book bootstrap unavailable for up: disconnected", logs.output[0])
+
+
 class ResolutionRefsTests(unittest.TestCase):
     def test_freeze_survives_clear_and_new_beat(self):
         state = BotState()
@@ -502,20 +515,147 @@ class BacktestCacheSingleLoadTests(unittest.TestCase):
         self.assertEqual(response["data_end_ts"], 1000)
 
 
-class SignullHotStreakSizingTests(unittest.TestCase):
-    def test_three_or_four_consecutive_wins_use_25_percent_risk(self):
+class ConsecutiveWinStreakTests(unittest.TestCase):
+    def test_backtest_engine_passes_exact_consecutive_win_streak(self):
+        from strategies.base import Strategy, StrategyMeta, TradeSignal
+        from src.backtest.engine import run_backtest
+        from src.backtest.types import CandleDataset
+
+        class WinningStrategy(Strategy):
+            meta = StrategyMeta(id="test", name="test", description="test")
+
+            def __init__(self):
+                super().__init__()
+                self.streaks: list[int] = []
+
+            def on_account_update(self, *args, **kwargs):
+                super().on_account_update(*args, **kwargs)
+                self.streaks.append(self._wins_streak)
+
+            def evaluate(self, _tick, candle, *, entered):
+                if entered:
+                    return None
+                return TradeSignal(side=candle.winner, price=0.5, reason="test")
+
+            def position_risk_fraction(self, *_args):
+                return 0.01
+
+        candles = [
+            CandleDataset(
+                slug=f"c{i}", title=f"c{i}", start_ts=i * 300,
+                end_ts=(i + 1) * 300, winner="up", up_token_id="u",
+                down_token_id="d", ticks=[(i * 300, 0.5, 0.5)],
+            )
+            for i in range(6)
+        ]
+        strategy = WinningStrategy()
+        run_backtest(strategy, candles)
+
+        self.assertEqual(strategy.streaks, [0, 1, 2, 3, 4, 5])
+
+    def test_signull_uses_25_percent_after_three_or_four_wins(self):
         from strategies.base import CandleContext, TickContext, TradeSignal
         from strategies.signull_1_0 import Signull10Strategy
 
         strategy = Signull10Strategy()
+        strategy._recent_trustworthy = lambda _candle: (False, 1, 3)  # type: ignore[method-assign]
+        strategy._btc_aligned = lambda _ts, _side: (False, 0.5)  # type: ignore[method-assign]
         signal = TradeSignal(side="up", price=0.70, reason="test")
         tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=1, seconds_to_close=299)
         candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
-
         for streak in (3, 4):
             strategy._wins_streak = streak
             self.assertEqual(strategy.position_risk_fraction(signal, tick, candle), 0.25)
             self.assertEqual(strategy.size_label(0.25), "hot-streak")
+
+
+class Signull11KellyTests(unittest.TestCase):
+    def test_closed_candle_hook_is_a_clean_no_op(self):
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+
+        self.assertFalse(
+            strategy.register_closed_candle(
+                "btc-updown-123", [(1, 0.70, 0.30)]
+            )
+        )
+
+    def test_uses_ten_percent_current_bankroll_during_calibration(self):
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+        strategy.on_account_update(120.0, 100.0, 120.0)
+        signal = TradeSignal(side="up", price=0.70, reason="test")
+        tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
+        candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
+
+        # The engine takes a fraction of initial capital; 12% of initial is
+        # exactly a 10% allocation of the current $120 bankroll.
+        self.assertAlmostEqual(strategy.position_risk_fraction(signal, tick, candle), 0.12)
+        self.assertEqual(strategy.size_label(0.12), "explore")
+
+    def test_moves_to_conservative_kelly_after_warmup(self):
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+        strategy.on_account_update(100.0, 100.0, 100.0)
+        strategy._stats["all"] = [30, 30]
+        signal = TradeSignal(side="up", price=0.70, reason="test")
+        tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
+        candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
+
+        risk = strategy.position_risk_fraction(signal, tick, candle)
+        self.assertGreater(risk, 0.0)
+        self.assertLessEqual(risk, 0.10)
+        self.assertEqual(strategy.size_label(risk), "kelly")
+
+    def test_declined_backtest_signal_keeps_calibrating(self):
+        """A no-edge decision must not freeze Signull 1.1's sample forever."""
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+        strategy.on_account_update(100.0, 100.0, 100.0)
+        strategy._stats["all"] = [0, 30]
+        signal = TradeSignal(side="up", price=0.70, reason="test")
+        tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
+        candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
+
+        self.assertEqual(strategy.position_risk_fraction(signal, tick, candle), 0.0)
+        strategy.on_signal_resolved(True, traded=False)
+        self.assertEqual(strategy._stats["all"], [1, 31])
+
+
+class DeclinedSignalBacktestTests(unittest.TestCase):
+    def test_engine_reports_outcome_for_zero_risk_signal(self):
+        from strategies.base import Strategy, StrategyMeta, TradeSignal
+        from src.backtest.engine import run_backtest
+        from src.backtest.types import CandleDataset
+
+        class ObserveStrategy(Strategy):
+            meta = StrategyMeta(id="observe", name="observe", description="observe")
+
+            def __init__(self):
+                super().__init__()
+                self.outcomes = []
+
+            def evaluate(self, _tick, candle, *, entered):
+                return None if entered else TradeSignal(candle.winner, 0.5, "observe")
+
+            def position_risk_fraction(self, *_args):
+                return 0.0
+
+            def on_signal_resolved(self, won, *, traded):
+                self.outcomes.append((won, traded))
+
+        candle = CandleDataset("c", "c", 0, 300, "up", "u", "d", [(0, .5, .5)])
+        strategy = ObserveStrategy()
+        result = run_backtest(strategy, [candle])
+        self.assertEqual(result.candles_traded, 0)
+        self.assertEqual(strategy.outcomes, [(True, False)])
 
 
 class AssetFeedTests(unittest.TestCase):

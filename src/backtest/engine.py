@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from strategies.base import CandleContext, Strategy, TickContext
 
@@ -30,6 +30,7 @@ def run_backtest(
     *,
     initial_capital: float = 100.0,
     min_stake: float = 0.01,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> BacktestResult:
     """
     Simulate *strategy* across resolved candles.
@@ -52,6 +53,19 @@ def run_backtest(
     wins_streak = 0
     losses_streak = 0
     equity_hist: list[float] = [capital]
+
+    def report(candle_idx: int, trade: TradeRecord | None = None) -> None:
+        if progress_callback is None:
+            return
+        payload = {
+            "type": "progress", "phase": "backtesting",
+            "candles_completed": candle_idx, "candles_total": len(candles),
+            "equity": round(capital, 4),
+            "equity_point": {"idx": candle_idx, "equity": round(capital, 4)},
+        }
+        if trade is not None:
+            payload["trade"] = trade.__dict__
+        progress_callback(payload)
 
     for candle_idx, candle in enumerate(candles, start=1):
         if capital < min_stake:
@@ -99,12 +113,19 @@ def run_backtest(
 
         if signal is None or entry_tick is None:
             equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
+            report(candle_idx)
             continue
 
         risk_frac = strategy.position_risk_fraction(signal, entry_tick, ctx)
         stake = min(initial_capital * risk_frac, capital)
         if stake < min_stake:
-            break
+            # A strategy may intentionally decline a marginal trade by
+            # returning zero risk. That must skip this candle, not terminate
+            # the whole backtest.
+            strategy.on_signal_resolved(signal.side == candle.winner, traded=False)
+            equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
+            report(candle_idx)
+            continue
 
         size_label = ""
         if hasattr(strategy, "size_label"):
@@ -132,12 +153,13 @@ def run_backtest(
         else:
             wins_streak = 0
             losses_streak += 1
+        strategy.on_trade_settled(won)
+        strategy.on_signal_resolved(won, traded=True)
         recent_outcomes.append(won)
         if len(recent_outcomes) > 10:
             recent_outcomes.pop(0)
 
-        trades.append(
-            TradeRecord(
+        trade = TradeRecord(
                 candle_slug=candle.slug,
                 candle_title=candle.title,
                 side=signal.side,
@@ -153,8 +175,9 @@ def run_backtest(
                 risk_pct=round(risk_frac * 100, 2),
                 size_label=size_label,
             )
-        )
+        trades.append(trade)
         equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
+        report(candle_idx, trade)
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return compute_metrics(

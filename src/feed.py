@@ -42,6 +42,13 @@ class MarketFeed:
         self._next_market: CandleMarket | None = None
         self._switching = False
         self._provisional_pushed_for: int | None = None
+        self._beat_task: asyncio.Task | None = None
+
+    async def close(self) -> None:
+        """Stop auxiliary work spawned by the feed during application shutdown."""
+        if self._beat_task is not None and not self._beat_task.done():
+            self._beat_task.cancel()
+            await asyncio.gather(self._beat_task, return_exceptions=True)
 
     async def run(self) -> None:
         while not self.state.should_shutdown():
@@ -236,7 +243,9 @@ class MarketFeed:
                 beat, candle_start_ts=market.candle_start_ts
             )
         else:
-            asyncio.create_task(self._capture_beat_when_ready())
+            if self._beat_task is not None and not self._beat_task.done():
+                self._beat_task.cancel()
+            self._beat_task = asyncio.create_task(self._capture_beat_when_ready())
         self.state.update(
             market=market_to_dict(market),
             prices=None,
@@ -255,8 +264,11 @@ class MarketFeed:
             asks = _normalize_levels(getattr(book, "asks", []) or [])
             if bids or asks:
                 self.state.update_feed_book(side, bids, asks)
-        except Exception:
-            logger.exception("REST book bootstrap failed for %s", side)
+        except Exception as exc:
+            # The WebSocket remains the source of truth. A transient REST
+            # bootstrap failure (network drop, DNS blip, or upstream close)
+            # must not produce a traceback or stop the next reconnect.
+            logger.warning("REST book bootstrap unavailable for %s: %s", side, exc)
 
     async def _handle_message(self, raw: str | bytes) -> None:
         if raw in ("PONG", "PING"):

@@ -235,16 +235,33 @@ function recomputeBtcDeltas() {
   }
 }
 
+/** Pick the freshest usable spot source for the BTC panel and chart. */
+function currentBtcSpot(btc, now = Date.now() / 1000) {
+  if (!btc) return { value: null, source: null, binanceAge: Infinity };
+  const binance = btc.price != null ? Number(btc.price) : NaN;
+  const chainlink = btc.chainlink != null ? Number(btc.chainlink) : NaN;
+  const binanceAge = btc.updated_at != null ? now - Number(btc.updated_at) : Infinity;
+
+  if (Number.isFinite(binance) && binanceAge <= 2) {
+    return { value: binance, source: "binance", binanceAge };
+  }
+  // State switches the server history to Chainlink after a two-second Binance
+  // gap. Mirror that choice here so a stale opening price cannot pin Δ at $0.
+  if (Number.isFinite(chainlink)) {
+    return { value: chainlink, source: "chainlink", binanceAge };
+  }
+  return Number.isFinite(binance)
+    ? { value: binance, source: "stale-binance", binanceAge }
+    : { value: null, source: null, binanceAge };
+}
+
 /**
- * Push a live sample from the latest btc panel tick.
+ * Push a live sample from the latest BTC panel tick.
  * Always uses wall clock so a frozen server updated_at cannot pin the series.
  */
 function seedBtcLivePoint(btc) {
-  if (!btc) return;
-  // Prefer Binance; fall back to Chainlink if the fast tape is silent.
-  const v = btc.price != null ? Number(btc.price)
-    : (btc.chainlink != null ? Number(btc.chainlink) : null);
-  if (v == null || isNaN(v)) return;
+  const { value: v } = currentBtcSpot(btc);
+  if (v == null) return;
 
   const now = Date.now() / 1000;
   let d = null;
@@ -775,11 +792,9 @@ function updateBtcPanel(btc) {
   const beatPrefix = btc.beat_estimated ? "Beat ~" : "Beat";
   const beatText = btc.price_to_beat != null ? `${beatPrefix} ${fmtUsd(btc.price_to_beat)}` : "Beat —";
 
-  // Prefer fast Binance (price); Chainlink only as fallback for the hero number.
-  const binanceAge = btc.updated_at != null ? (Date.now() / 1000 - Number(btc.updated_at)) : 999;
-  const livePrice = (btc.price != null && binanceAge < 5)
-    ? btc.price
-    : (btc.price != null ? btc.price : btc.chainlink);
+  const spot = currentBtcSpot(btc);
+  const binanceAge = spot.binanceAge;
+  const livePrice = spot.value;
   if (livePrice != null) {
     setText("btc-spot", fmtUsd(livePrice));
     setText("hero-btc-price", fmtUsd(livePrice));
@@ -808,7 +823,8 @@ function updateBtcPanel(btc) {
 
   if (delta != null) {
     smooth.btcDelta = lerp(smooth.btcDelta, delta, 0.45);
-    const stale = binanceAge > 3 ? " · lag" : "";
+    const stale = spot.source === "chainlink" ? " · oracle fallback"
+      : (spot.source === "stale-binance" || binanceAge > 3 ? " · lag" : "");
     setText("btc-chart-meta", `${fmtDelta(delta)} · ${chartWindowLabel()}${stale}`);
     const metaEl = document.getElementById("btc-chart-meta");
     if (metaEl) metaEl.className = deltaCls;

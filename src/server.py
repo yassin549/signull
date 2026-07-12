@@ -109,6 +109,24 @@ class BotService:
         if self._hub_task is None or self._hub_task.done():
             self._hub_task = asyncio.create_task(self.hub.run())
 
+    async def shutdown_background_tasks(self) -> None:
+        """Cancel and join service tasks so Uvicorn can exit cleanly."""
+        tasks = [
+            task
+            for task in (
+                self._watchdog_task,
+                self._feed_task,
+                self._btc_feed_task,
+                self._hub_task,
+            )
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.feed.close()
+
 
 def create_app(config: BotConfig) -> FastAPI:
     service = BotService(config)
@@ -139,8 +157,12 @@ def create_app(config: BotConfig) -> FastAPI:
             "has_wallet": config.has_wallet,
             "signature_type": config.signature_type,
             "signature_label": config.signature_label,
-            "strategy": "signull_1_0",
-            "strategy_name": "Signull 1.0",
+            "strategy": config.strategy_id,
+            "strategy_name": (
+                service._bot.strategy.meta.name
+                if service._bot is not None
+                else config.strategy_id
+            ),
             "paper_initial_capital": config.paper_initial_capital,
             "strategy_params": config.strategy_params(),
         }
@@ -168,7 +190,9 @@ def create_app(config: BotConfig) -> FastAPI:
             await ws.send_json(service.state.get_snapshot(history_points=600))
             while True:
                 await asyncio.sleep(60)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # Normal disconnect or application shutdown. CancelledError is a
+            # BaseException in modern Python, so it is not covered below.
             pass
         except Exception:
             pass
@@ -188,5 +212,6 @@ def create_app(config: BotConfig) -> FastAPI:
     async def shutdown():
         service.state.request_shutdown()
         service.stop_bot()
+        await service.shutdown_background_tasks()
 
     return app

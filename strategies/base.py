@@ -82,6 +82,38 @@ class Strategy(ABC):
         self._losses_streak = losses_streak
         self._equity_momentum = equity_momentum
 
+    def on_trade_settled(self, won: bool) -> None:
+        """Receive the outcome of a trade placed by this strategy.
+
+        The default is intentionally a no-op. Adaptive strategies can use this
+        hook to update online calibration without the engine knowing their
+        model details.
+        """
+
+    def on_signal_resolved(self, won: bool, *, traded: bool) -> None:
+        """Receive the eventual outcome of every eligible backtest signal.
+
+        `traded` distinguishes an executed trade from a signal that was
+        deliberately declined by position sizing.  Adaptive strategies can
+        keep learning after a zero-risk decision instead of freezing forever.
+        """
+        del won, traded
+
+    def register_closed_candle(
+        self,
+        slug: str,
+        ticks: list[tuple[int, float, float]],
+    ) -> bool:
+        """Receive a completed live candle and return whether its path was noisy.
+
+        The live bot calls this for every candle, including when no trade was
+        entered.  Most strategies do not use intrabar-path trust, so their
+        default is a clean no-op.  Strategies that do use it (such as
+        Signull 1.0) override this hook.
+        """
+        del slug, ticks
+        return False
+
     @abstractmethod
     def evaluate(self, tick: TickContext, candle: CandleContext, *, entered: bool) -> TradeSignal | None:
         """

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=8" />
+  <link rel="stylesheet" href="/static/styles.css?v=10" />
 </head>
 <body>
   <div class="app">
@@ -37,21 +37,26 @@
           <option value="xrp">XRP</option>
         </select>
       </div>
-      <div class="field">
-        <label for="data-period">Data period</label>
-        <select id="data-period">
-          <option value="12">Last 1 hour</option>
-          <option value="72">Last 6 hours</option>
-          <option value="100" selected>Last ~8 hours</option>
-          <option value="144">Last 12 hours</option>
-          <option value="288">Last 24 hours</option>
-          <option value="432">Last 36 hours</option>
-        </select>
-        <p class="hint">Ends at the latest resolved 5-minute market.</p>
+      <div class="field date-range-field">
+        <label>Backtest period (UTC)</label>
+        <div class="date-inputs">
+          <input id="start-date" type="datetime-local" step="60" aria-label="Backtest start time in UTC" />
+          <span>to</span>
+          <input id="end-date" type="datetime-local" step="60" aria-label="Backtest end time in UTC" />
+        </div>
+        <div class="date-actions">
+          <button class="period-btn" type="button" data-days="1">1D</button>
+          <button class="period-btn" type="button" data-days="7">7D</button>
+          <button class="period-btn" type="button" data-days="30">30D</button>
+          <button class="period-btn" id="all-history-btn" type="button">All available</button>
+        </div>
+        <p class="hint" id="date-range-hint">Choose exact UTC dates and times from Polymarket's retained 5-minute history.</p>
+        <p class="candle-estimate" id="candle-estimate">Select a range to estimate candles.</p>
       </div>
-      <div class="field">
+      <div class="field capital-field">
         <label for="initial-capital">Starting capital ($)</label>
         <input id="initial-capital" type="number" min="1" step="1" value="100" />
+        <p class="hint">Your simulated bankroll at the start of this period.</p>
       </div>
       <div class="field params-field">
         <label>Strategy params</label>
@@ -93,6 +98,6 @@
       </div>
     </section>
   </div>
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

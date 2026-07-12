@@ -155,7 +155,7 @@ class Signull10Strategy(Strategy):
             "Signull 1.0: resting limit at 70¢ (default). Favorite thr (≥50¢): "
             "fill only when a side RISES to ≥ thr. Underdog thr (<50¢): fill only "
             "when a side DROPS to ≤ thr. Binary sizing via spot-chart align + path "
-            "trust + equity buffer."
+            "trust + equity buffer; 3–4 consecutive wins use 25% risk."
         ),
         default_params={
             "threshold": 0.70,
@@ -172,7 +172,7 @@ class Signull10Strategy(Strategy):
     def __init__(self, params: dict | None = None, *, asset: str = "btc"):
         super().__init__(params)
         self._normalize_params()
-        self._asset = (asset or "btc").lower()
+        self._asset = str(self.params.get("asset", asset) or "btc").lower()
         self._klines: list | None = None
         self._klines_fetched_at: float = 0.0
         self._klines_lock = threading.Lock()
@@ -426,9 +426,12 @@ class Signull10Strategy(Strategy):
         hot_streak_risk = float(self.params["hot_streak_risk_pct"])
         hi = float(self.params["max_risk_pct"])
 
-        # This is deliberately an exact streak, not a count of wins in a
-        # rolling window.  The higher stake applies to wins 4 and 5 only.
-        if self._wins_streak in (3, 4):
+        # The engines pass an exact, consecutive settled-win count. The hot
+        # streak rule takes priority so both the 3- and 4-win cases are always
+        # staked at 25% of initial capital.
+        hot_streak = self._wins_streak in (3, 4)
+
+        if hot_streak:
             self._last_size_label = "hot-streak"
             signal.reason = (
                 f"{signal.reason} · {self._wins_streak}-win streak "
