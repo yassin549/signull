@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "saved_at": 1784187597.230693,
+  "trading_mode": "live",
+  "asset": "btc",
+  "strategy_id": "signull_1_1",
+  "initial_capital": 100.0,
+  "equity": 100.0,
+  "peak_equity": 100.0,
+  "wins_recent": [],
+  "wins_streak": 1,
+  "losses_streak": 0,
+  "trades_placed": 1,
+  "strategy_trades": [
+    {
+      "t": 1784015335.4506125,
+      "slug": "s",
+      "title": "t",
+      "side": "up",
+      "entry_price": 0.5,
+      "stake": 20.0,
+      "entry_fee": 0.0,
+      "size_label": "big",
+      "risk_pct": 50.0,
+      "winner": "up",
+      "won": true,
+      "pnl": null,
+      "equity_after": null,
+      "mode": "live",
+      "reason": "x",
+      "resolve_source": "gamma",
+      "filled_shares": 40.0
+    }
+  ],
+  "equity_history": [
+    {
+      "t": 1784187489.4080226,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187498.5406787,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187506.008157,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187514.9407418,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187523.709126,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187532.0710814,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187541.100352,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187552.3346004,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187561.294216,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187569.9211502,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187578.401316,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187587.0673516,
+      "v": 0.0,
+      "mode": "live"
+    },
+    {
+      "t": 1784187595.217518,
+      "v": 0.0,
+      "mode": "live"
+    }
+  ]
+}

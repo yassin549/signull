@@ -22,6 +22,8 @@ let needsRedraw = true;
 let lastServerTs = null;
 let countdownBase = null;
 let activeCandleSlug = null;
+let activeCandleStartTs = null;
+let lastBtcSnapshot = null;
 let feedReconnecting = false;
 let localWindowStart = null;
 
@@ -138,10 +140,13 @@ function applySnapshot(d, isFull) {
     mergeHistory(incoming);
   }
 
+  syncCandleWindow(d);
+
   const btcIncoming = d.btc_history || [];
   if (isFull) {
-    // Server is authoritative on full poll — empty is OK right after rollover.
-    btcHistory = (btcIncoming || []).map(normalizeBtcPoint);
+    btcHistory = filterBtcHistoryForCandle(
+      (btcIncoming || []).map(normalizeBtcPoint)
+    );
   } else if (btcIncoming.length) {
     mergeBtcHistory(btcIncoming);
   }
@@ -189,25 +194,52 @@ function mergeHistory(incoming) {
   if (history.length > 6000) history = history.slice(-6000);
 }
 
+function candleWindowStart() {
+  if (activeCandleStartTs != null) return activeCandleStartTs;
+  return clockWindowStart();
+}
+
+function syncCandleWindow(d) {
+  const cs = d.btc_candle_start_ts ?? d.market?.candle_start_ts;
+  if (cs != null && Number.isFinite(Number(cs))) {
+    const next = Number(cs);
+    if (activeCandleStartTs !== next) {
+      activeCandleStartTs = next;
+      btcHistory = filterBtcHistoryForCandle(btcHistory);
+      recomputeBtcDeltas();
+    }
+  }
+}
+
+function filterBtcHistoryForCandle(points) {
+  const start = candleWindowStart();
+  if (start == null) return points;
+  return points.filter(p =>
+    (p.cs != null && Number(p.cs) === Number(start))
+    || (p.cs == null && p.t >= start - 1)
+  );
+}
+
 function mergeBtcHistory(incoming) {
+  incoming = filterBtcHistoryForCandle(incoming.map(normalizeBtcPoint));
   if (!incoming.length) return;
+  btcHistory = filterBtcHistoryForCandle(btcHistory);
   if (!btcHistory.length) {
-    btcHistory = incoming.map(normalizeBtcPoint);
+    btcHistory = incoming.slice();
     return;
   }
   // Index by rounded time so slower server samples can update/extend even if
   // the client live-tail timestamp is slightly ahead.
   const byT = new Map();
   for (const p of btcHistory) byT.set(Math.round(p.t * 20) / 20, p);
-  for (const raw of incoming) {
-    const pt = normalizeBtcPoint(raw);
+  for (const pt of incoming) {
     const key = Math.round(pt.t * 20) / 20;
     const prev = byT.get(key);
     if (!prev || (pt.v != null && (prev.v == null || pt.t >= prev.t))) {
       byT.set(key, pt);
     }
   }
-  btcHistory = [...byT.values()].sort((a, b) => a.t - b.t);
+  btcHistory = filterBtcHistoryForCandle([...byT.values()].sort((a, b) => a.t - b.t));
   if (btcHistory.length > 6000) btcHistory = btcHistory.slice(-6000);
 }
 
@@ -261,24 +293,33 @@ function currentBtcSpot(btc, now = Date.now() / 1000) {
  */
 function seedBtcLivePoint(btc) {
   const { value: v } = currentBtcSpot(btc);
-  if (v == null) return;
+  if (v == null) return false;
 
   const now = Date.now() / 1000;
   let d = null;
   if (priceToBeat != null) d = v - priceToBeat;
   else if (btc.delta != null) d = Number(btc.delta);
 
+  const cs = activeCandleStartTs;
+  const point = { t: now, v, d, cs };
+
   if (!btcHistory.length) {
-    btcHistory.push({ t: now, v, d });
-    return;
+    btcHistory.push(point);
+    return true;
   }
   const last = btcHistory[btcHistory.length - 1];
   if (now - last.t < 0.045) {
-    btcHistory[btcHistory.length - 1] = { t: now, v, d: d != null ? d : last.d };
+    btcHistory[btcHistory.length - 1] = { ...last, ...point };
   } else {
-    btcHistory.push({ t: now, v, d: d != null ? d : last.d });
+    btcHistory.push(point);
     if (btcHistory.length > 6000) btcHistory = btcHistory.slice(-6000);
   }
+  return true;
+}
+
+function liveBtcSpotPrice() {
+  if (!lastBtcSnapshot) return null;
+  return currentBtcSpot(lastBtcSnapshot).value;
 }
 
 const onUpdate = safe(function onUpdate(d) {
@@ -300,18 +341,27 @@ function detectCandleChange(market) {
   if (!slug || slug === activeCandleSlug) return;
   const isRollover = activeCandleSlug !== null;
   activeCandleSlug = slug;
-  if (isRollover) resetCandleUI(market?.provisional ? "soft" : "full");
   countdownBase = { market };
+  if (market?.candle_start_ts != null) {
+    activeCandleStartTs = Number(market.candle_start_ts);
+  } else if (slug.startsWith("local-")) {
+    activeCandleStartTs = Number(slug.slice("local-".length)) || clockWindowStart();
+  }
+  if (isRollover) {
+    resetCandleUI(market?.provisional ? "soft" : "full");
+    pollStatus();
+  }
 }
 
 function resetCandleUI(mode = "full") {
   // Soft: keep last odds prices briefly while provisional window loads.
-  // BTC series always resets on candle change — keeping the previous window
-  // rebased onto the new open beat pinned Δ near 0 and looked "stuck".
+  // Drop prior-candle BTC samples instead of rebasing them onto a new beat,
+  // which pinned Δ near 0 and made the chart look frozen.
   history = [];
-  btcHistory = [];
+  btcHistory = filterBtcHistoryForCandle(btcHistory);
   priceToBeat = null;
   smooth.btcDelta = null;
+  lastServerTs = null;
   lastTradeId = null;
   needsRedraw = true;
   if (mode === "full") {
@@ -778,6 +828,7 @@ function updateLog(entries) {
 
 function updateBtcPanel(btc) {
   if (!btc) return;
+  lastBtcSnapshot = btc;
 
   const prevBeat = priceToBeat;
   if (btc.price_to_beat != null) {
@@ -880,11 +931,15 @@ function chartNow() {
 
 function chartWindowSec() {
   const now = chartNow();
-  let earliest = now;
+  const candleStart = candleWindowStart();
+  const candleSpan = Math.max(0, now - candleStart);
+  let earliest = candleStart;
   if (history.length) earliest = Math.min(earliest, history[0].t);
   if (btcHistory.length) earliest = Math.min(earliest, btcHistory[0].t);
-  if (!history.length && !btcHistory.length) return CANDLE_SEC;
-  const span = now - earliest;
+  const span = Math.max(candleSpan, now - earliest);
+  if (!history.length && !btcHistory.length) {
+    return Math.min(CANDLE_SEC, Math.max(45, candleSpan + 2));
+  }
   return Math.min(CANDLE_SEC, Math.max(45, span + 2));
 }
 
@@ -1005,54 +1060,35 @@ function drawLine(ctx, pts, key, color, xS, yS) {
   ctx.fill();
 }
 
-function btcPointDelta(p, baseline) {
-  // Always prefer absolute spot vs locked beat — avoids a frozen d=0 series
-  // when v later moves (or when an old d was computed against a wrong beat).
-  if (p.v != null && baseline != null) return p.v - baseline;
-  if (p.v != null && priceToBeat != null) return p.v - priceToBeat;
-  if (p.d != null) return p.d;
-  return null;
-}
-
 function drawBtcChart() {
   const canvas = document.getElementById("btc-chart");
   if (!canvas) return false;
   const setup = setupCanvas(canvas);
   if (!setup) return false;
   const { ctx, w: W, h: H } = setup;
+  const pad = { l: 62, r: 12, t: 12, b: 26 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
 
   ctx.fillStyle = "#06090f";
   ctx.fillRect(0, 0, W, H);
 
-  if (!btcHistory.length) {
-    return true;
-  }
-
-  const pad = { l: 52, r: 12, t: 12, b: 26 };
-  const plotW = W - pad.l - pad.r;
-  const plotH = H - pad.t - pad.b;
-  // Same time window as the odds chart so movements line up visually.
-  const windowSec = chartWindowSec();
   const now = chartNow();
-  const tMin = now - windowSec;
+  const windowSec = chartWindowSec();
+  const tMin = Math.max(candleWindowStart(), now - windowSec);
+  const liveSpot = liveBtcSpotPrice();
 
-  // Baseline for Δ: official beat when known, else first visible absolute price
-  // so we still draw a continuous series during beat loading / soft rollover.
-  let baseline = priceToBeat;
-  const inWindow = btcHistory.filter(p => p.t >= tMin && (p.v != null || p.d != null));
-  if (baseline == null && inWindow.length) {
-    const firstV = inWindow.find(p => p.v != null);
-    if (firstV) baseline = firstV.v;
+  let visible = filterBtcHistoryForCandle(btcHistory)
+    .filter(p => p.t >= tMin && p.v != null)
+    .map(p => ({ t: p.t, v: Number(p.v) }));
+
+  if (liveSpot != null) {
+    visible = [...visible, { t: now, v: Number(liveSpot) }];
   }
 
-  let visible = inWindow
-    .map(p => ({ t: p.t, d: btcPointDelta(p, baseline), v: p.v }))
-    .filter(p => p.d != null);
-
-  // Single point: synthesize a flat start so we still show a line.
   if (visible.length === 1) {
     visible = [
-      { t: Math.max(tMin, visible[0].t - 1), d: visible[0].d },
+      { t: Math.max(tMin, visible[0].t - 1), v: visible[0].v },
       visible[0],
     ];
   }
@@ -1061,36 +1097,43 @@ function drawBtcChart() {
     return true;
   }
 
-  // Live tail (smooth) — same trick as the odds chart.
-  if (smooth.btcDelta != null) {
-    visible = [...visible, { t: now, d: smooth.btcDelta }];
-  } else {
-    // Extend last sample to "now" so the line doesn't leave a gap at the right edge.
-    const last = visible[visible.length - 1];
-    if (now - last.t > 0.05) {
-      visible = [...visible, { t: now, d: last.d }];
-    }
-  }
-
-  const vals = visible.map(p => p.d);
-  const absMax = Math.max(...vals.map(Math.abs), 5);
-  const padY = Math.max(2, absMax * 0.15);
-  let yMin = Math.min(-padY, Math.min(...vals) - padY);
-  let yMax = Math.max(padY, Math.max(...vals) + padY);
-  if (yMax - yMin < 10) {
-    yMin = -5;
-    yMax = 5;
+  const beat = priceToBeat != null ? Number(priceToBeat) : null;
+  const vals = visible.map(p => p.v);
+  if (beat != null) vals.push(beat);
+  let yMin = Math.min(...vals);
+  let yMax = Math.max(...vals);
+  const span = yMax - yMin;
+  const padY = Math.max(span * 0.08, beat != null ? Math.max(8, beat * 0.00015) : 8);
+  yMin -= padY;
+  yMax += padY;
+  if (yMax - yMin < 1) {
+    const mid = (yMax + yMin) / 2;
+    yMin = mid - 0.5;
+    yMax = mid + 0.5;
   }
 
   const xS = t => pad.l + ((t - tMin) / windowSec) * plotW;
-  const yS = d => pad.t + plotH - ((d - yMin) / (yMax - yMin)) * plotH;
-  const y0 = yS(0);
+  const yS = price => pad.t + plotH - ((price - yMin) / (yMax - yMin)) * plotH;
 
-  // Up / down zones vs beat (0)
-  ctx.fillStyle = "rgba(14, 203, 129, 0.06)";
-  ctx.fillRect(pad.l, pad.t, plotW, Math.max(0, y0 - pad.t));
-  ctx.fillStyle = "rgba(246, 70, 93, 0.06)";
-  ctx.fillRect(pad.l, y0, plotW, pad.t + plotH - y0);
+  if (beat != null) {
+    const yBeat = yS(beat);
+    ctx.fillStyle = "rgba(14, 203, 129, 0.05)";
+    ctx.fillRect(pad.l, pad.t, plotW, Math.max(0, yBeat - pad.t));
+    ctx.fillStyle = "rgba(246, 70, 93, 0.05)";
+    ctx.fillRect(pad.l, yBeat, plotW, pad.t + plotH - yBeat);
+    ctx.strokeStyle = "rgba(240, 185, 11, 0.75)";
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yBeat);
+    ctx.lineTo(W - pad.r, yBeat);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(240, 185, 11, 0.9)";
+    ctx.textAlign = "left";
+    ctx.font = "9px JetBrains Mono, monospace";
+    ctx.fillText(`Beat ${fmtUsdCompact(beat)}`, pad.l + 4, yBeat - 5);
+  }
 
   ctx.strokeStyle = "#1a2438";
   ctx.lineWidth = 1;
@@ -1104,37 +1147,11 @@ function drawBtcChart() {
     ctx.fillStyle = "#5a6d8a";
     ctx.textAlign = "right";
     const tickVal = yMax - ((yMax - yMin) / 4) * i;
-    ctx.fillText(fmtDeltaCompact(tickVal), pad.l - 4, y + 3);
+    ctx.fillText(fmtUsdCompact(tickVal), pad.l - 4, y + 3);
   }
 
-  // Beat = 0 line
-  ctx.strokeStyle = "rgba(240, 185, 11, 0.7)";
-  ctx.setLineDash([6, 4]);
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(pad.l, y0);
-  ctx.lineTo(W - pad.r, y0);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = "rgba(240, 185, 11, 0.9)";
-  ctx.textAlign = "left";
-  ctx.fillText(priceToBeat != null ? "Beat 0" : "ref 0", pad.l + 4, y0 - 5);
-
-  const lastDelta = visible[visible.length - 1].d;
-  const lineColor = lastDelta >= 0 ? "#0ecb81" : "#f6465d";
-
-  // Fill to zero
-  ctx.fillStyle = lastDelta >= 0 ? "rgba(14, 203, 129, 0.12)" : "rgba(246, 70, 93, 0.12)";
-  ctx.beginPath();
-  visible.forEach((p, i) => {
-    const x = xS(p.t), y = yS(p.d);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.lineTo(xS(visible[visible.length - 1].t), y0);
-  ctx.lineTo(xS(visible[0].t), y0);
-  ctx.closePath();
-  ctx.fill();
+  const last = visible[visible.length - 1];
+  const lineColor = beat != null && last.v >= beat ? "#0ecb81" : "#f6465d";
 
   ctx.strokeStyle = lineColor;
   ctx.lineWidth = 2;
@@ -1142,16 +1159,16 @@ function drawBtcChart() {
   ctx.lineCap = "round";
   ctx.beginPath();
   visible.forEach((p, i) => {
-    const x = xS(p.t), y = yS(p.d);
+    const x = xS(p.t);
+    const y = yS(p.v);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 
-  const last = visible[visible.length - 1];
   ctx.fillStyle = lineColor;
   ctx.beginPath();
-  ctx.arc(xS(last.t), yS(last.d), 3.5, 0, Math.PI * 2);
+  ctx.arc(xS(last.t), yS(last.v), 3.5, 0, Math.PI * 2);
   ctx.fill();
 
   return true;
@@ -1241,6 +1258,9 @@ function drawEquityChart() {
 }
 
 function renderLoop() {
+  if (lastBtcSnapshot) {
+    if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
+  }
   // Keep redrawing while live so both charts advance the right edge smoothly.
   const animating = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
   if (needsRedraw || animating) {

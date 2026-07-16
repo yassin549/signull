@@ -134,11 +134,49 @@ class BotState:
                 if hasattr(self._snapshot, key):
                     setattr(self._snapshot, key, value)
             if "account" in kwargs and kwargs["account"]:
-                self._append_equity_locked(kwargs["account"])
+                self._append_equity_from_account_locked(kwargs["account"])
             self._bump()
             return self._snapshot
 
-    def _append_equity_locked(self, account: dict[str, Any]) -> None:
+    def record_equity_point(
+        self,
+        equity: float,
+        *,
+        mode: str | None = None,
+        force: bool = False,
+    ) -> None:
+        """Append a balance sample for the dashboard equity curve."""
+        with self._lock:
+            self._append_equity_locked(
+                float(equity),
+                mode=str(mode or self._snapshot.mode).lower(),
+                force=force,
+            )
+            self._bump()
+
+    def _append_equity_locked(
+        self,
+        equity: float,
+        *,
+        mode: str,
+        force: bool = False,
+    ) -> None:
+        now = time.time()
+        previous = self._equity_history[-1] if self._equity_history else None
+        # Preserve every balance move; otherwise retain a five-second sample.
+        if (
+            not force
+            and previous
+            and previous["v"] == equity
+            and now - self._last_equity_append < 5.0
+        ):
+            return
+        self._equity_history.append(
+            {"t": now, "v": round(equity, 4), "mode": mode}
+        )
+        self._last_equity_append = now
+
+    def _append_equity_from_account_locked(self, account: dict[str, Any]) -> None:
         """Record paper equity or the latest observed live USDC balance."""
         mode = str(account.get("mode") or self._snapshot.mode).lower()
         raw = account.get("balance_usdc") if mode == "live" else account.get("paper_equity")
@@ -146,14 +184,7 @@ class BotState:
             equity = float(raw)
         except (TypeError, ValueError):
             return
-
-        now = time.time()
-        previous = self._equity_history[-1] if self._equity_history else None
-        # Preserve every balance move; otherwise retain a five-second sample.
-        if previous and previous["v"] == equity and now - self._last_equity_append < 5.0:
-            return
-        self._equity_history.append({"t": now, "v": round(equity, 4), "mode": mode})
-        self._last_equity_append = now
+        self._append_equity_locked(equity, mode=mode, force=False)
 
     def increment(self, field_name: str, amount: int = 1) -> None:
         with self._lock:
@@ -249,6 +280,30 @@ class BotState:
             trades = list(self._snapshot.strategy_trades)
             trades.insert(0, trade)
             self._snapshot.strategy_trades = trades[:100]
+            self._bump()
+
+    def restore_persisted(
+        self,
+        *,
+        strategy_trades: list[dict[str, Any]] | None = None,
+        equity_history: list[dict[str, Any]] | None = None,
+        trades_placed: int = 0,
+    ) -> None:
+        """Hydrate dashboard history from a saved session."""
+        with self._lock:
+            if strategy_trades:
+                self._snapshot.strategy_trades = list(strategy_trades)[:100]
+            if equity_history:
+                self._equity_history.clear()
+                for point in equity_history[-self._equity_history.maxlen :]:
+                    if isinstance(point, dict) and "v" in point:
+                        self._equity_history.append(point)
+                if self._equity_history:
+                    self._last_equity_append = float(
+                        self._equity_history[-1].get("t", 0.0)
+                    )
+            if trades_placed > 0:
+                self._snapshot.trades_placed = int(trades_placed)
             self._bump()
 
     def set_feed_status(self, connected: bool, extra: dict | None = None) -> None:
@@ -441,6 +496,8 @@ class BotState:
         beat = self._price_to_beat
         if beat is not None:
             point["d"] = round(float(spot) - float(beat), 2)
+        if self._beat_candle_start is not None:
+            point["cs"] = int(self._beat_candle_start)
 
         self._btc_history.append(point)
         self._last_btc_append = now
@@ -568,7 +625,6 @@ class BotState:
             self._snapshot.orderbooks = {}
             self._snapshot.trades = []
             self._price_history.clear()
-            self._btc_history.clear()
             self._last_btc_append = 0.0
             self._price_to_beat = None
             self._beat_candle_start = None
@@ -577,12 +633,34 @@ class BotState:
             self._sync_btc_locked()
             self._bump()
 
+    def _active_btc_candle_start(self) -> int | None:
+        market = self._snapshot.market or {}
+        raw = market.get("candle_start_ts")
+        if raw is not None:
+            return int(raw)
+        if self._beat_candle_start is not None:
+            return int(self._beat_candle_start)
+        return None
+
+    def _btc_history_for_dashboard(self, history_points: int) -> list[dict]:
+        candle_start = self._active_btc_candle_start()
+        points = list(self._btc_history)
+        if candle_start is not None:
+            points = [
+                p
+                for p in points
+                if p.get("cs") == candle_start
+                or (p.get("cs") is None and float(p.get("t", 0)) >= candle_start)
+            ]
+        return slice_history_tail(points, history_points)
+
     def get_snapshot(self, history_points: int = 600) -> dict[str, Any]:
         with self._lock:
             data = asdict(self._snapshot)
             data["activity"] = [e.to_dict() for e in list(self._log)]
             data["price_history"] = slice_history_tail(self._price_history, history_points)
-            data["btc_history"] = slice_history_tail(self._btc_history, history_points)
+            data["btc_history"] = self._btc_history_for_dashboard(history_points)
+            data["btc_candle_start_ts"] = self._active_btc_candle_start()
             data["equity_history"] = slice_history_tail(self._equity_history, history_points)
             data["version"] = self._version
             return data

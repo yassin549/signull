@@ -1,8 +1,10 @@
 """
 Signull 1.0
 
-Limit entry at `threshold` — fill only when the market actually trades through
-that price. Side selection is fixed; edge is sizing only.
+Enter when a side first crosses the threshold during the candle. The entry is
+recorded at the observed price at that crossing — never at an invented fixed
+70¢ fill. In a live order, the bot replaces that observation with the current
+executable ask before submitting the buy.
 
 Two regimes (auto from threshold):
   • Underdog  (threshold < 0.50): wait for a side to DROP to ≤ threshold
@@ -10,9 +12,8 @@ Two regimes (auto from threshold):
   • Favorite  (threshold ≥ 0.50): wait for a side to RISE to ≥ threshold
     e.g. 70¢ — classic "first to 70%" entry.
 
-Fill price is always exactly `threshold` (resting limit). We only fire when
-the printed mid has crossed the limit, so we never invent a fill at 10¢ while
-the book is still 50¢.
+Historical price history does not contain executable bid/ask depth, so its
+backtest price remains an observed-price proxy rather than proof of a fill.
 
 Size big only when ALL hold:
   1. BTC 1m chart is trending in the same direction as our side
@@ -106,11 +107,10 @@ def first_limit_hit(
     threshold: float,
 ) -> tuple[str, float] | None:
     """
-    Return (side, market_print) if a resting limit at `threshold` would fill.
+    Return (side, market_print) when an observation is beyond ``threshold``.
 
-    Underdog: mid ≤ threshold (odds dropped to our bid).
-    Favorite: mid ≥ threshold (odds rose to our bid on the favorite).
-    If both hit on the same tick, pick the side that is more through the limit.
+    This is deliberately stateless for simple callers. The strategy itself
+    also requires a crossing from the prior observation before it signals.
     """
     thr = float(threshold)
     underdog = is_underdog_threshold(thr)
@@ -145,17 +145,17 @@ def first_limit_hit(
 
 class Signull10Strategy(Strategy):
     """
-    Signull 1.0 — limit at threshold with correct underdog/favorite crossing.
+    Signull 1.0 — observed-price threshold crossing with binary sizing.
     """
 
     meta = StrategyMeta(
         id="signull_1_0",
         name="Signull 1.0",
         description=(
-            "Signull 1.0: resting limit at 70¢ (default). Favorite thr (≥50¢): "
-            "fill only when a side RISES to ≥ thr. Underdog thr (<50¢): fill only "
-            "when a side DROPS to ≤ thr. Binary sizing via spot-chart align + path "
-            "trust + equity buffer; 3–4 consecutive wins use 25% risk."
+            "Signull 1.0: enter only when a side crosses 70¢ (default), using "
+            "the observed crossing price in historical data and the live ask in "
+            "execution. Includes estimated crypto taker fees. Binary sizing via "
+            "spot-chart align + path trust + equity buffer; 3–4 wins use 25% risk."
         ),
         default_params={
             "threshold": 0.70,
@@ -166,6 +166,9 @@ class Signull10Strategy(Strategy):
             "btc_align_min": 0.55,
             "btc_lookback": BTC_LOOKBACK,
             "big_equity_buffer": 1.25,
+            # Crypto CLOB markets use the documented 7% fee-rate coefficient;
+            # the actual dollar fee is price-dependent and applied per trade.
+            "taker_fee_rate": 0.07,
         },
     )
 
@@ -181,6 +184,8 @@ class Signull10Strategy(Strategy):
         self._slug_order: list[str] = []
         self._slug_to_idx: dict[str, int] = {}
         self._last_size_label: str = "small"
+        self._entry_slug: str | None = None
+        self._previous_prices: tuple[float, float] | None = None
 
     def _klines_are_fresh_locked(self, now: float | None = None) -> bool:
         """Caller must hold `_klines_lock`. Empty/None is never fresh."""
@@ -298,6 +303,7 @@ class Signull10Strategy(Strategy):
             ("max_risk_pct", 0.50),
             ("btc_align_min", 0.55),
             ("big_equity_buffer", 1.25),
+            ("taker_fee_rate", 0.07),
         ):
             try:
                 v = float(p.get(key, default))
@@ -306,6 +312,8 @@ class Signull10Strategy(Strategy):
             if v != v:
                 v = default
             p[key] = v
+
+        p["taker_fee_rate"] = max(0.0, min(1.0, p["taker_fee_rate"]))
 
         try:
             p["trust_lookback"] = max(1, int(float(p.get("trust_lookback", 3))))
@@ -324,6 +332,8 @@ class Signull10Strategy(Strategy):
         self._noisy_by_slug.clear()
         self._slug_order = []
         self._slug_to_idx = {}
+        self._entry_slug = None
+        self._previous_prices = None
 
         if not candles:
             self._klines = None
@@ -391,17 +401,47 @@ class Signull10Strategy(Strategy):
             return None
 
         threshold = self._threshold()
-        hit = first_limit_hit(tick, threshold)
-        if hit is None:
+
+        # A threshold state is not an entry. Seed the first observation for
+        # each candle, then require the side to cross from the other side. A
+        # late startup/reconnect therefore cannot pretend it bought at 70¢
+        # after the market was already far beyond the threshold.
+        if candle.slug != self._entry_slug:
+            self._entry_slug = candle.slug
+            self._previous_prices = (tick.up, tick.down)
             return None
 
-        side, mkt = hit
-        fill = threshold
+        previous = self._previous_prices
+        self._previous_prices = (tick.up, tick.down)
+        if previous is None:
+            return None
+
         underdog = is_underdog_threshold(threshold)
+        if underdog:
+            up_crossed = previous[0] > threshold >= tick.up
+            down_crossed = previous[1] > threshold >= tick.down
+        else:
+            up_crossed = previous[0] < threshold <= tick.up
+            down_crossed = previous[1] < threshold <= tick.down
+
+        if not up_crossed and not down_crossed:
+            return None
+
+        if up_crossed and down_crossed:
+            if underdog:
+                side = "up" if tick.up <= tick.down else "down"
+            else:
+                side = "up" if tick.up >= tick.down else "down"
+            mkt = tick.up if side == "up" else tick.down
+        elif up_crossed:
+            side, mkt = "up", tick.up
+        else:
+            side, mkt = "down", tick.down
+
         cmp = "≤" if underdog else "≥"
         regime = "underdog" if underdog else "favorite"
 
-        # Safety: market must actually be on the correct side of the limit
+        # Safety: the crossing observation must be on the correct side.
         if underdog and mkt > threshold + 1e-9:
             return None
         if not underdog and mkt < threshold - 1e-9:
@@ -409,11 +449,12 @@ class Signull10Strategy(Strategy):
 
         return TradeSignal(
             side=side,
-            price=fill,
+            price=mkt,
             reason=(
                 f"{side.upper()} {regime} {cmp}{threshold:.0%} "
-                f"(limit @{fill:.0%}, mkt {mkt:.1%})"
+                f"(crossed at observed {mkt:.1%}; historical price proxy)"
             ),
+            taker_fee_rate=float(self.params["taker_fee_rate"]),
         )
 
     def position_risk_fraction(

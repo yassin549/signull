@@ -1,4 +1,4 @@
-"""Assert threshold changes fill price and win PnL."""
+"""Inspect Signull 1.0's observed-price threshold-crossing entries."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def main() -> None:
         sample = big_wins[0] if big_wins else (r.trades[0] if r.trades else None)
         print(
             f"threshold={thr:.2f} trades={r.candles_traded} "
-            f"entry_prices={sorted(prices)} "
+            f"observed_entry_prices={sorted(prices)} "
             f"end=${r.ending_capital:.2f}"
         )
         if sample:
@@ -40,7 +40,7 @@ def main() -> None:
                 f"  sample stake=${sample.stake:.2f} entry={sample.entry_price:.2f} "
                 f"won={sample.won} pnl={sample.pnl:+.2f}"
             )
-        assert prices == {thr}, f"expected all fills at {thr}, got {prices}"
+        assert all(p >= thr for p in prices), prices
 
 
 if __name__ == "__main__":

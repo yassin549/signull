@@ -27,6 +27,27 @@ def compute_stake(
     return stake
 
 
+def estimate_taker_fee(stake: float, entry_price: float, fee_rate: float) -> float:
+    """Estimate a CLOB taker fee for a binary-token buy."""
+    if stake <= 0 or not 0 < entry_price < 1 or fee_rate <= 0:
+        return 0.0
+    # shares * rate * price * (1 - price), where stake = shares * price
+    return float(stake) * float(fee_rate) * (1.0 - float(entry_price))
+
+
+def cap_stake_for_taker_fee(
+    stake: float,
+    entry_price: float,
+    fee_rate: float,
+    available_cash: float,
+) -> float:
+    """Cap share notional so notional plus the estimated fee fits cash."""
+    if stake <= 0 or available_cash <= 0:
+        return 0.0
+    multiplier = 1.0 + max(0.0, float(fee_rate)) * (1.0 - float(entry_price))
+    return min(float(stake), float(available_cash) / multiplier)
+
+
 def partial_fill_stake(filled_shares: float, entry_price: float) -> float:
     """USDC notional that actually filled: shares * limit price."""
     if filled_shares <= 0 or entry_price <= 0:

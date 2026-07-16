@@ -16,7 +16,13 @@ from src.config import BotConfig
 from src.ml import btc_features
 from src.ml.btc_features import window_features
 from src.polymarket import PolymarketClient
-from src.sizing import compute_stake, partial_fill_stake, scale_pending_for_fill
+from src.sizing import (
+    cap_stake_for_taker_fee,
+    compute_stake,
+    estimate_taker_fee,
+    partial_fill_stake,
+    scale_pending_for_fill,
+)
 from src.state import BotState, slice_history_tail
 
 
@@ -41,6 +47,7 @@ def _paper_config(**overrides) -> BotConfig:
         strategy_trust_lookback=3,
         strategy_btc_align_min=0.55,
         strategy_big_equity_buffer=1.25,
+        strategy_risk_pct=0.10,
     )
     base.update(overrides)
     return BotConfig(**base)
@@ -197,8 +204,32 @@ class SizingTests(unittest.TestCase):
         self.assertAlmostEqual(shares, 40.0)
         self.assertAlmostEqual(stake, 20.0)
 
+    def test_taker_fee_and_cash_cap(self):
+        # 100 shares at 70¢, with the crypto 7% fee coefficient, costs
+        # 70 * 0.07 * 0.30 = $1.47 in taker fees.
+        self.assertAlmostEqual(estimate_taker_fee(70.0, 0.70, 0.07), 1.47)
+        capped = cap_stake_for_taker_fee(100.0, 0.70, 0.07, 100.0)
+        self.assertAlmostEqual(capped + estimate_taker_fee(capped, 0.70, 0.07), 100.0)
+
+
+def _clear_paper_session() -> None:
+    from src.session_store import session_path
+
+    path = session_path(_paper_config())
+    if path.exists():
+        path.unlink()
+
 
 class BankrollSettleTests(unittest.TestCase):
+    def setUp(self):
+        _clear_paper_session()
+        self._save_patcher = mock.patch("src.bot.save_session")
+        self._save_patcher.start()
+
+    def tearDown(self):
+        self._save_patcher.stop()
+        _clear_paper_session()
+
     def test_apply_settle_updates_equity_consistently(self):
         bot = TradingBot(_paper_config())
         pending = PendingTrade(
@@ -569,7 +600,153 @@ class ConsecutiveWinStreakTests(unittest.TestCase):
             self.assertEqual(strategy.size_label(0.25), "hot-streak")
 
 
-class Signull11KellyTests(unittest.TestCase):
+class Signull10ExecutionTests(unittest.TestCase):
+    def test_requires_a_real_upward_cross_and_uses_observed_price(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_0 import Signull10Strategy
+
+        strategy = Signull10Strategy()
+        candle = CandleContext("c", "c", 0, 300, "")
+        first = TickContext(1, 0.50, 0.50, 1, 299)
+        below = TickContext(2, 0.69, 0.31, 2, 298)
+        crossed = TickContext(3, 0.73, 0.27, 3, 297)
+
+        self.assertIsNone(strategy.evaluate(first, candle, entered=False))
+        self.assertIsNone(strategy.evaluate(below, candle, entered=False))
+        signal = strategy.evaluate(crossed, candle, entered=False)
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertAlmostEqual(signal.price, 0.73)
+        self.assertAlmostEqual(signal.taker_fee_rate, 0.07)
+
+    def test_does_not_enter_from_an_already_above_threshold_first_quote(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_0 import Signull10Strategy
+
+        strategy = Signull10Strategy()
+        candle = CandleContext("c", "c", 0, 300, "")
+        self.assertIsNone(
+            strategy.evaluate(TickContext(1, 0.75, 0.25, 1, 299), candle, entered=False)
+        )
+        self.assertIsNone(
+            strategy.evaluate(TickContext(2, 0.80, 0.20, 2, 298), candle, entered=False)
+        )
+
+    def test_backtest_debits_signull_taker_fee(self):
+        from strategies.base import CandleContext, Strategy, StrategyMeta, TickContext, TradeSignal
+        from src.backtest.engine import run_backtest
+        from src.backtest.types import CandleDataset
+
+        class FeeStrategy(Strategy):
+            meta = StrategyMeta(id="fee", name="fee", description="fee")
+
+            def evaluate(self, _tick, _candle, *, entered):
+                if entered:
+                    return None
+                return TradeSignal("up", 0.70, "fee", taker_fee_rate=0.07)
+
+            def position_risk_fraction(self, *_args):
+                return 0.10
+
+        candle = CandleDataset(
+            "c", "c", 0, 300, "up", "u", "d", [(0, 0.50, 0.50)]
+        )
+        result = run_backtest(FeeStrategy(), [candle])
+
+        self.assertAlmostEqual(result.trades[0].stake, 10.0)
+        self.assertAlmostEqual(result.trades[0].entry_fee, 0.21)
+        # Backtest summary rounds ending capital to cents; the trade record
+        # retains the exact fee amount used to reach it.
+        self.assertAlmostEqual(result.ending_capital, 104.08, places=2)
+
+
+class Signull12RegimeKellyTests(unittest.TestCase):
+    def test_enters_on_the_first_threshold_eligible_observation(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_2 import Signull12Strategy
+
+        strategy = Signull12Strategy()
+        candle = CandleContext("c", "c", 0, 300, "")
+        self.assertIsNone(
+            strategy.evaluate(TickContext(1, .50, .50, 1, 299), candle, entered=False)
+        )
+        self.assertIsNone(
+            strategy.evaluate(TickContext(2, .69, .31, 2, 298), candle, entered=False)
+        )
+        signal = strategy.evaluate(
+            TickContext(3, .72, .28, 3, 297), candle, entered=False
+        )
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertAlmostEqual(signal.price, .72)
+        self.assertAlmostEqual(signal.taker_fee_rate, .07)
+
+    def test_enters_when_the_first_recorded_quote_is_already_eligible(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_2 import Signull12Strategy
+
+        strategy = Signull12Strategy()
+        candle = CandleContext("c", "c", 0, 300, "")
+        signal = strategy.evaluate(
+            TickContext(1, .76, .24, 1, 299), candle, entered=False
+        )
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertAlmostEqual(signal.price, .76)
+
+    def test_exploration_is_small_fraction_of_current_bankroll(self):
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_2 import Signull12Strategy
+
+        strategy = Signull12Strategy()
+        strategy.on_account_update(120.0, 100.0, 120.0)
+        signal = TradeSignal("up", .70, "test", taker_fee_rate=.07)
+        tick = TickContext(10, .70, .30, 10, 290)
+        candle = CandleContext("c", "c", 0, 300, "")
+
+        # 2% of current $120 is $2.40, represented as 2.4% of initial $100.
+        self.assertAlmostEqual(
+            strategy.position_risk_fraction(signal, tick, candle), .024
+        )
+        self.assertEqual(strategy.size_label(.024), "explore")
+
+    def test_no_edge_is_skipped_but_still_updates_calibration(self):
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_2 import Signull12Strategy
+
+        strategy = Signull12Strategy()
+        strategy._stats["all"] = [71, 100]
+        signal = TradeSignal("up", .70, "test", taker_fee_rate=.07)
+        tick = TickContext(10, .70, .30, 10, 290)
+        candle = CandleContext("c", "c", 0, 300, "")
+
+        self.assertEqual(strategy.position_risk_fraction(signal, tick, candle), 0.0)
+        self.assertEqual(strategy.size_label(0.0), "no-edge")
+        strategy.on_signal_resolved(True, traded=False)
+        self.assertEqual(strategy._stats["all"], [72, 101])
+
+    def test_positive_edge_uses_capped_fractional_kelly_not_win_streak(self):
+        from strategies.base import CandleContext, TickContext, TradeSignal
+        from strategies.signull_1_2 import Signull12Strategy
+
+        strategy = Signull12Strategy()
+        strategy._stats["all"] = [100, 100]
+        strategy._wins_streak = 12
+        signal = TradeSignal("up", .70, "test", taker_fee_rate=.07)
+        tick = TickContext(10, .70, .30, 10, 290)
+        candle = CandleContext("c", "c", 0, 300, "")
+
+        risk = strategy.position_risk_fraction(signal, tick, candle)
+        self.assertGreater(risk, 0.0)
+        self.assertLessEqual(risk, .10)
+        self.assertEqual(strategy.size_label(risk), "kelly")
+
+
+class Signull11AlwaysInTests(unittest.TestCase):
     def test_closed_candle_hook_is_a_clean_no_op(self):
         from strategies.signull_1_1 import Signull11Strategy
 
@@ -581,7 +758,40 @@ class Signull11KellyTests(unittest.TestCase):
             )
         )
 
-    def test_uses_ten_percent_current_bankroll_during_calibration(self):
+    def test_enters_at_threshold_when_favorite_crosses(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+        candle = CandleContext("c", "c", 0, 300, "up")
+        signal = strategy.evaluate(
+            TickContext(1, 0.70, 0.30, 10, 290), candle, entered=False
+        )
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertAlmostEqual(signal.price, 0.70)
+
+    def test_enters_near_close_when_threshold_never_hits(self):
+        from strategies.base import CandleContext, TickContext
+        from strategies.signull_1_1 import Signull11Strategy
+
+        strategy = Signull11Strategy()
+        candle = CandleContext("c", "c", 0, 300, "up")
+        self.assertIsNone(
+            strategy.evaluate(
+                TickContext(1, 0.55, 0.45, 10, 290), candle, entered=False
+            )
+        )
+        signal = strategy.evaluate(
+            TickContext(2, 0.58, 0.42, 298, 2), candle, entered=False
+        )
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertAlmostEqual(signal.price, 0.58)
+
+    def test_uses_fixed_fraction_of_current_bankroll(self):
         from strategies.base import CandleContext, TickContext, TradeSignal
         from strategies.signull_1_1 import Signull11Strategy
 
@@ -591,42 +801,148 @@ class Signull11KellyTests(unittest.TestCase):
         tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
         candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
 
-        # The engine takes a fraction of initial capital; 12% of initial is
-        # exactly a 10% allocation of the current $120 bankroll.
+        # 10% of current $120 is $12, represented as 12% of initial $100.
         self.assertAlmostEqual(strategy.position_risk_fraction(signal, tick, candle), 0.12)
-        self.assertEqual(strategy.size_label(0.12), "explore")
+        self.assertEqual(strategy.size_label(0.12), "flat")
 
-    def test_moves_to_conservative_kelly_after_warmup(self):
+    def test_never_declines_a_signal_for_zero_risk(self):
         from strategies.base import CandleContext, TickContext, TradeSignal
         from strategies.signull_1_1 import Signull11Strategy
 
         strategy = Signull11Strategy()
         strategy.on_account_update(100.0, 100.0, 100.0)
-        strategy._stats["all"] = [30, 30]
         signal = TradeSignal(side="up", price=0.70, reason="test")
         tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
         candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
 
         risk = strategy.position_risk_fraction(signal, tick, candle)
         self.assertGreater(risk, 0.0)
-        self.assertLessEqual(risk, 0.10)
-        self.assertEqual(strategy.size_label(risk), "kelly")
+        self.assertEqual(strategy.size_label(risk), "flat")
 
-    def test_declined_backtest_signal_keeps_calibrating(self):
-        """A no-edge decision must not freeze Signull 1.1's sample forever."""
-        from strategies.base import CandleContext, TickContext, TradeSignal
-        from strategies.signull_1_1 import Signull11Strategy
 
-        strategy = Signull11Strategy()
-        strategy.on_account_update(100.0, 100.0, 100.0)
-        strategy._stats["all"] = [0, 30]
-        signal = TradeSignal(side="up", price=0.70, reason="test")
-        tick = TickContext(t=1, up=0.70, down=0.30, seconds_into_candle=10, seconds_to_close=290)
-        candle = CandleContext(slug="test", title="test", start_ts=0, end_ts=300, winner="up")
+class FastSettlementTests(unittest.TestCase):
+    def setUp(self):
+        _clear_paper_session()
+        self._save_patcher = mock.patch("src.bot.save_session")
+        self._save_patcher.start()
 
-        self.assertEqual(strategy.position_risk_fraction(signal, tick, candle), 0.0)
-        strategy.on_signal_resolved(True, traded=False)
-        self.assertEqual(strategy._stats["all"], [1, 31])
+    def tearDown(self):
+        self._save_patcher.stop()
+        _clear_paper_session()
+
+    def test_winner_from_price_refs_is_instant(self):
+        from src.markets import winner_from_price_refs
+
+        winner, source = winner_from_price_refs(
+            {"beat": 100.0, "chainlink": 100.5, "spot": 100.4}
+        )
+        self.assertEqual(winner, "up")
+        self.assertIn("chainlink", source)
+
+    def test_resolve_winner_prefers_frozen_oracle_over_gamma(self):
+        from src.bot import TradingBot
+
+        bot = TradingBot(_paper_config())
+        with mock.patch("src.bot.resolve_candle_winner", return_value=None) as gamma:
+            with mock.patch("src.bot.time.sleep") as sleep:
+                winner, source = bot._resolve_winner_reliable(
+                    start_ts=1,
+                    ticks=[(1, 0.55, 0.45)],
+                    refs={"beat": 100.0, "chainlink": 99.5, "spot": 99.6},
+                )
+        self.assertEqual(winner, "down")
+        self.assertIn("btc", source)
+        gamma.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_apply_settle_updates_equity_history_immediately(self):
+        from src.bot import TradingBot
+
+        bot = TradingBot(_paper_config())
+        pending = PendingTrade(
+            slug="s",
+            title="t",
+            side="up",
+            entry_price=0.70,
+            stake=10.0,
+            size_label="flat",
+            risk_pct=10.0,
+            reason="x",
+            entry_ts=time.time(),
+            start_ts=1,
+            mode="paper",
+            token_id="tok",
+        )
+        bot._apply_settle_result(
+            _SettleResult(
+                slug="s",
+                title="t",
+                pending=pending,
+                winner="up",
+                source="btc",
+                filled_shares=0.0,
+            )
+        )
+        snap = bot.state.get_snapshot()
+        self.assertTrue(snap["equity_history"])
+        self.assertAlmostEqual(snap["equity_history"][-1]["v"], bot._equity, places=4)
+        self.assertIsNone(bot._pending)
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    def test_bot_restores_paper_bankroll_from_session(self):
+        from src.session_store import load_session, save_session, session_path
+
+        config = _paper_config(strategy_id="signull_1_1")
+        path = session_path(config)
+        if path.exists():
+            path.unlink()
+
+        save_session(
+            config,
+            {
+                "initial_capital": 100.0,
+                "equity": 118.5,
+                "peak_equity": 120.0,
+                "wins_recent": [True, False],
+                "wins_streak": 0,
+                "losses_streak": 1,
+                "trades_placed": 4,
+                "strategy_trades": [{"slug": "btc-1", "won": True}],
+                "equity_history": [{"t": 1.0, "v": 118.5, "mode": "paper"}],
+            },
+        )
+
+        bot = TradingBot(config, BotState(), session=load_session(config))
+        self.assertAlmostEqual(bot._equity, 118.5)
+        self.assertAlmostEqual(bot._peak, 120.0)
+        self.assertEqual(bot._wins_recent, [True, False])
+        self.assertEqual(bot.state.get_snapshot()["strategy_trades"][0]["slug"], "btc-1")
+
+        if path.exists():
+            path.unlink()
+
+    def test_persist_session_writes_round_trip(self):
+        from src.session_store import load_session, session_path
+
+        config = _paper_config(strategy_id="signull_1_1")
+        path = session_path(config)
+        if path.exists():
+            path.unlink()
+
+        bot = TradingBot(config, BotState())
+        bot._equity = 112.0
+        bot._peak = 115.0
+        bot.state.record_strategy_trade({"slug": "btc-2", "won": False})
+        bot.persist_session()
+
+        restored = load_session(config)
+        assert restored is not None
+        self.assertAlmostEqual(restored["equity"], 112.0)
+        self.assertEqual(restored["strategy_trades"][0]["slug"], "btc-2")
+
+        if path.exists():
+            path.unlink()
 
 
 class DeclinedSignalBacktestTests(unittest.TestCase):
@@ -672,6 +988,18 @@ class AssetFeedTests(unittest.TestCase):
             feed = BtcPriceFeed(BotState(), asset=asset)
             self.assertEqual(feed._binance_sym, BINANCE_SYMBOLS[asset])
             self.assertEqual(feed._chainlink_sym, CHAINLINK_SYMBOLS[asset])
+
+    def test_binance_feed_rejects_unlabeled_ticks(self):
+        from src.btc_feed import BtcPriceFeed
+
+        feed = BtcPriceFeed(BotState(), asset="btc")
+        self.assertFalse(feed._binance_point_matches({"value": 100.0}))
+        self.assertTrue(
+            feed._binance_point_matches({"symbol": "btcusdt", "value": 100.0})
+        )
+        self.assertFalse(
+            feed._binance_point_matches({"symbol": "ethusdt", "value": 100.0})
+        )
 
 
 class ScheduleKlinesNonBlockingTests(unittest.TestCase):

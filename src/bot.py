@@ -1,4 +1,4 @@
-"""Main trading bot loop — Signull 1.0 on live markets (paper or real)."""
+"""Main trading bot loop — Signull strategies on live markets (paper or real)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from eth_account import Account
 from strategies.base import CandleContext, TickContext
 from strategies.signull_1_0 import Signull10Strategy
 from strategies.signull_1_1 import Signull11Strategy
+from strategies.signull_1_2 import Signull12Strategy
 
 from .account import fetch_positions
 from .config import BotConfig
@@ -23,21 +24,35 @@ from .markets import (
     get_current_candle,
     market_to_dict,
     resolve_candle_winner,
+    winner_from_price_refs,
     winner_from_ticks,
 )
 from .polymarket import PolymarketClient
-from .sizing import compute_stake, scale_pending_for_fill
+from .sizing import (
+    cap_stake_for_taker_fee,
+    compute_stake,
+    estimate_taker_fee,
+    scale_pending_for_fill,
+)
+from .session_store import (
+    MAX_EQUITY_HISTORY,
+    MAX_STRATEGY_TRADES,
+    load_session,
+    save_session,
+)
 from .state import BotState
 
 logger = logging.getLogger(__name__)
 
 
-def _settle_pnl(stake: float, entry_price: float, won: bool) -> float:
+def _settle_pnl(
+    stake: float, entry_price: float, won: bool, entry_fee: float = 0.0
+) -> float:
     if entry_price <= 0 or stake <= 0:
         return 0.0
     if won:
-        return stake / entry_price - stake
-    return -stake
+        return stake / entry_price - stake - entry_fee
+    return -stake - entry_fee
 
 
 @dataclass
@@ -57,6 +72,8 @@ class PendingTrade:
     order_id: str | None = None
     requested_shares: float = 0.0
     filled_shares: float = 0.0
+    entry_fee: float = 0.0
+    taker_fee_rate: float = 0.0
 
 
 @dataclass
@@ -72,12 +89,20 @@ class _SettleResult:
 
 
 class TradingBot:
-    def __init__(self, config: BotConfig, state: BotState | None = None):
+    def __init__(
+        self,
+        config: BotConfig,
+        state: BotState | None = None,
+        *,
+        session: dict | None = None,
+    ):
         self.config = config
         self.state = state or BotState()
         self.client = PolymarketClient(config)
 
-        if config.strategy_id == "signull_1_1":
+        if config.strategy_id == "signull_1_2":
+            self.strategy = Signull12Strategy(config.strategy_params())
+        elif config.strategy_id == "signull_1_1":
             self.strategy = Signull11Strategy(config.strategy_params())
         else:
             self.strategy = Signull10Strategy(
@@ -90,9 +115,12 @@ class TradingBot:
         self._wins_recent: list[bool] = []
         self._wins_streak = 0
         self._losses_streak = 0
+        self._last_session_save = 0.0
+        self._apply_session(session or load_session(config))
         # Serialize bankroll reads/writes; settle results applied on tick path.
         self._bankroll_lock = threading.Lock()
         self._settle_results: queue.Queue[_SettleResult] = queue.Queue()
+        self._settling_slugs: set[str] = set()
 
         self._active_slug: str | None = None
         self._active_start_ts: int | None = None
@@ -136,6 +164,62 @@ class TradingBot:
 
         self.state.update(running=False)
         self.state.log("info", "Bot stopped")
+        self.persist_session()
+
+    def _apply_session(self, session: dict | None) -> None:
+        if not session:
+            return
+
+        if not self.config.is_live:
+            self._initial = float(
+                session.get("initial_capital", self._initial)
+            )
+            self._equity = float(session.get("equity", self._equity))
+            self._peak = float(
+                session.get("peak_equity", max(self._peak, self._equity))
+            )
+
+        self._wins_recent = [
+            bool(value) for value in session.get("wins_recent", [])
+        ][-10:]
+        self._wins_streak = int(session.get("wins_streak", 0))
+        self._losses_streak = int(session.get("losses_streak", 0))
+
+        self.state.restore_persisted(
+            strategy_trades=session.get("strategy_trades"),
+            equity_history=session.get("equity_history"),
+            trades_placed=int(session.get("trades_placed", 0)),
+        )
+
+        if not self.config.is_live:
+            self.state.log(
+                "info",
+                f"Restored paper session — equity ${self._equity:.2f} "
+                f"(initial ${self._initial:.2f})",
+            )
+        else:
+            self.state.log("info", "Restored strategy trade history from session")
+
+    def persist_session(self) -> None:
+        snap = self.state.get_snapshot(history_points=MAX_EQUITY_HISTORY)
+        with self._bankroll_lock:
+            payload = {
+                "initial_capital": round(self._initial, 4),
+                "equity": round(self._equity, 4),
+                "peak_equity": round(self._peak, 4),
+                "wins_recent": list(self._wins_recent),
+                "wins_streak": self._wins_streak,
+                "losses_streak": self._losses_streak,
+                "trades_placed": int(snap.get("trades_placed", 0)),
+                "strategy_trades": list(snap.get("strategy_trades", []))[
+                    :MAX_STRATEGY_TRADES
+                ],
+                "equity_history": list(snap.get("equity_history", []))[
+                    -MAX_EQUITY_HISTORY:
+                ],
+            }
+        save_session(self.config, payload)
+        self._last_session_save = time.time()
 
     def _tick(self) -> None:
         # Apply completed settlements before sizing / signals so equity is current.
@@ -156,6 +240,8 @@ class TradingBot:
 
         if market.slug != self._active_slug:
             self._on_new_candle(market)
+        else:
+            self._maybe_finalize_closing_candle(market)
 
         if not self.state.is_feed_connected():
             self._refresh_books_rest(market)
@@ -189,11 +275,7 @@ class TradingBot:
         if not self._entered:
             signal = self.strategy.evaluate(tick, ctx, entered=False)
 
-        thr = float(self.strategy.params["threshold"])
-        if thr < 0.5:
-            wait_msg = f"Waiting for a side to drop ≤ {thr:.0%}…"
-        else:
-            wait_msg = f"Waiting for a side to reach ≥ {thr:.0%}…"
+        wait_msg = self._waiting_message()
 
         signal_side = "hold"
         signal_reason = wait_msg
@@ -249,6 +331,21 @@ class TradingBot:
 
         if signal is not None and not self._entered:
             self._enter(market, signal, tick, ctx)
+
+        if time.time() - self._last_session_save >= 30.0:
+            self.persist_session()
+
+    def _waiting_message(self) -> str:
+        thr = float(self.strategy.params["threshold"])
+        if self.config.strategy_id == "signull_1_1":
+            late = float(self.strategy.params.get("late_entry_seconds", 2.0))
+            return (
+                f"Watching for ≥ {thr:.0%} or end-of-candle entry "
+                f"(last {late:.0f}s)…"
+            )
+        if thr < 0.5:
+            return f"Waiting for a side to drop ≤ {thr:.0%}…"
+        return f"Waiting for a side to reach ≥ {thr:.0%}…"
 
     def _snapshot_resolution_refs(self, start_ts: int | None) -> dict[str, float | None]:
         """Prefer frozen closed-window refs; fall back to live capture."""
@@ -306,19 +403,14 @@ class TradingBot:
         self._pending = None
 
         if prev_slug is not None:
-            threading.Thread(
-                target=self._finalize_candle,
-                kwargs={
-                    "slug": prev_slug,
-                    "title": prev_title,
-                    "start_ts": int(start_ts),
-                    "ticks": prev_ticks,
-                    "pending": prev_pending,
-                    "refs": prev_refs,
-                },
-                daemon=True,
-                name="signull-settle",
-            ).start()
+            self._schedule_candle_settlement(
+                slug=prev_slug,
+                title=prev_title or prev_slug,
+                start_ts=int(start_ts),
+                ticks=prev_ticks,
+                pending=prev_pending,
+                refs=prev_refs,
+            )
 
         # These 1.0-only helpers maintain its BTC/noise cache. Simpler
         # strategies such as 1.1 intentionally do not need them.
@@ -368,6 +460,55 @@ class TradingBot:
             signal_reason="New candle — watching",
         )
 
+    def _maybe_finalize_closing_candle(self, market: CandleMarket) -> None:
+        """Start settlement as soon as the candle ends — don't wait for slug rollover."""
+        if self._pending is None or self._active_slug is None:
+            return
+        if self._pending.slug != self._active_slug:
+            return
+        close_window = max(2.0, float(self.config.bot_poll_interval_sec) + 0.5)
+        if market.seconds_to_close > close_window:
+            return
+        start_ts = self._active_start_ts or market.candle_start_ts
+        self._schedule_candle_settlement(
+            slug=self._active_slug,
+            title=self._active_title or market.title,
+            start_ts=int(start_ts),
+            ticks=list(self._candle_ticks),
+            pending=self._pending,
+            refs=self._snapshot_resolution_refs(int(start_ts)),
+        )
+
+    def _schedule_candle_settlement(
+        self,
+        *,
+        slug: str,
+        title: str,
+        start_ts: int,
+        ticks: list[tuple[int, float, float]],
+        pending: PendingTrade | None,
+        refs: dict[str, float | None] | None,
+    ) -> None:
+        if pending is None or pending.slug != slug:
+            return
+        with self._bankroll_lock:
+            if slug in self._settling_slugs:
+                return
+            self._settling_slugs.add(slug)
+        threading.Thread(
+            target=self._finalize_candle,
+            kwargs={
+                "slug": slug,
+                "title": title,
+                "start_ts": start_ts,
+                "ticks": ticks,
+                "pending": pending,
+                "refs": refs,
+            },
+            daemon=True,
+            name="signull-settle",
+        ).start()
+
     def _finalize_candle(
         self,
         *,
@@ -378,47 +519,51 @@ class TradingBot:
         pending: PendingTrade | None = None,
         refs: dict[str, float | None] | None = None,
     ) -> None:
-        """Background: resolve winner / fill status; enqueue bankroll apply."""
-        noisy = self.strategy.register_closed_candle(slug, ticks)
-        self.state.log(
-            "info",
-            f"Candle closed {slug[-12:]} · trust path {'NOISY' if noisy else 'clean'}",
-        )
+        """Background: resolve winner / fill status; apply bankroll immediately."""
+        try:
+            noisy = self.strategy.register_closed_candle(slug, ticks)
+            self.state.log(
+                "info",
+                f"Candle closed {slug[-12:]} · trust path {'NOISY' if noisy else 'clean'}",
+            )
 
-        if pending is None or pending.slug != slug:
-            return
-
-        filled = 0.0
-        if pending.mode == "live":
-            # A submitted GTC is not a fill.  Cancel anything still resting,
-            # then record only the matched quantity.
-            filled = self._close_live_order(pending)
-            if filled <= 0:
-                self.state.log(
-                    "info",
-                    f"[LIVE] no fill for {pending.order_id or slug}; no trade settled",
-                )
+            if pending is None or pending.slug != slug:
                 return
 
-        # Prefer frozen refs (survives feed clear) over the passed snapshot.
-        frozen = self.state.get_frozen_resolution_refs(start_ts)
-        use_refs = frozen if frozen is not None else (refs or {})
+            filled = 0.0
+            if pending.mode == "live":
+                # A submitted GTC is not a fill.  Cancel anything still resting,
+                # then record only the matched quantity.
+                filled = self._close_live_order(pending)
+                if filled <= 0:
+                    self.state.log(
+                        "info",
+                        f"[LIVE] no fill for {pending.order_id or slug}; no trade settled",
+                    )
+                    return
 
-        winner, source = self._resolve_winner_reliable(
-            start_ts=start_ts,
-            ticks=ticks,
-            refs=use_refs,
-        )
-        self._settle_results.put(
-            _SettleResult(
-                slug=slug,
-                title=title,
-                pending=pending,
-                winner=winner,
-                source=source,
-                filled_shares=filled,
+            # Prefer frozen refs (survives feed clear) over the passed snapshot.
+            frozen = self.state.get_frozen_resolution_refs(start_ts)
+            use_refs = frozen if frozen is not None else (refs or {})
+
+            winner, source = self._resolve_winner_reliable(
+                start_ts=start_ts,
+                ticks=ticks,
+                refs=use_refs,
             )
-        )
+            self._apply_settle_result(
+                _SettleResult(
+                    slug=slug,
+                    title=title,
+                    pending=pending,
+                    winner=winner,
+                    source=source,
+                    filled_shares=filled,
+                )
+            )
+        finally:
+            with self._bankroll_lock:
+                self._settling_slugs.discard(slug)
 
     def _drain_settle_results(self) -> None:
         """Apply bankroll mutations on the bot thread under the bankroll lock."""
@@ -450,9 +595,14 @@ class TradingBot:
             )
             pending.stake = stake
             pending.filled_shares = result.filled_shares
+            pending.entry_fee = estimate_taker_fee(
+                stake, pending.entry_price, pending.taker_fee_rate
+            )
 
         won = pending.side == result.winner
-        pnl = _settle_pnl(stake, pending.entry_price, won)
+        pnl = _settle_pnl(
+            stake, pending.entry_price, won, pending.entry_fee
+        )
         self.strategy.on_trade_settled(won)
 
         with self._bankroll_lock:
@@ -475,6 +625,7 @@ class TradingBot:
             "side": pending.side,
             "entry_price": pending.entry_price,
             "stake": round(stake, 4),
+            "entry_fee": round(pending.entry_fee, 4),
             "size_label": pending.size_label,
             "risk_pct": pending.risk_pct,
             "winner": result.winner,
@@ -488,6 +639,15 @@ class TradingBot:
         }
         self.state.record_strategy_trade(trade_rec)
         self.state.increment("trades_placed")
+
+        if pending.mode == "paper":
+            self.state.record_equity_point(
+                equity_after,
+                mode=self.config.trading_mode,
+                force=True,
+            )
+        if self._pending is not None and self._pending.slug == result.slug:
+            self._pending = None
 
         result_label = "WIN" if won else "LOSS"
         msg = (
@@ -505,6 +665,12 @@ class TradingBot:
             )
         self.state.log("trade" if won else "warn", msg)
         logger.info(msg)
+        self.persist_session()
+        self._cached_account = self._build_account_snapshot()
+        self.state.update(
+            account=self._cached_account,
+            signal={"side": "hold", "reason": msg},
+        )
         self._push_strategy_state(
             signal_side="hold",
             signal_reason=msg,
@@ -540,33 +706,24 @@ class TradingBot:
         refs: dict[str, float | None],
     ) -> tuple[str | None, str]:
         """
-        Resolve in order of trust:
-          1. Gamma strict settlement (retry — prices lag a few seconds)
-          2. End-of-candle mids from our own tick path (≥90¢)
-          3. Snapshotted Chainlink/spot vs price-to-beat for *this* candle only
+        Resolve instantly from frozen oracle data, then local ticks, then Gamma.
         """
-        # 1) Wait for real market resolution (do not trust half-resolved mids)
-        for attempt in range(12):
+        winner, source = winner_from_price_refs(refs)
+        if winner is not None:
+            return winner, source
+
+        tick_winner = winner_from_ticks(ticks, at_close=True)
+        if tick_winner is not None:
+            return tick_winner, "ticks"
+
+        for attempt in range(3):
             winner = resolve_candle_winner(
                 self.config.asset, start_ts, require_resolved=True
             )
             if winner is not None:
                 return winner, "gamma"
-            time.sleep(0.75 if attempt < 4 else 1.25)
-
-        # 2) Our last observed mids on this candle
-        tick_winner = winner_from_ticks(ticks)
-        if tick_winner is not None:
-            return tick_winner, "ticks"
-
-        # 3) Spot path for *this* candle only (frozen before rollover)
-        beat = refs.get("beat")
-        ref = refs.get("chainlink")
-        if ref is None:
-            ref = refs.get("spot")
-        if beat is not None and ref is not None:
-            winner = "up" if float(ref) >= float(beat) else "down"
-            return winner, f"btc(beat={beat:.2f},ref={ref:.2f})"
+            if attempt < 2:
+                time.sleep(0.15)
 
         return None, "none"
 
@@ -577,12 +734,29 @@ class TradingBot:
         tick: TickContext,
         ctx: CandleContext,
     ) -> None:
-        risk_frac = self.strategy.position_risk_fraction(signal, tick, ctx)
-        size_label = self.strategy.size_label(risk_frac)
-
         with self._bankroll_lock:
             equity = self._equity
             initial = self._initial
+
+        token_id = (
+            market.up_token_id if signal.side == "up" else market.down_token_id
+        )
+        mode = "live" if self.config.is_live else "paper"
+        entry_price = float(signal.price)
+        if self.config.is_live:
+            # A midpoint or last print is not executable. Resolve the current
+            # ask just before submitting instead of placing a stale 70¢ bid.
+            best_ask = self.client.get_best_ask(token_id)
+            if best_ask is None or not 0 < best_ask < 1:
+                self.state.log("warn", "No executable ask — skipping strategy entry")
+                return
+            entry_price = float(best_ask)
+            # Fee-aware strategies must size from the actual executable quote,
+            # not the earlier midpoint/last-price trigger observation.
+            signal.price = entry_price
+
+        risk_frac = self.strategy.position_risk_fraction(signal, tick, ctx)
+        size_label = self.strategy.size_label(risk_frac)
 
         wallet_balance = self._cached_wallet_balance
         if self.config.is_live and wallet_balance is None and self.client.is_authenticated:
@@ -600,16 +774,19 @@ class TradingBot:
             wallet_balance=wallet_balance,
             is_live=self.config.is_live,
         )
+        available_cash = equity
+        if self.config.is_live and wallet_balance is not None:
+            available_cash = min(available_cash, wallet_balance)
+        fee_rate = max(0.0, float(signal.taker_fee_rate))
+        stake = cap_stake_for_taker_fee(
+            stake, entry_price, fee_rate, available_cash
+        )
         if stake < 0.01:
             self.state.log("warn", "Stake too small — skipping")
             self._entered = True
             return
 
-        entry_price = float(signal.price)
-        token_id = (
-            market.up_token_id if signal.side == "up" else market.down_token_id
-        )
-        mode = "live" if self.config.is_live else "paper"
+        entry_fee = estimate_taker_fee(stake, entry_price, fee_rate)
         order_id: str | None = None
 
         if self.config.is_live:
@@ -668,6 +845,8 @@ class TradingBot:
             token_id=token_id,
             order_id=order_id,
             requested_shares=stake / entry_price if entry_price > 0 else 0.0,
+            entry_fee=entry_fee,
+            taker_fee_rate=fee_rate,
         )
         self._entered = True
         self._push_strategy_state(
@@ -793,18 +972,24 @@ class TradingBot:
                 "mode": self.config.trading_mode,
                 "balance_usdc": equity,
                 "tips": [
-                    "PAPER: Signull 1.0 simulates fills at threshold on live prices",
+                    (
+                        f"PAPER: {self.strategy.meta.name} on live market prices "
+                        f"(session persists across restarts)"
+                    ),
                     "Add PRIVATE_KEY + FUNDER_ADDRESS for live orders",
                     "Run: python scripts/verify_wallet.py",
                 ],
                 **paper_block,
             }
 
-        signer = Account.from_key(
-            self.config.private_key
-            if self.config.private_key.startswith("0x")
-            else f"0x{self.config.private_key}"
-        ).address
+        signer = None
+        if self.config.private_key:
+            key = (
+                self.config.private_key
+                if self.config.private_key.startswith("0x")
+                else f"0x{self.config.private_key}"
+            )
+            signer = Account.from_key(key).address
 
         balance = None
         positions: list[dict] = []

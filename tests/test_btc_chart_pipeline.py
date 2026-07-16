@@ -51,12 +51,18 @@ class BtcChartPipelineTests(unittest.TestCase):
         state = BotState()
         state.update_btc_price(50_000.0, int(time.time() * 1000))
         state.clear_market_data()
-        # After clear history empty but last price kept
-        self.assertEqual(state.get_snapshot(history_points=10)["btc_history"], [])
-        state.set_price_to_beat(50_010.0)
+        # BTC samples are retained server-side; dashboard filters by candle.
+        state.set_price_to_beat(50_010.0, candle_start_ts=1_700_000_000)
+        state.update(
+            market={
+                "slug": "btc-updown-5m-1700000000",
+                "candle_start_ts": 1_700_000_000,
+            }
+        )
         hist = state.get_snapshot(history_points=10)["btc_history"]
         self.assertTrue(hist)
         self.assertIn("d", hist[-1])
+        self.assertEqual(hist[-1].get("cs"), 1_700_000_000)
 
     def test_clear_keeps_last_spot_for_reseed(self):
         state = BotState()
@@ -100,6 +106,19 @@ class BtcChartPipelineTests(unittest.TestCase):
         ok = state.set_price_to_beat(100_200.0, candle_start_ts=400)
         self.assertTrue(ok)
         self.assertAlmostEqual(state.get_resolution_refs()["beat"], 100_200.0, places=1)
+
+    def test_snapshot_filters_btc_history_to_active_candle(self):
+        state = BotState()
+        state.update(
+            market={"slug": "btc-new", "candle_start_ts": 200},
+        )
+        state.set_price_to_beat(50_000.0, candle_start_ts=200)
+        state._btc_history.append({"t": 100.0, "v": 49_000.0, "cs": 100})
+        state._btc_history.append({"t": 201.0, "v": 50_010.0, "cs": 200})
+        hist = state.get_snapshot(history_points=10)["btc_history"]
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["cs"], 200)
+        self.assertEqual(state.get_snapshot(history_points=10)["btc_candle_start_ts"], 200)
 
     def test_chainlink_fills_chart_when_binance_stale(self):
         state = BotState()

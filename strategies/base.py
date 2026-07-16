@@ -42,6 +42,9 @@ class TradeSignal:
     side: str  # "up" | "down"
     price: float
     reason: str
+    # The CLOB's taker-fee rate used for this entry. Most strategies remain
+    # fee-free until they explicitly opt in; crypto Signull entries set this.
+    taker_fee_rate: float = 0.0
 
 
 class Strategy(ABC):

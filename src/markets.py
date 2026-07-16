@@ -324,22 +324,44 @@ def _winner_from_prices(
     return None
 
 
-def winner_from_ticks(ticks: list[tuple[int, float, float]]) -> str | None:
+def winner_from_price_refs(
+    refs: dict[str, float | None],
+) -> tuple[str | None, str]:
+    """Resolve UP/DOWN from frozen beat vs oracle/spot (instant at candle close)."""
+    beat = refs.get("beat")
+    ref = refs.get("chainlink")
+    source = "chainlink"
+    if ref is None:
+        ref = refs.get("spot")
+        source = "spot"
+    if beat is None or ref is None:
+        return None, "none"
+    side = "up" if float(ref) >= float(beat) else "down"
+    return side, f"btc(beat={float(beat):.2f},{source}={float(ref):.2f})"
+
+
+def winner_from_ticks(
+    ticks: list[tuple[int, float, float]],
+    *,
+    at_close: bool = False,
+) -> str | None:
     """Infer winner from the last path prints of a candle (near-close mids)."""
     if not ticks:
         return None
+    lead_threshold = 0.80 if at_close else 0.90
+    extreme_threshold = 0.92 if at_close else 0.95
     # Prefer the last few samples in case the final print is noisy
     tail = ticks[-5:]
     up = sum(t[1] for t in tail) / len(tail)
     down = sum(t[2] for t in tail) / len(tail)
-    if up >= 0.90 and up > down:
+    if up >= lead_threshold and up > down:
         return "up"
-    if down >= 0.90 and down > up:
+    if down >= lead_threshold and down > up:
         return "down"
     # Extreme last print
     _t, lu, ld = ticks[-1]
-    if lu >= 0.95 and lu > ld:
+    if lu >= extreme_threshold and lu > ld:
         return "up"
-    if ld >= 0.95 and ld > lu:
+    if ld >= extreme_threshold and ld > lu:
         return "down"
     return None

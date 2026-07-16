@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, Callable
 
 from strategies.base import CandleContext, Strategy, TickContext
+from src.sizing import cap_stake_for_taker_fee, estimate_taker_fee
 
 from .metrics import compute_metrics
 from .types import BacktestResult, CandleDataset, TradeRecord
@@ -14,14 +15,19 @@ if TYPE_CHECKING:
     pass
 
 
-def _settle_trade(stake: float, entry_price: float, won: bool) -> float:
+def _settle_trade(
+    stake: float,
+    entry_price: float,
+    won: bool,
+    entry_fee: float = 0.0,
+) -> float:
     """Return PnL for a binary market buy held to resolution."""
     if entry_price <= 0 or stake <= 0:
         return 0.0
     if won:
         shares = stake / entry_price
-        return shares * 1.0 - stake
-    return -stake
+        return shares * 1.0 - stake - entry_fee
+    return -stake - entry_fee
 
 
 def run_backtest(
@@ -117,7 +123,12 @@ def run_backtest(
             continue
 
         risk_frac = strategy.position_risk_fraction(signal, entry_tick, ctx)
-        stake = min(initial_capital * risk_frac, capital)
+        entry_price = max(0.01, min(0.99, signal.price))
+        fee_rate = max(0.0, float(signal.taker_fee_rate))
+        desired_stake = min(initial_capital * risk_frac, capital)
+        stake = cap_stake_for_taker_fee(
+            desired_stake, entry_price, fee_rate, capital
+        )
         if stake < min_stake:
             # A strategy may intentionally decline a marginal trade by
             # returning zero risk. That must skip this candle, not terminate
@@ -131,10 +142,10 @@ def run_backtest(
         if hasattr(strategy, "size_label"):
             size_label = strategy.size_label(risk_frac)  # type: ignore[attr-defined]
 
-        entry_price = max(0.01, min(0.99, signal.price))
         shares = stake / entry_price
         won = signal.side == candle.winner
-        pnl = _settle_trade(stake, entry_price, won)
+        entry_fee = estimate_taker_fee(stake, entry_price, fee_rate)
+        pnl = _settle_trade(stake, entry_price, won, entry_fee)
         capital += pnl
         equity_hist.append(capital)
 
@@ -174,6 +185,7 @@ def run_backtest(
                 reason=reason,
                 risk_pct=round(risk_frac * 100, 2),
                 size_label=size_label,
+                entry_fee=round(entry_fee, 4),
             )
         trades.append(trade)
         equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})

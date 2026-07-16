@@ -16,6 +16,7 @@ from .bot import TradingBot
 from .config import BotConfig
 from .btc_feed import BtcPriceFeed
 from .feed import MarketFeed
+from .session_store import load_session
 from .state import BotState
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,8 @@ class BroadcastHub:
                 # The browser retains history between messages; a short tail is
                 # enough for recovery and avoids serializing thousands of chart
                 # points for every market update/client.
-                # 240 pts @ ~20 Hz ≈ 12s tail — enough for client merge recovery
-                # without shipping multi-minute series every 50ms.
-                payload = self.state.get_snapshot(history_points=240)
+                # ~45s tail at 20 Hz for merge recovery without huge payloads.
+                payload = self.state.get_snapshot(history_points=900)
                 dead: list[WebSocket] = []
                 for ws in list(self.clients):
                     try:
@@ -64,6 +64,13 @@ class BotService:
     def __init__(self, config: BotConfig):
         self.config = config
         self.state = BotState()
+        session = load_session(config)
+        if session:
+            self.state.restore_persisted(
+                strategy_trades=session.get("strategy_trades"),
+                equity_history=session.get("equity_history"),
+                trades_placed=int(session.get("trades_placed", 0)),
+            )
         self.hub = BroadcastHub(self.state, config.dashboard_push_ms)
         self.feed = MarketFeed(config, self.state)
         self.btc_feed = BtcPriceFeed(self.state, asset=config.asset)
@@ -82,7 +89,11 @@ class BotService:
         if self.is_running:
             return
         self.state.clear_stop()
-        self._bot = TradingBot(self.config, self.state)
+        self._bot = TradingBot(
+            self.config,
+            self.state,
+            session=load_session(self.config),
+        )
         self._thread = threading.Thread(target=self._bot.run, daemon=True)
         self._thread.start()
 
@@ -141,7 +152,7 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.get("/api/status")
     async def status():
-        snap = service.state.get_snapshot(history_points=600)
+        snap = service.state.get_snapshot(history_points=6000)
         snap["bot_thread_alive"] = service.is_running
         return snap
 
@@ -187,7 +198,7 @@ def create_app(config: BotConfig) -> FastAPI:
         service.hub.add(ws)
         try:
             # Send immediate full snapshot on connect
-            await ws.send_json(service.state.get_snapshot(history_points=600))
+            await ws.send_json(service.state.get_snapshot(history_points=6000))
             while True:
                 await asyncio.sleep(60)
         except (WebSocketDisconnect, asyncio.CancelledError):
@@ -212,6 +223,10 @@ def create_app(config: BotConfig) -> FastAPI:
     async def shutdown():
         service.state.request_shutdown()
         service.stop_bot()
+        if service._thread is not None:
+            service._thread.join(timeout=5.0)
+        if service._bot is not None:
+            service._bot.persist_session()
         await service.shutdown_background_tasks()
 
     return app

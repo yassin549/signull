@@ -66,6 +66,7 @@ class TradeRecord:
     reason: str
     risk_pct: float = 0.0
     size_label: str = ""
+    entry_fee: float = 0.0
 
 
 @dataclass
