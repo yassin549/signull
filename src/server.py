@@ -7,21 +7,29 @@ import logging
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from .account import verify_wallet
+from .backtest_server import register_backtest_routes
 from .bot import TradingBot
 from .config import BotConfig
 from .btc_feed import BtcPriceFeed
 from .feed import MarketFeed
-from .session_store import load_session
+from .backtest.registry import get_strategy
+from .session_store import clear_session, load_session
 from .state import BotState
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
+
+
+class StrategyUpdateRequest(BaseModel):
+    strategy_id: str
+    params: dict | None = None
 
 
 class BroadcastHub:
@@ -71,6 +79,28 @@ class BotService:
                 equity_history=session.get("equity_history"),
                 trades_placed=int(session.get("trades_placed", 0)),
             )
+        try:
+            init_strat = get_strategy(config.strategy_id, config.strategy_params())
+            self.state.update(
+                strategy={
+                    "id": init_strat.meta.id,
+                    "name": init_strat.meta.name,
+                    "mode": config.trading_mode,
+                    "params": dict(init_strat.params),
+                    "equity": float(config.paper_initial_capital),
+                    "initial": float(config.paper_initial_capital),
+                    "peak": float(config.paper_initial_capital),
+                    "return_pct": 0.0,
+                    "pending": None,
+                    "entered_this_candle": False,
+                    "signal_side": "hold",
+                    "signal_reason": "Standby",
+                    "losses_streak": 0,
+                    "wins_recent": 0,
+                }
+            )
+        except Exception as err:
+            logger.warning(f"Failed to populate initial strategy state: {err}")
         self.hub = BroadcastHub(self.state, config.dashboard_push_ms)
         self.feed = MarketFeed(config, self.state)
         self.btc_feed = BtcPriceFeed(self.state, asset=config.asset)
@@ -99,6 +129,50 @@ class BotService:
 
     def stop_bot(self) -> None:
         self.state.request_bot_stop()
+
+    def reset_account(self, initial_capital: float = 100.0) -> None:
+        if self._bot is not None:
+            self._bot.reset_account(initial_capital)
+        else:
+            self.state.reset_account(initial_capital)
+            clear_session(self.config, initial_capital)
+            self.state.log(
+                "info",
+                f"Account balance reset to ${initial_capital:.2f} and all prior trading data deleted.",
+            )
+
+    def update_strategy(self, strategy_id: str, params: dict | None = None) -> dict:
+        if self._bot is not None:
+            strat = self._bot.update_strategy(strategy_id, params)
+        else:
+            strat = get_strategy(strategy_id, params)
+            self.config.strategy_id = strategy_id
+            self.config.custom_strategy_params = dict(strat.params)
+            self.state.update(
+                strategy={
+                    "id": strat.meta.id,
+                    "name": strat.meta.name,
+                    "mode": self.config.trading_mode,
+                    "params": dict(strat.params),
+                    "equity": float(self.config.paper_initial_capital),
+                    "initial": float(self.config.paper_initial_capital),
+                    "peak": float(self.config.paper_initial_capital),
+                    "return_pct": 0.0,
+                    "pending": None,
+                    "entered_this_candle": False,
+                    "signal_side": "hold",
+                    "signal_reason": "Standby",
+                    "losses_streak": 0,
+                    "wins_recent": 0,
+                }
+            )
+            self.state.log("info", f"Strategy updated to {strat.meta.name} (params: {strat.params})")
+        return {
+            "ok": True,
+            "strategy_id": strat.meta.id,
+            "strategy_name": strat.meta.name,
+            "params": dict(strat.params),
+        }
 
     async def ensure_feed(self) -> None:
         if self._feed_task is None or self._feed_task.done():
@@ -141,14 +215,17 @@ class BotService:
 
 def create_app(config: BotConfig) -> FastAPI:
     service = BotService(config)
-    app = FastAPI(title="Signull", version="0.2.0")
+    app = FastAPI(title="Signull", version="0.3.0")
 
     if DASHBOARD_DIR.exists():
         app.mount("/static", StaticFiles(directory=DASHBOARD_DIR), name="static")
 
     @app.get("/")
     async def index():
-        return FileResponse(DASHBOARD_DIR / "index.html")
+        return FileResponse(
+            DASHBOARD_DIR / "index.html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     @app.get("/api/status")
     async def status():
@@ -158,6 +235,11 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.get("/api/config")
     async def get_config():
+        strat = (
+            service._bot.strategy
+            if service._bot is not None and getattr(service._bot, "strategy", None) is not None
+            else None
+        )
         return {
             "trading_mode": config.trading_mode,
             "asset": config.asset,
@@ -170,13 +252,20 @@ def create_app(config: BotConfig) -> FastAPI:
             "signature_label": config.signature_label,
             "strategy": config.strategy_id,
             "strategy_name": (
-                service._bot.strategy.meta.name
-                if service._bot is not None
-                else config.strategy_id
+                strat.meta.name if strat is not None else config.strategy_id
             ),
             "paper_initial_capital": config.paper_initial_capital,
-            "strategy_params": config.strategy_params(),
+            "strategy_params": strat.params if strat is not None else config.strategy_params(),
         }
+
+    @app.post("/api/strategy/update")
+    async def strategy_update(req: StrategyUpdateRequest):
+        try:
+            return service.update_strategy(req.strategy_id, req.params)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail=str(err))
+        except Exception as err:
+            raise HTTPException(status_code=422, detail=str(err))
 
     @app.get("/api/wallet/verify")
     async def wallet_verify():
@@ -191,6 +280,11 @@ def create_app(config: BotConfig) -> FastAPI:
     async def bot_stop():
         service.stop_bot()
         return {"ok": True, "running": service.is_running}
+
+    @app.post("/api/account/reset")
+    async def account_reset():
+        service.reset_account(100.0)
+        return {"ok": True, "balance": 100.0, "message": "Account reset to $100"}
 
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket):
@@ -209,6 +303,9 @@ def create_app(config: BotConfig) -> FastAPI:
             pass
         finally:
             service.hub.remove(ws)
+
+    # Live + backtest APIs on one origin so the unified dashboard can toggle instantly.
+    register_backtest_routes(app)
 
     @app.on_event("startup")
     async def startup():

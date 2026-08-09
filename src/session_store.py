@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 SESSION_VERSION = 1
 SESSION_DIR = Path(__file__).resolve().parent.parent / "data" / "sessions"
-MAX_STRATEGY_TRADES = 100
-MAX_EQUITY_HISTORY = 2000
+MAX_STRATEGY_TRADES = 1000
+MAX_EQUITY_HISTORY = 50000
 
 
 def session_path(config: BotConfig) -> Path:
@@ -69,3 +69,20 @@ def save_session(config: BotConfig, data: dict[str, Any]) -> None:
         temporary.replace(path)
     except OSError:
         logger.exception("Failed to persist bot session to %s", path)
+
+
+def clear_session(config: BotConfig, initial_capital: float = 100.0) -> dict[str, Any]:
+    now = time.time()
+    payload = {
+        "initial_capital": float(initial_capital),
+        "equity": float(initial_capital),
+        "peak_equity": float(initial_capital),
+        "wins_recent": [],
+        "wins_streak": 0,
+        "losses_streak": 0,
+        "trades_placed": 0,
+        "strategy_trades": [],
+        "equity_history": [{"t": now, "v": float(initial_capital), "mode": config.trading_mode}],
+    }
+    save_session(config, payload)
+    return payload

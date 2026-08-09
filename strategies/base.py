@@ -24,6 +24,8 @@ class TickContext:
     down: float
     seconds_into_candle: float
     seconds_to_close: float
+    btc_price: float | None = 0.0
+
 
 
 @dataclass
@@ -121,8 +123,29 @@ class Strategy(ABC):
     def evaluate(self, tick: TickContext, candle: CandleContext, *, entered: bool) -> TradeSignal | None:
         """
         Return a trade signal on this tick, or None to keep waiting.
-        `entered` is True once a trade was already taken this candle.
+        `entered` is True while an open position is held this candle.
+        Strategies that support early exits may receive `entered=False` again
+        after closing, so they can re-enter on a later tick.
         """
+
+    def should_exit(
+        self,
+        tick: TickContext,
+        candle: CandleContext,
+        *,
+        side: str,
+        entry_price: float,
+    ) -> TradeSignal | None:
+        """
+        Optional early-exit hook while a position is open.
+
+        Return a TradeSignal (typically with the current mid as `price`) to
+        close the position on this tick, or None to keep holding.  The default
+        is hold-to-resolution.  Strategies that exit early can re-enter later
+        in the same candle when the engine calls `evaluate` with entered=False.
+        """
+        del tick, candle, side, entry_price
+        return None
 
     def position_risk_fraction(
         self,

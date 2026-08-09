@@ -60,15 +60,17 @@ def slice_history_tail(history: list | deque, history_points: int) -> list:
 
 
 class BotState:
-    def __init__(self, max_log_entries: int = 200, max_history: int = 7200, max_trades: int = 100):
+    def __init__(self, max_log_entries: int = 200, max_history: int = 7200, max_trades: int = 1000):
         self._lock = threading.Lock()
         self._snapshot = BotSnapshot()
         self._log: deque[ActivityEntry] = deque(maxlen=max_log_entries)
         self._price_history: deque[dict] = deque(maxlen=max_history)
         self._btc_history: deque[dict] = deque(maxlen=max_history)
+        self._sim_history: deque[dict] = deque(maxlen=max_history)
         # Account values are sparse compared with market data. Keeping a
-        # separate bounded series provides the dashboard equity curve.
-        self._equity_history: deque[dict] = deque(maxlen=max_history)
+        # separate series provides the dashboard equity curve.
+        self._equity_history: deque[dict] = deque(maxlen=50000)
+
         self._price_to_beat: float | None = None
         self._bot_stop = threading.Event()
         self._shutdown = threading.Event()
@@ -78,9 +80,11 @@ class BotState:
         self._feed_window_count = 0
         self._last_history_append = 0.0
         self._last_btc_append = 0.0
+        self._last_sim_append = 0.0
         self._last_equity_append = 0.0
         self._history_interval = 0.05  # 20 chart points/sec
         self._btc_history_interval = 0.05  # 20 chart points/sec
+        self._sim_history_interval = 0.05  # 20 chart points/sec
         self._last_btc_display: float | None = None
         self._last_chainlink: float | None = None
         self._binance_wall_ts: float = 0.0  # wall clock of last Binance tick
@@ -279,7 +283,7 @@ class BotState:
         with self._lock:
             trades = list(self._snapshot.strategy_trades)
             trades.insert(0, trade)
-            self._snapshot.strategy_trades = trades[:100]
+            self._snapshot.strategy_trades = trades[:1000]
             self._bump()
 
     def restore_persisted(
@@ -292,7 +296,7 @@ class BotState:
         """Hydrate dashboard history from a saved session."""
         with self._lock:
             if strategy_trades:
-                self._snapshot.strategy_trades = list(strategy_trades)[:100]
+                self._snapshot.strategy_trades = list(strategy_trades)[:1000]
             if equity_history:
                 self._equity_history.clear()
                 for point in equity_history[-self._equity_history.maxlen :]:
@@ -304,6 +308,39 @@ class BotState:
                     )
             if trades_placed > 0:
                 self._snapshot.trades_placed = int(trades_placed)
+            self._bump()
+
+    def reset_account(self, initial_capital: float = 100.0) -> None:
+        """Reset account balance to initial_capital and wipe all trading/equity history."""
+        now = time.time()
+        with self._lock:
+            self._snapshot.trades_placed = 0
+            self._snapshot.strategy_trades = []
+            self._snapshot.trades = []
+            self._equity_history.clear()
+            self._equity_history.append({
+                "t": now,
+                "v": float(initial_capital),
+                "mode": str(self._snapshot.mode).lower(),
+            })
+            self._last_equity_append = now
+            if self._snapshot.strategy:
+                strat = dict(self._snapshot.strategy)
+                strat["equity"] = float(initial_capital)
+                strat["initial"] = float(initial_capital)
+                strat["peak"] = float(initial_capital)
+                strat["return_pct"] = 0.0
+                strat["pending"] = None
+                strat["entered_this_candle"] = False
+                strat["losses_streak"] = 0
+                strat["wins_recent"] = 0
+                self._snapshot.strategy = strat
+            if self._snapshot.account:
+                acc = dict(self._snapshot.account)
+                acc["paper_equity"] = float(initial_capital)
+                acc["paper_initial"] = float(initial_capital)
+                acc["balance_usdc"] = float(initial_capital)
+                self._snapshot.account = acc
             self._bump()
 
     def set_feed_status(self, connected: bool, extra: dict | None = None) -> None:
@@ -421,6 +458,46 @@ class BotState:
             self._sync_btc_locked(connected=connected, error=error)
             self._bump()
 
+    def _compute_sim_prob_locked(self, now: float, spot: float) -> float | None:
+        beat = self._price_to_beat
+        if beat is None or beat <= 0:
+            return 0.5
+        cs = self._active_btc_candle_start()
+        if cs is None:
+            cs = int(now // 300) * 300
+        elapsed = max(0, min(299, int(now - cs)))
+
+        try:
+            from src.ml.direction_probs import DirectionProbStore
+            if not hasattr(self, "_cached_sim_store"):
+                try:
+                    self._cached_sim_store = DirectionProbStore.load_auto()
+                except Exception:
+                    self._cached_sim_store = None
+            if self._cached_sim_store and self._cached_sim_store.has_candle(cs):
+                val = self._cached_sim_store.prob_up_at(cs, elapsed)
+                if val is not None:
+                    return float(val)
+        except Exception:
+            pass
+
+        import numpy as np
+        log_ret = np.log(spot / beat)
+        rem_frac = (300 - elapsed) / 300.0
+        denom = max(1e-5, np.sqrt(rem_frac + 0.005) * 0.0025)
+        raw_prob = 1.0 / (1.0 + np.exp(-log_ret / denom))
+        return float(np.clip(raw_prob, 0.001, 0.999))
+
+    def _append_sim_history_locked(self, now: float, prob: float) -> bool:
+        if now - self._last_sim_append < self._sim_history_interval:
+            return False
+        point: dict[str, float] = {"t": now, "v": round(float(prob), 4)}
+        if self._beat_candle_start is not None:
+            point["cs"] = int(self._beat_candle_start)
+        self._sim_history.append(point)
+        self._last_sim_append = now
+        return True
+
     def update_btc_price(self, value: float, ts_ms: int) -> None:
         """Fast display price (Polymarket Binance RTDS) — drives the live chart.
 
@@ -433,13 +510,15 @@ class BotState:
             self._last_btc_display = float(value)
             self._binance_wall_ts = wall
             appended = self._append_btc_history_locked(wall, spot=float(value))
+            sim_p = self._compute_sim_prob_locked(wall, spot=float(value))
+            if sim_p is not None:
+                self._append_sim_history_locked(wall, prob=sim_p)
             self._sync_btc_locked(
                 price=float(value),
                 updated_at=wall,
                 source_ts_ms=int(ts_ms),
+                sim_prob=sim_p,
             )
-            # Bump on move *or* history sample so the dashboard keeps streaming
-            # even when the spot price is flat for a stretch.
             if changed or appended:
                 self._bump()
 
@@ -451,18 +530,21 @@ class BotState:
                 self._maybe_set_initial_beat_locked(float(value), wall)
             changed = self._last_chainlink != value
             self._last_chainlink = float(value)
-            # Chart from oracle when Binance has never ticked or is stale (>2s).
             binance_stale = (
                 self._last_btc_display is None
                 or (wall - self._binance_wall_ts) > 2.0
             )
             appended = False
+            sim_p = self._compute_sim_prob_locked(wall, spot=float(value))
             if binance_stale:
                 appended = self._append_btc_history_locked(wall, spot=float(value))
+                if sim_p is not None:
+                    self._append_sim_history_locked(wall, prob=sim_p)
             self._sync_btc_locked(
                 chainlink=float(value),
                 chainlink_at=wall,
                 source_ts_ms=int(ts_ms),
+                sim_prob=sim_p,
             )
             if changed or appended:
                 self._bump()
@@ -532,8 +614,11 @@ class BotState:
         connected: bool | None = None,
         error: str | None = None,
         source_ts_ms: int | None = None,
+        sim_prob: float | None = None,
     ) -> None:
         btc = dict(self._snapshot.btc or {})
+        if sim_prob is not None:
+            btc["sim_prob"] = sim_prob
         if price is not None:
             btc["price"] = price
         if updated_at is not None:
@@ -625,7 +710,9 @@ class BotState:
             self._snapshot.orderbooks = {}
             self._snapshot.trades = []
             self._price_history.clear()
+            self._sim_history.clear()
             self._last_btc_append = 0.0
+            self._last_sim_append = 0.0
             self._price_to_beat = None
             self._beat_candle_start = None
             # Keep last Binance/Chainlink ticks so the chart can reseed the
@@ -654,13 +741,27 @@ class BotState:
             ]
         return slice_history_tail(points, history_points)
 
+    def _sim_history_for_dashboard(self, history_points: int) -> list[dict]:
+        candle_start = self._active_btc_candle_start()
+        points = list(self._sim_history)
+        if candle_start is not None:
+            points = [
+                p
+                for p in points
+                if p.get("cs") == candle_start
+                or (p.get("cs") is None and float(p.get("t", 0)) >= candle_start)
+            ]
+        return slice_history_tail(points, history_points)
+
     def get_snapshot(self, history_points: int = 600) -> dict[str, Any]:
         with self._lock:
             data = asdict(self._snapshot)
             data["activity"] = [e.to_dict() for e in list(self._log)]
             data["price_history"] = slice_history_tail(self._price_history, history_points)
             data["btc_history"] = self._btc_history_for_dashboard(history_points)
+            data["sim_history"] = self._sim_history_for_dashboard(history_points)
             data["btc_candle_start_ts"] = self._active_btc_candle_start()
-            data["equity_history"] = slice_history_tail(self._equity_history, history_points)
+            data["equity_history"] = list(self._equity_history)
             data["version"] = self._version
             return data
+

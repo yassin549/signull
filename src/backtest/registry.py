@@ -35,7 +35,18 @@ def _discover() -> dict[str, Type[Strategy]]:
 def list_strategies() -> list[dict]:
     out = []
     # Keep Signull releases first, then list experimental strategies.
-    order = {"signull_1_0": 0, "signull_1_1": 1, "signull_1_2": 2, "smart_sizer": 3}
+    order = {
+        "signull_1_0": 0,
+        "signull_1_1": 1,
+        "signull_1_2": 2,
+        "signull_1_3": 3,
+        "signull_1_4": 4,
+        "signull_1_5": 5,
+        "smart_sizer": 6,
+        "model_prob_threshold": 7,
+        "prob_70": 8,
+        "tcn_sizer": 9,
+    }
     for sid, cls in sorted(
         _discover().items(),
         key=lambda x: (order.get(x[0], 1), x[1].meta.name),

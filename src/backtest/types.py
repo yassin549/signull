@@ -67,6 +67,8 @@ class TradeRecord:
     risk_pct: float = 0.0
     size_label: str = ""
     entry_fee: float = 0.0
+    sim_entry_prob: float | None = None
+    sim_lifetime_probs: list[dict[str, Any]] | None = None
 
 
 @dataclass

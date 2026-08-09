@@ -25,7 +25,9 @@ def main() -> None:
 
     if len(sys.argv) > 1 and sys.argv[1] == "server":
         app = create_app(config)
-        print(f"Dashboard: http://{config.server_host}:{config.server_port}")
+        print(f"Dashboard (Live + Backtest): http://{config.server_host}:{config.server_port}")
+        print(f"  Live:     http://{config.server_host}:{config.server_port}/#live")
+        print(f"  Backtest: http://{config.server_host}:{config.server_port}/#backtest")
         uvicorn.run(app, host=config.server_host, port=config.server_port, log_level="info")
         return
 
@@ -35,7 +37,8 @@ def main() -> None:
         port = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
         host = config.server_host
         app = create_backtest_app()
-        print(f"Backtest dashboard: http://{host}:{port}")
+        print(f"Backtest-only dashboard: http://{host}:{port}/#backtest")
+        print("(Prefer `python main.py server` for the unified Live + Backtest UI.)")
         uvicorn.run(app, host=host, port=port, log_level="info")
         return
 

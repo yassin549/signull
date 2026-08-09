@@ -13,9 +13,7 @@ from typing import Any
 from eth_account import Account
 
 from strategies.base import CandleContext, TickContext
-from strategies.signull_1_0 import Signull10Strategy
-from strategies.signull_1_1 import Signull11Strategy
-from strategies.signull_1_2 import Signull12Strategy
+from src.backtest.registry import get_strategy
 
 from .account import fetch_positions
 from .config import BotConfig
@@ -43,6 +41,12 @@ from .session_store import (
 from .state import BotState
 
 logger = logging.getLogger(__name__)
+
+# Polymarket CLOB prices-history uses fidelity=1 (≈1 minute). The backtest
+# engine only sees those sparse prints, so the live bot samples strategy
+# decisions on the same cadence for aligned strategies instead of reacting
+# to every 2s midpoint spike.
+BACKTEST_PRICE_FIDELITY_SEC = 60.0
 
 
 def _settle_pnl(
@@ -100,15 +104,7 @@ class TradingBot:
         self.state = state or BotState()
         self.client = PolymarketClient(config)
 
-        if config.strategy_id == "signull_1_2":
-            self.strategy = Signull12Strategy(config.strategy_params())
-        elif config.strategy_id == "signull_1_1":
-            self.strategy = Signull11Strategy(config.strategy_params())
-        else:
-            self.strategy = Signull10Strategy(
-                config.strategy_params(),
-                asset=config.asset,
-            )
+        self.strategy = get_strategy(config.strategy_id, config.strategy_params())
         self._initial = float(config.paper_initial_capital)
         self._equity = float(config.paper_initial_capital)
         self._peak = float(config.paper_initial_capital)
@@ -128,6 +124,8 @@ class TradingBot:
         self._candle_ticks: list[tuple[int, float, float]] = []
         self._entered = False
         self._pending: PendingTrade | None = None
+        # Last fidelity bucket we already fed to strategy.evaluate (live≈backtest).
+        self._eval_fidelity_bucket: int | None = None
         self._heartbeat_id = ""
         self._last_account_refresh = 0.0
         self._cached_account: dict[str, Any] | None = None
@@ -143,10 +141,15 @@ class TradingBot:
 
     def run(self) -> None:
         mode = "LIVE" if self.config.is_live else "PAPER"
-        thr = self.strategy.params["threshold"]
+        thr = self.strategy.params.get("threshold")
+        if thr is not None:
+            spec_str = f"limit @{float(thr):.0%}"
+        else:
+            target = self.strategy.params.get("target_delta", 30.0)
+            spec_str = f"target ±${float(target):.0f}"
         msg = (
             f"Bot started [{mode}] {self.strategy.meta.name} — {self.config.asset.upper()}, "
-            f"limit @{thr:.0%}, paper bankroll ${self._initial:.2f}"
+            f"{spec_str}, paper bankroll ${self._initial:.2f}"
         )
         logger.info(msg)
         self.state.log("info", msg)
@@ -221,6 +224,52 @@ class TradingBot:
         save_session(self.config, payload)
         self._last_session_save = time.time()
 
+    def reset_account(self, initial_capital: float = 100.0) -> None:
+        with self._bankroll_lock:
+            self._initial = float(initial_capital)
+            self._equity = float(initial_capital)
+            self._peak = float(initial_capital)
+            self._wins_recent = []
+            self._wins_streak = 0
+            self._losses_streak = 0
+            self._pending = None
+            self._entered = False
+            self._cached_account = None
+
+        self.strategy.on_account_update(
+            float(initial_capital),
+            float(initial_capital),
+            float(initial_capital),
+            wins_recent=0,
+            wins_streak=0,
+            losses_streak=0,
+        )
+        self.state.reset_account(initial_capital)
+        self.persist_session()
+        self.state.log(
+            "info",
+            f"Account balance reset to ${initial_capital:.2f} and all prior trading data deleted.",
+        )
+        self._push_strategy_state(signal_side="hold", signal_reason="Account reset to $100")
+
+    def update_strategy(
+        self, strategy_id: str, params: dict[str, Any] | None = None
+    ):
+        strat = get_strategy(strategy_id, params)
+        self.config.strategy_id = strategy_id
+        self.config.custom_strategy_params = dict(strat.params)
+        self.strategy = strat
+        self._eval_fidelity_bucket = None
+        self._sync_account_to_strategy()
+        msg = f"Trading model changed to {strat.meta.name}"
+        logger.info("%s with params: %s", msg, strat.params)
+        self.state.log("info", f"{msg} (params: {strat.params})")
+        self._push_strategy_state(
+            signal_side="hold",
+            signal_reason=f"Model switched to {strat.meta.name}",
+        )
+        return strat
+
     def _tick(self) -> None:
         # Apply completed settlements before sizing / signals so equity is current.
         self._drain_settle_results()
@@ -267,13 +316,16 @@ class TradingBot:
             down=down_mid,
             seconds_into_candle=max(0.0, now_ts - market.candle_start_ts),
             seconds_to_close=max(0.0, market.seconds_to_close),
+            btc_price=self.state.get_btc_price(),
         )
 
         self._sync_account_to_strategy()
 
         signal = None
         if not self._entered:
-            signal = self.strategy.evaluate(tick, ctx, entered=False)
+            eval_tick = self._tick_for_strategy_eval(tick)
+            if eval_tick is not None:
+                signal = self.strategy.evaluate(eval_tick, ctx, entered=False)
 
         wait_msg = self._waiting_message()
 
@@ -336,9 +388,18 @@ class TradingBot:
             self.persist_session()
 
     def _waiting_message(self) -> str:
-        thr = float(self.strategy.params["threshold"])
+        if self.config.strategy_id == "signull_1_5":
+            target = float(self.strategy.params.get("target_delta", 30.0))
+            return f"Waiting for BTC to move ±${target:.0f} on the chart…"
+        thr = float(self.strategy.params.get("threshold", 0.70))
+        sample_sec = self._live_sample_sec()
         if self.config.strategy_id == "signull_1_1":
             late = float(self.strategy.params.get("late_entry_seconds", 2.0))
+            if sample_sec > 0:
+                return (
+                    f"Watching for ≥ {thr:.0%} on {sample_sec:.0f}s samples "
+                    f"(backtest-aligned)…"
+                )
             return (
                 f"Watching for ≥ {thr:.0%} or end-of-candle entry "
                 f"(last {late:.0f}s)…"
@@ -346,6 +407,49 @@ class TradingBot:
         if thr < 0.5:
             return f"Waiting for a side to drop ≤ {thr:.0%}…"
         return f"Waiting for a side to reach ≥ {thr:.0%}…"
+
+    def _live_sample_sec(self) -> float:
+        """Seconds between strategy samples; 0 = every poll (legacy real-time).
+
+        Signull 1.1 defaults to the same ~1-minute fidelity the backtest uses
+        from CLOB prices-history, so live does not fire on brief mid spikes
+        that never appear in historical series.
+        """
+        raw = self.strategy.params.get("live_sample_sec")
+        if raw is None:
+            if self.config.strategy_id == "signull_1_1":
+                return BACKTEST_PRICE_FIDELITY_SEC
+            return 0.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _tick_for_strategy_eval(self, tick: TickContext) -> TickContext | None:
+        """Gate strategy.evaluate to backtest-like sample times.
+
+        Returns the tick to evaluate, or None when this poll should only
+        update the UI / books and not make a decision.
+        """
+        sample_sec = self._live_sample_sec()
+        if sample_sec <= 0:
+            return tick
+
+        bucket = int(tick.seconds_into_candle // sample_sec)
+        # First prints in a candle: wait until the first full sample bucket
+        # closes (t ≈ sample_sec), matching sparse history that rarely has
+        # a quote in the opening second.
+        if self._eval_fidelity_bucket is None:
+            if tick.seconds_into_candle < sample_sec:
+                return None
+            self._eval_fidelity_bucket = bucket
+            return tick
+
+        if bucket <= self._eval_fidelity_bucket:
+            return None
+
+        self._eval_fidelity_bucket = bucket
+        return tick
 
     def _snapshot_resolution_refs(self, start_ts: int | None) -> dict[str, float | None]:
         """Prefer frozen closed-window refs; fall back to live capture."""
@@ -401,6 +505,7 @@ class TradingBot:
         self._candle_ticks = []
         self._entered = False
         self._pending = None
+        self._eval_fidelity_bucket = None
 
         if prev_slug is not None:
             self._schedule_candle_settlement(
@@ -706,24 +811,27 @@ class TradingBot:
         refs: dict[str, float | None],
     ) -> tuple[str | None, str]:
         """
-        Resolve instantly from frozen oracle data, then local ticks, then Gamma.
+        Prefer official Gamma settlement — same source the backtest uses.
+
+        Oracle/tick fallbacks only apply when Gamma has not finalized yet so
+        paper PnL does not diverge from market resolution / backtests.
         """
         winner, source = winner_from_price_refs(refs)
         if winner is not None:
             return winner, source
 
-        tick_winner = winner_from_ticks(ticks, at_close=True)
-        if tick_winner is not None:
-            return tick_winner, "ticks"
-
-        for attempt in range(3):
+        for attempt in range(8):
             winner = resolve_candle_winner(
                 self.config.asset, start_ts, require_resolved=True
             )
             if winner is not None:
                 return winner, "gamma"
-            if attempt < 2:
-                time.sleep(0.15)
+            if attempt < 7:
+                time.sleep(0.35)
+
+        tick_winner = winner_from_ticks(ticks, at_close=True)
+        if tick_winner is not None:
+            return tick_winner, "ticks"
 
         return None, "none"
 
@@ -742,18 +850,12 @@ class TradingBot:
             market.up_token_id if signal.side == "up" else market.down_token_id
         )
         mode = "live" if self.config.is_live else "paper"
-        entry_price = float(signal.price)
-        if self.config.is_live:
-            # A midpoint or last print is not executable. Resolve the current
-            # ask just before submitting instead of placing a stale 70¢ bid.
-            best_ask = self.client.get_best_ask(token_id)
-            if best_ask is None or not 0 < best_ask < 1:
-                self.state.log("warn", "No executable ask — skipping strategy entry")
-                return
-            entry_price = float(best_ask)
-            # Fee-aware strategies must size from the actual executable quote,
-            # not the earlier midpoint/last-price trigger observation.
-            signal.price = entry_price
+        # Match the backtest fill model: enter at the strategy signal price
+        # (e.g. fixed 70¢ threshold for Signull 1.1), not a chased best-ask.
+        # Live places a GTC limit at that price; unfilled size is cancelled
+        # at candle close (same as before).
+        entry_price = max(0.01, min(0.99, float(signal.price)))
+        signal.price = entry_price
 
         risk_frac = self.strategy.position_risk_fraction(signal, tick, ctx)
         size_label = self.strategy.size_label(risk_frac)

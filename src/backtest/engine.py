@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import Any, Callable
 
-from strategies.base import CandleContext, Strategy, TickContext
+from strategies.base import CandleContext, Strategy, TickContext, TradeSignal
 from src.sizing import cap_stake_for_taker_fee, estimate_taker_fee
 
 from .metrics import compute_metrics
 from .types import BacktestResult, CandleDataset, TradeRecord
-
-if TYPE_CHECKING:
-    pass
 
 
 def _settle_trade(
@@ -40,14 +37,12 @@ def run_backtest(
 ) -> BacktestResult:
     """
     Simulate *strategy* across resolved candles.
-
-    Rules:
-    - One entry per candle (first signal wins)
-    - Stake = position_risk_fraction * initial_capital (capped at current equity)
-    - Hold to candle close (binary settlement)
     """
     if hasattr(strategy, "prepare_backtest"):
-        strategy.prepare_backtest(candles)  # type: ignore[attr-defined]
+        try:
+            strategy.prepare_backtest(candles, progress_callback=progress_callback)  # type: ignore[attr-defined]
+        except TypeError:
+            strategy.prepare_backtest(candles)  # type: ignore[attr-defined]
 
     t0 = time.perf_counter()
     capital = float(initial_capital)
@@ -60,12 +55,22 @@ def run_backtest(
     losses_streak = 0
     equity_hist: list[float] = [capital]
 
+    sim_store = getattr(strategy, "prob_store", None) or getattr(strategy, "sim_store", None)
+    if sim_store is None:
+        try:
+            from src.ml.direction_probs import DirectionProbStore
+            sim_store = DirectionProbStore.load_auto()
+        except Exception:
+            sim_store = None
+
     def report(candle_idx: int, trade: TradeRecord | None = None) -> None:
         if progress_callback is None:
             return
         payload = {
-            "type": "progress", "phase": "backtesting",
-            "candles_completed": candle_idx, "candles_total": len(candles),
+            "type": "progress",
+            "phase": "backtesting",
+            "candles_completed": candle_idx,
+            "candles_total": len(candles),
             "equity": round(capital, 4),
             "equity_point": {"idx": candle_idx, "equity": round(capital, 4)},
         }
@@ -98,7 +103,7 @@ def run_backtest(
         )
 
         entered = False
-        signal = None
+        signal: TradeSignal | None = None
         entry_ts = 0
         entry_tick: TickContext | None = None
 
@@ -130,9 +135,6 @@ def run_backtest(
             desired_stake, entry_price, fee_rate, capital
         )
         if stake < min_stake:
-            # A strategy may intentionally decline a marginal trade by
-            # returning zero risk. That must skip this candle, not terminate
-            # the whole backtest.
             strategy.on_signal_resolved(signal.side == candle.winner, traded=False)
             equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
             report(candle_idx)
@@ -170,23 +172,58 @@ def run_backtest(
         if len(recent_outcomes) > 10:
             recent_outcomes.pop(0)
 
+        sim_entry_prob: float | None = None
+        sim_lifetime_probs: list[dict[str, Any]] = []
+
+        has_tcn = sim_store and sim_store.has_candle(candle.start_ts)
+        probs_series = sim_store.prob_up_series(candle.start_ts) if has_tcn else None
+
+        if probs_series is not None:
+            s_entry = max(0, min(299, int(entry_ts - candle.start_ts)))
+            sim_entry_prob = round(float(probs_series[s_entry]), 4)
+            sim_lifetime_probs = [
+                {
+                    "t": candle.start_ts + s,
+                    "s": s,
+                    "prob": round(float(probs_series[s]), 4),
+                }
+                for s in range(s_entry, 300)
+            ]
+        else:
+            s_entry = max(0, int(entry_ts - candle.start_ts))
+            sim_entry_prob = round(float(entry_tick.up), 4) if entry_tick else 0.5
+            for tick_t, up_p, _down_p in candle.ticks:
+                if tick_t >= entry_ts:
+                    s = max(0, int(tick_t - candle.start_ts))
+                    sim_lifetime_probs.append(
+                        {
+                            "t": tick_t,
+                            "s": s,
+                            "prob": round(float(up_p), 4),
+                        }
+                    )
+            if not sim_lifetime_probs:
+                sim_lifetime_probs = [{"t": entry_ts, "s": s_entry, "prob": sim_entry_prob}]
+
         trade = TradeRecord(
-                candle_slug=candle.slug,
-                candle_title=candle.title,
-                side=signal.side,
-                entry_price=round(entry_price, 4),
-                stake=round(stake, 4),
-                shares=round(shares, 4),
-                winner=candle.winner,
-                won=won,
-                pnl=round(pnl, 4),
-                equity_after=round(capital, 4),
-                entry_ts=entry_ts,
-                reason=reason,
-                risk_pct=round(risk_frac * 100, 2),
-                size_label=size_label,
-                entry_fee=round(entry_fee, 4),
-            )
+            candle_slug=candle.slug,
+            candle_title=candle.title,
+            side=signal.side,
+            entry_price=round(entry_price, 4),
+            stake=round(stake, 4),
+            shares=round(shares, 4),
+            winner=candle.winner,
+            won=won,
+            pnl=round(pnl, 4),
+            equity_after=round(capital, 4),
+            entry_ts=entry_ts,
+            reason=reason,
+            risk_pct=round(risk_frac * 100, 2),
+            size_label=size_label,
+            entry_fee=round(entry_fee, 4),
+            sim_entry_prob=sim_entry_prob,
+            sim_lifetime_probs=sim_lifetime_probs,
+        )
         trades.append(trade)
         equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
         report(candle_idx, trade)

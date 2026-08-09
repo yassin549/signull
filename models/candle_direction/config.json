@@ -1,0 +1,17 @@
+{
+  "n_features": 68,
+  "hidden_channels": [
+    64,
+    64,
+    64,
+    64
+  ],
+  "kernel_size": 3,
+  "dropout": 0.1,
+  "learning_rate": 0.001,
+  "weight_decay": 1e-05,
+  "batch_size": 64,
+  "max_epochs": 40,
+  "patience": 8,
+  "seed": 42
+}

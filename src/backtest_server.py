@@ -1,4 +1,4 @@
-"""FastAPI server for the backtesting dashboard."""
+"""FastAPI server for the backtesting dashboard (and shared route registration)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import json
 import queue
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Callable
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -20,6 +20,8 @@ from src.backtest.engine import run_backtest
 from src.backtest.registry import get_strategy, list_strategies
 from src.config import SERIES_SLUGS
 
+# Unified UI lives under dashboard/; backtest_dashboard/ is legacy-only.
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
 BACKTEST_DIR = Path(__file__).resolve().parent.parent / "backtest_dashboard"
 
 
@@ -85,21 +87,18 @@ def _run_backtest(
         requested = 0 if first > last else ((last - first) // 300) + 1
         result["candles_requested"] = requested
         result["candles_missing"] = max(0, requested - len(candles))
+    # Surface model-probability coverage for ML strategies (dashboard warnings).
+    cov = getattr(strategy, "last_coverage", None)
+    if isinstance(cov, dict):
+        result["model_coverage"] = cov
     return result
 
 
-def create_backtest_app() -> FastAPI:
-    app = FastAPI(title="Signull Backtest", version="0.1.0")
+def register_backtest_routes(app: FastAPI) -> None:
+    """Mount backtest REST + SSE endpoints on an existing FastAPI app."""
     run_slots = asyncio.Semaphore(1)
     run_active = False
     jobs: dict[str, queue.Queue[dict]] = {}
-
-    if BACKTEST_DIR.exists():
-        app.mount("/static", StaticFiles(directory=BACKTEST_DIR), name="static")
-
-    @app.get("/")
-    async def index():
-        return FileResponse(BACKTEST_DIR / "index.html")
 
     @app.get("/api/strategies")
     async def strategies():
@@ -157,10 +156,13 @@ def create_backtest_app() -> FastAPI:
                 async with run_slots:
                     result = await asyncio.to_thread(_run_backtest, req, emit)
                 emit({"type": "complete", "result": result})
-            except (KeyError, LookupError, ValueError) as exc:
+            except (KeyError, LookupError, ValueError, FileNotFoundError) as exc:
                 emit({"type": "error", "message": str(exc)})
-            except Exception:
-                emit({"type": "error", "message": "Backtest failed; check the server log."})
+            except Exception as exc:
+                emit({
+                    "type": "error",
+                    "message": f"Backtest failed: {type(exc).__name__}: {exc}",
+                })
             finally:
                 run_active = False
 
@@ -188,4 +190,18 @@ def create_backtest_app() -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+
+def create_backtest_app() -> FastAPI:
+    """Standalone backtest server (no live bot). Serves the unified dashboard."""
+    app = FastAPI(title="Signull Backtest", version="0.1.0")
+    static_dir = DASHBOARD_DIR if DASHBOARD_DIR.exists() else BACKTEST_DIR
+
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/")
+    async def index():
+        return FileResponse(static_dir / "index.html")
+
+    register_backtest_routes(app)
     return app

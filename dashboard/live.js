@@ -1,10 +1,17 @@
-/* Signull dashboard */
+(function () {
+/* Signull live dashboard module */
 
 let ws, reconnectTimer, pollTimer, lastVersion = -1;
 let history = [];
 let btcHistory = [];
+let simHistory = [];
 let equityHistory = [];
 let equityInitial = null;
+let liveStrategyTrades = [];
+let eqViewState = { xMin: null, xMax: null, isUserZoomed: false, autoScroll: true };
+let eqHoverState = { active: false, x: 0, y: 0, trade: null };
+let eqDragState = { isDragging: false, startX: 0, startMin: null, startMax: null };
+let equityChartEventsBound = false;
 let priceToBeat = null;
 let activeBook = "up";
 let cachedBooks = {};
@@ -26,6 +33,14 @@ let activeCandleStartTs = null;
 let lastBtcSnapshot = null;
 let feedReconnecting = false;
 let localWindowStart = null;
+/** When false, WS/state keep updating but canvas paint is skipped. */
+let viewActive = true;
+let liveInited = false;
+
+let cachedConfig = null;
+let latestSnapshotStrategy = null;
+let lwEquityChart = null;
+let lwEquitySeries = null;
 
 function safe(fn) {
   return (...args) => {
@@ -35,6 +50,8 @@ function safe(fn) {
 }
 
 function init() {
+  if (liveInited) return;
+  liveInited = true;
   initTabs("book-tabs", (tab) => {
     activeBook = tab;
     renderActiveBook();
@@ -44,11 +61,24 @@ function init() {
     document.getElementById("info-wallet").classList.toggle("hidden", tab !== "wallet");
     document.getElementById("info-log").classList.toggle("hidden", tab !== "log");
   });
+  const startBtn = document.getElementById("btn-start");
+  const stopBtn = document.getElementById("btn-stop");
+  const resetBtn = document.getElementById("btn-reset");
+  const resetInfoBtn = document.getElementById("btn-reset-info");
+  if (startBtn) startBtn.addEventListener("click", startBot);
+  if (stopBtn) stopBtn.addEventListener("click", stopBot);
+  if (resetBtn) resetBtn.addEventListener("click", resetAccount);
+  if (resetInfoBtn) resetInfoBtn.addEventListener("click", resetAccount);
+
+  initLiveStrategyControl();
+
   fetch("/api/config")
     .then(r => r.json())
     .then(c => {
+      cachedConfig = c;
       const el = document.getElementById("asset-badge");
       if (el) el.textContent = (c.asset || "btc").toUpperCase();
+      updateStrategyParams(latestSnapshotStrategy || {});
     })
     .catch(() => {});
   pollStatus();
@@ -58,7 +88,10 @@ function init() {
   requestAnimationFrame(renderLoop);
 }
 
-document.addEventListener("DOMContentLoaded", init);
+function setActive(active) {
+  viewActive = !!active;
+  if (viewActive) needsRedraw = true;
+}
 
 function initTabs(id, onSwitch) {
   const el = document.getElementById(id);
@@ -150,15 +183,27 @@ function applySnapshot(d, isFull) {
   } else if (btcIncoming.length) {
     mergeBtcHistory(btcIncoming);
   }
+
+  const simIncoming = d.sim_history || [];
+  if (isFull) {
+    simHistory = filterBtcHistoryForCandle(
+      (simIncoming || []).map(normalizeSimPoint)
+    );
+  } else if (simIncoming.length) {
+    mergeSimHistory(simIncoming);
+  }
+
   // Live tail after history merge so it never blocks server points.
   if (d.btc) seedBtcLivePoint(d.btc);
 
-  // Shared wall-clock "now" for both charts (odds + BTC must share the axis).
+  // Shared wall-clock "now" for charts (odds + BTC + SIM must share the axis).
   const oddsT = history.length ? history[history.length - 1].t : null;
   const btcT = btcHistory.length ? btcHistory[btcHistory.length - 1].t : null;
+  const simT = simHistory.length ? simHistory[simHistory.length - 1].t : null;
   lastServerTs = Math.max(
     oddsT || 0,
     btcT || 0,
+    simT || 0,
     d.feed?.last_update_at || 0,
     d.btc?.updated_at || 0,
     Date.now() / 1000 - 1
@@ -177,7 +222,8 @@ function mergeEquityHistory(incoming) {
       byT.set(keyFor(p), { ...p, t: Number(p.t), v: Number(p.v) });
     }
   });
-  equityHistory = [...byT.values()].sort((a, b) => a.t - b.t).slice(-6000);
+  equityHistory = [...byT.values()].sort((a, b) => a.t - b.t).slice(-50000);
+  updateLightweightEquityChart();
 }
 
 function mergeHistory(incoming) {
@@ -254,6 +300,35 @@ function normalizeBtcPoint(p) {
     out.d = Number(p.d);
   }
   return out;
+}
+
+function normalizeSimPoint(p) {
+  if (!p) return { t: 0 };
+  const out = { t: Number(p.t) };
+  if (p.v != null && !isNaN(Number(p.v))) out.v = Number(p.v);
+  if (p.cs != null) out.cs = p.cs;
+  return out;
+}
+
+function mergeSimHistory(incoming) {
+  incoming = filterBtcHistoryForCandle(incoming.map(normalizeSimPoint));
+  if (!incoming.length) return;
+  simHistory = filterBtcHistoryForCandle(simHistory);
+  if (!simHistory.length) {
+    simHistory = incoming.slice();
+    return;
+  }
+  const byT = new Map();
+  for (const p of simHistory) byT.set(Math.round(p.t * 20) / 20, p);
+  for (const pt of incoming) {
+    const key = Math.round(pt.t * 20) / 20;
+    const prev = byT.get(key);
+    if (!prev || (pt.v != null && (prev.v == null || pt.t >= prev.t))) {
+      byT.set(key, pt);
+    }
+  }
+  simHistory = filterBtcHistoryForCandle([...byT.values()].sort((a, b) => a.t - b.t));
+  if (simHistory.length > 6000) simHistory = simHistory.slice(-6000);
 }
 
 /** Recompute Δ from absolute price when beat is known. */
@@ -535,13 +610,27 @@ function updateStrategy(d) {
 }
 
 function updateStrategyTrades(trades) {
+  if (Array.isArray(trades)) {
+    const existing = new Map(liveStrategyTrades.map(t => [t.slug || `${t.t}_${t.side}`, t]));
+    for (const t of trades) {
+      if (t) existing.set(t.slug || `${t.t}_${t.side}`, t);
+    }
+    liveStrategyTrades = [...existing.values()].sort((a, b) => Number(a.t) - Number(b.t));
+  }
+
+  const countEl = document.getElementById("equity-trades-count");
+  if (countEl) {
+    countEl.textContent = `${liveStrategyTrades.length} trade${liveStrategyTrades.length === 1 ? "" : "s"}`;
+  }
+
   const el = document.getElementById("strat-trades");
   if (!el) return;
-  if (!trades.length) {
+  if (!liveStrategyTrades.length) {
     el.innerHTML = '<div class="placeholder">No Signull trades yet</div>';
     return;
   }
-  el.innerHTML = trades.slice(0, 20).map(t => {
+  const sortedDesc = [...liveStrategyTrades].reverse();
+  el.innerHTML = sortedDesc.slice(0, 20).map(t => {
     const cls = t.won ? "win" : "loss";
     const pnl = Number(t.pnl || 0);
     const tip = [
@@ -559,6 +648,7 @@ function updateStrategyTrades(trades) {
       <span class="st-eq">$${Number(t.equity_after).toFixed(2)}</span>
     </div>`;
   }).join("");
+  needsRedraw = true;
 }
 
 function flashEl(id) {
@@ -687,6 +777,227 @@ function updateWallet(d) {
       tipsEl.innerHTML = "";
     }
   }
+
+  updateStrategyParams(s);
+}
+
+let liveStrategies = [];
+let userEditingLiveParams = false;
+
+function initLiveStrategyControl() {
+  const sel = document.getElementById("live-strategy-select");
+  const applyBtn = document.getElementById("btn-apply-live-strategy");
+  if (!sel) return;
+
+  if (applyBtn) {
+    applyBtn.addEventListener("click", applyLiveStrategy);
+  }
+  sel.addEventListener("change", () => {
+    const activeId = cachedConfig?.strategy || latestSnapshotStrategy?.id;
+    userEditingLiveParams = sel.value !== activeId;
+    onLiveStrategyChange();
+  });
+
+  fetch("/api/strategies")
+    .then(r => r.json())
+    .then(data => {
+      liveStrategies = data.strategies || [];
+      if (!liveStrategies.length) return;
+      sel.innerHTML = liveStrategies.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
+      const activeId = cachedConfig?.strategy || latestSnapshotStrategy?.id || liveStrategies[0].id;
+      sel.value = activeId;
+      onLiveStrategyChange();
+    })
+    .catch(err => {
+      console.error("Failed to load live strategies", err);
+    });
+}
+
+function onLiveStrategyChange() {
+  const sel = document.getElementById("live-strategy-select");
+  if (!sel) return;
+  const selectedId = sel.value;
+  const strat = liveStrategies.find(s => s.id === selectedId);
+  const descEl = document.getElementById("live-strategy-desc");
+  if (descEl) {
+    descEl.textContent = strat ? strat.description : "No description available.";
+  }
+
+  const activeId = cachedConfig?.strategy || latestSnapshotStrategy?.id;
+  const currentParams = (selectedId === activeId)
+    ? (latestSnapshotStrategy?.params || cachedConfig?.strategy_params || strat?.default_params || {})
+    : (strat?.default_params || {});
+
+  renderLiveParamsBox(currentParams);
+}
+
+function renderLiveParamsBox(params) {
+  const box = document.getElementById("live-params-box");
+  if (!box) return;
+
+  const entries = Object.entries(params || {});
+  if (!entries.length) {
+    box.innerHTML = '<div class="placeholder">No parameters for this strategy</div>';
+    return;
+  }
+
+  box.innerHTML = entries.map(([k, v]) => {
+    const label = k.replace(/_/g, " ");
+    const step = paramStepVal(v);
+    return `
+      <div class="live-param-chip">
+        <label title="${esc(k)}">${esc(label)}</label>
+        <input type="number" step="${step}" data-live-param="${esc(k)}" value="${v}" />
+      </div>
+    `;
+  }).join("");
+
+  box.querySelectorAll("input").forEach(input => {
+    input.addEventListener("focus", () => { userEditingLiveParams = true; });
+    input.addEventListener("input", () => { userEditingLiveParams = true; });
+  });
+}
+
+function paramStepVal(v) {
+  if (typeof v === "number") {
+    if (Number.isInteger(v)) return "1";
+    if (Math.abs(v) >= 1) return "0.05";
+    return "0.01";
+  }
+  return "any";
+}
+
+async function applyLiveStrategy() {
+  const sel = document.getElementById("live-strategy-select");
+  const applyBtn = document.getElementById("btn-apply-live-strategy");
+  const msgEl = document.getElementById("live-strat-update-msg");
+  if (!sel) return;
+
+  const strategyId = sel.value;
+  const params = {};
+  document.querySelectorAll("[data-live-param]").forEach(el => {
+    const key = el.dataset.liveParam;
+    const v = parseFloat(el.value);
+    if (!Number.isNaN(v)) {
+      params[key] = v;
+    }
+  });
+
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.textContent = "Applying…";
+  }
+  if (msgEl) {
+    msgEl.textContent = "";
+    msgEl.className = "strat-update-msg";
+  }
+
+  try {
+    const res = await fetch("/api/strategy/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ strategy_id: strategyId, params }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Failed to update strategy");
+    }
+
+    const data = await res.json();
+    userEditingLiveParams = false;
+    if (cachedConfig) {
+      cachedConfig.strategy = data.strategy_id;
+      cachedConfig.strategy_name = data.strategy_name;
+      cachedConfig.strategy_params = data.params;
+    }
+    if (latestSnapshotStrategy) {
+      latestSnapshotStrategy.id = data.strategy_id;
+      latestSnapshotStrategy.name = data.strategy_name;
+      latestSnapshotStrategy.params = data.params;
+    }
+
+    if (msgEl) {
+      msgEl.textContent = "✓ Applied!";
+      msgEl.className = "strat-update-msg ok";
+      setTimeout(() => {
+        if (msgEl.textContent === "✓ Applied!") msgEl.textContent = "";
+      }, 3500);
+    }
+
+    pollStatus();
+    fetch("/api/config").then(r => r.json()).then(c => { cachedConfig = c; }).catch(() => {});
+  } catch (e) {
+    if (msgEl) {
+      msgEl.textContent = `❌ ${e.message}`;
+      msgEl.className = "strat-update-msg err";
+    }
+  } finally {
+    if (applyBtn) {
+      applyBtn.disabled = false;
+      applyBtn.textContent = "Apply Changes";
+    }
+  }
+}
+
+function updateStrategyParams(s) {
+  if (s && Object.keys(s).length) {
+    latestSnapshotStrategy = s;
+  }
+  const grid = document.getElementById("strat-params-grid");
+  const nameEl = document.getElementById("strat-params-name");
+
+  const stratName = s?.name || cachedConfig?.strategy_name || cachedConfig?.strategy || "Signull 1.1 (Always In)";
+  if (nameEl) {
+    nameEl.textContent = stratName;
+  }
+
+  const activeId = s?.id || cachedConfig?.strategy;
+  const sel = document.getElementById("live-strategy-select");
+  if (sel && activeId && !userEditingLiveParams && sel.value !== activeId) {
+    if (Array.from(sel.options).some(opt => opt.value === activeId)) {
+      sel.value = activeId;
+      onLiveStrategyChange();
+    }
+  }
+
+  const params = (s && s.params && Object.keys(s.params).length > 0)
+    ? s.params
+    : (cachedConfig?.strategy_params || {});
+
+  const keys = Object.keys(params);
+  if (!grid) return;
+  if (!keys.length) {
+    grid.innerHTML = '<div class="placeholder">No parameters loaded</div>';
+    return;
+  }
+
+  grid.innerHTML = keys.map(k => {
+    const rawVal = params[k];
+    let displayVal = rawVal;
+    if (typeof rawVal === "number") {
+      if (Number.isInteger(rawVal)) {
+        displayVal = rawVal.toString();
+      } else if (k.includes("pct") || k.includes("rate") || k.includes("threshold")) {
+        displayVal = `${(rawVal * 100).toFixed(rawVal * 100 % 1 === 0 ? 0 : 1)}%`;
+      } else if (k.includes("usdc") || k.includes("stake")) {
+        displayVal = `$${rawVal.toFixed(2)}`;
+      } else if (k.includes("seconds") || k.includes("sec")) {
+        displayVal = `${rawVal.toFixed(0)}s`;
+      } else {
+        displayVal = rawVal.toFixed(3);
+      }
+    } else if (typeof rawVal === "boolean") {
+      displayVal = rawVal ? "True" : "False";
+    }
+    const label = k.replace(/_/g, " ");
+    return `
+      <div class="param-card">
+        <span class="param-key" title="${esc(k)}">${esc(label)}</span>
+        <span class="param-val mono" title="${esc(String(rawVal))}">${esc(String(displayVal))}</span>
+      </div>
+    `;
+  }).join("");
 }
 
 function updateEquityMeta(equity, initial) {
@@ -1174,8 +1485,512 @@ function drawBtcChart() {
   return true;
 }
 
+function drawSimChart() {
+  const canvas = document.getElementById("sim-chart");
+  if (!canvas) return false;
+  const setup = setupCanvas(canvas);
+  if (!setup) return false;
+  const { ctx, w: W, h: H } = setup;
+  const pad = { l: 48, r: 12, t: 12, b: 26 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+
+  ctx.fillStyle = "#06090f";
+  ctx.fillRect(0, 0, W, H);
+
+  const now = chartNow();
+  const windowSec = chartWindowSec();
+  const tMin = Math.max(candleWindowStart(), now - windowSec);
+
+  let visible = filterBtcHistoryForCandle(simHistory)
+    .filter(p => p.t >= tMin && p.v != null)
+    .map(p => ({ t: p.t, v: Number(p.v) }));
+
+  if (!visible.length && lastBtcSnapshot && lastBtcSnapshot.btc && lastBtcSnapshot.btc.sim_prob != null) {
+    visible.push({ t: now, v: Number(lastBtcSnapshot.btc.sim_prob) });
+  }
+
+  if (visible.length === 1) {
+    visible = [
+      { t: Math.max(tMin, visible[0].t - 1), v: visible[0].v },
+      visible[0],
+    ];
+  }
+
+  if (visible.length < 2) {
+    setText("sim-spot-prob", "P(Up) —");
+    setText("sim-chart-meta", "Waiting for data…");
+    return true;
+  }
+
+  const yMin = 0.0;
+  const yMax = 1.0;
+
+  const xS = t => pad.l + ((t - tMin) / windowSec) * plotW;
+  const yS = prob => pad.t + plotH - ((prob - yMin) / (yMax - yMin)) * plotH;
+
+  // Grid lines: 0%, 25%, 50%, 75%, 100%
+  ctx.strokeStyle = "#1a2438";
+  ctx.lineWidth = 1;
+  ctx.font = "10px JetBrains Mono, monospace";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (plotH / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(W - pad.r, y);
+    ctx.stroke();
+    ctx.fillStyle = "#5a6d8a";
+    ctx.textAlign = "right";
+    const tickVal = 1.0 - (i / 4.0);
+    ctx.fillText(`${(tickVal * 100).toFixed(0)}%`, pad.l - 4, y + 3);
+  }
+
+  // 50% threshold line (dotted)
+  const y50 = yS(0.5);
+  ctx.strokeStyle = "rgba(0, 242, 254, 0.35)";
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pad.l, y50);
+  ctx.lineTo(W - pad.r, y50);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Gradient area fill
+  const areaGrad = ctx.createLinearGradient(0, pad.t, 0, pad.t + plotH);
+  areaGrad.addColorStop(0, "rgba(0, 242, 254, 0.22)");
+  areaGrad.addColorStop(1, "rgba(79, 172, 254, 0.01)");
+  ctx.fillStyle = areaGrad;
+  ctx.beginPath();
+  visible.forEach((p, i) => {
+    const x = xS(p.t);
+    const y = yS(p.v);
+    if (i === 0) {
+      ctx.moveTo(x, pad.t + plotH);
+      ctx.lineTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  const lastX = xS(visible[visible.length - 1].t);
+  ctx.lineTo(lastX, pad.t + plotH);
+  ctx.closePath();
+  ctx.fill();
+
+  // Vibrant line
+  const lineGrad = ctx.createLinearGradient(pad.l, 0, W - pad.r, 0);
+  lineGrad.addColorStop(0, "#00f2fe");
+  lineGrad.addColorStop(1, "#4facfe");
+
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  visible.forEach((p, i) => {
+    const x = xS(p.t);
+    const y = yS(p.v);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // End point pulse dot
+  const last = visible[visible.length - 1];
+  const lastProb = last.v;
+  ctx.fillStyle = "#00f2fe";
+  ctx.beginPath();
+  ctx.arc(xS(last.t), yS(lastProb), 3.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  setText("sim-spot-prob", `P(Up) ${(lastProb * 100).toFixed(1)}%`);
+  setText("sim-chart-meta", `SIM 1.0 · ${chartWindowLabel()}`);
+
+  return true;
+}
+
+function initEquityChartInteractivity() {
+  if (equityChartEventsBound) return;
+  const canvas = document.getElementById("live-equity-chart");
+  const container = document.getElementById("equity-chart-container");
+  if (!canvas || !container) return;
+
+  equityChartEventsBound = true;
+
+  const btnIn = document.getElementById("eq-zoom-in");
+  if (btnIn) btnIn.addEventListener("click", () => zoomEquityChart(0.75, 0.5));
+
+  const btnOut = document.getElementById("eq-zoom-out");
+  if (btnOut) btnOut.addEventListener("click", () => zoomEquityChart(1.33, 0.5));
+
+  const btnReset = document.getElementById("eq-zoom-reset");
+  if (btnReset) btnReset.addEventListener("click", () => resetEquityZoom());
+
+  container.addEventListener("wheel", e => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const padL = 58, padR = 16;
+    const plotW = rect.width - padL - padR;
+    const mouseX = e.clientX - rect.left;
+    let ratio = 0.5;
+    if (plotW > 0) {
+      ratio = Math.max(0.05, Math.min(0.95, (mouseX - padL) / plotW));
+    }
+    const factor = e.deltaY < 0 ? 0.8 : 1.25;
+    zoomEquityChart(factor, ratio);
+  }, { passive: false });
+
+  container.addEventListener("mousedown", e => {
+    if (e.button !== 0) return;
+    eqDragState.isDragging = true;
+    eqDragState.startX = e.clientX;
+    const allT = equityHistory.map(p => Number(p.t)).filter(Number.isFinite);
+    if (allT.length) {
+      const fullMin = allT[0];
+      const fullMax = allT[allT.length - 1];
+      eqDragState.startMin = eqViewState.isUserZoomed ? eqViewState.xMin : fullMin;
+      eqDragState.startMax = eqViewState.isUserZoomed ? eqViewState.xMax : Math.max(fullMax, fullMin + 1);
+    }
+  });
+
+  window.addEventListener("mousemove", e => {
+    const rect = canvas.getBoundingClientRect();
+    const inBounds = e.clientX >= rect.left && e.clientX <= rect.right &&
+                     e.clientY >= rect.top && e.clientY <= rect.bottom;
+
+    if (eqDragState.isDragging) {
+      const dx = e.clientX - eqDragState.startX;
+      const padL = 58, padR = 16;
+      const plotW = rect.width - padL - padR;
+      if (plotW > 0 && eqDragState.startMin != null && eqDragState.startMax != null) {
+        const span = eqDragState.startMax - eqDragState.startMin;
+        const dt = -(dx / plotW) * span;
+        const allT = equityHistory.map(p => Number(p.t)).filter(Number.isFinite);
+        const fullMax = allT.length ? allT[allT.length - 1] : 0;
+
+        eqViewState.xMin = eqDragState.startMin + dt;
+        eqViewState.xMax = eqDragState.startMax + dt;
+        eqViewState.isUserZoomed = true;
+        eqViewState.autoScroll = (eqViewState.xMax >= fullMax - 2);
+        needsRedraw = true;
+      }
+    }
+
+    if (inBounds) {
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      eqHoverState.active = true;
+      eqHoverState.x = mouseX;
+      eqHoverState.y = mouseY;
+      needsRedraw = true;
+    } else if (!eqDragState.isDragging && eqHoverState.active) {
+      eqHoverState.active = false;
+      const tooltip = document.getElementById("equity-tooltip");
+      if (tooltip) tooltip.classList.add("hidden");
+      needsRedraw = true;
+    }
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (eqDragState.isDragging) {
+      eqDragState.isDragging = false;
+    }
+  });
+
+  container.addEventListener("mouseleave", () => {
+    if (!eqDragState.isDragging) {
+      eqHoverState.active = false;
+      const tooltip = document.getElementById("equity-tooltip");
+      if (tooltip) tooltip.classList.add("hidden");
+      needsRedraw = true;
+    }
+  });
+
+  container.addEventListener("dblclick", () => {
+    resetEquityZoom();
+  });
+
+  let lastTouchDist = 0;
+  container.addEventListener("touchstart", e => {
+    if (e.touches.length === 1) {
+      eqDragState.isDragging = true;
+      eqDragState.startX = e.touches[0].clientX;
+      const allT = equityHistory.map(p => Number(p.t)).filter(Number.isFinite);
+      if (allT.length) {
+        const fullMin = allT[0];
+        const fullMax = allT[allT.length - 1];
+        eqDragState.startMin = eqViewState.isUserZoomed ? eqViewState.xMin : fullMin;
+        eqDragState.startMax = eqViewState.isUserZoomed ? eqViewState.xMax : Math.max(fullMax, fullMin + 1);
+      }
+    } else if (e.touches.length === 2) {
+      lastTouchDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+    }
+  }, { passive: true });
+
+  container.addEventListener("touchmove", e => {
+    if (e.touches.length === 1 && eqDragState.isDragging) {
+      const dx = e.touches[0].clientX - eqDragState.startX;
+      const rect = canvas.getBoundingClientRect();
+      const padL = 58, padR = 16;
+      const plotW = rect.width - padL - padR;
+      if (plotW > 0 && eqDragState.startMin != null) {
+        const span = eqDragState.startMax - eqDragState.startMin;
+        const dt = -(dx / plotW) * span;
+        const allT = equityHistory.map(p => Number(p.t)).filter(Number.isFinite);
+        const fullMax = allT.length ? allT[allT.length - 1] : 0;
+        eqViewState.xMin = eqDragState.startMin + dt;
+        eqViewState.xMax = eqDragState.startMax + dt;
+        eqViewState.isUserZoomed = true;
+        eqViewState.autoScroll = (eqViewState.xMax >= fullMax - 2);
+        needsRedraw = true;
+      }
+    } else if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      if (lastTouchDist > 0) {
+        const factor = lastTouchDist / dist;
+        zoomEquityChart(factor, 0.5);
+      }
+      lastTouchDist = dist;
+    }
+  }, { passive: true });
+
+  container.addEventListener("touchend", () => {
+    eqDragState.isDragging = false;
+    lastTouchDist = 0;
+  });
+}
+
+function zoomEquityChart(factor, targetRatio = 0.5) {
+  if (!equityHistory.length) return;
+  const allT = equityHistory.map(p => Number(p.t)).filter(Number.isFinite);
+  if (!allT.length) return;
+  const fullMin = allT[0];
+  const fullMax = allT[allT.length - 1];
+  let curMin = eqViewState.isUserZoomed ? eqViewState.xMin : fullMin;
+  let curMax = eqViewState.isUserZoomed ? eqViewState.xMax : Math.max(fullMax, fullMin + 1);
+
+  let span = curMax - curMin;
+  let newSpan = Math.max(10, span * factor);
+  if (newSpan >= (fullMax - fullMin) * 1.5) {
+    resetEquityZoom();
+    return;
+  }
+  let targetT = curMin + span * targetRatio;
+  let newMin = targetT - newSpan * targetRatio;
+  let newMax = targetT + newSpan * (1 - targetRatio);
+
+  eqViewState.xMin = newMin;
+  eqViewState.xMax = newMax;
+  eqViewState.isUserZoomed = true;
+  eqViewState.autoScroll = (newMax >= fullMax - 5);
+  needsRedraw = true;
+}
+
+function initLightweightEquityChart() {
+  const container = document.getElementById("equity-chart-container");
+  if (!container || lwEquityChart) return;
+
+  const oldCanvas = document.getElementById("live-equity-chart");
+  if (oldCanvas) oldCanvas.style.display = "none";
+
+  const chartDiv = document.createElement("div");
+  chartDiv.id = "lw-equity-chart-div";
+  chartDiv.style.width = "100%";
+  chartDiv.style.height = "100%";
+  chartDiv.style.position = "absolute";
+  chartDiv.style.top = "0";
+  chartDiv.style.left = "0";
+  chartDiv.style.right = "0";
+  chartDiv.style.bottom = "0";
+  container.appendChild(chartDiv);
+
+  lwEquityChart = LightweightCharts.createChart(chartDiv, {
+    layout: {
+      background: { type: 'solid', color: '#06090f' },
+      textColor: '#94a3b8',
+      fontSize: 11,
+      fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+    },
+    grid: {
+      vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
+      horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
+    },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: {
+        color: 'rgba(99, 102, 241, 0.5)',
+        width: 1,
+        style: LightweightCharts.LineStyle.Dashed,
+        labelBackgroundColor: '#6366f1',
+      },
+      horzLine: {
+        color: 'rgba(99, 102, 241, 0.5)',
+        width: 1,
+        style: LightweightCharts.LineStyle.Dashed,
+        labelBackgroundColor: '#6366f1',
+      },
+    },
+    rightPriceScale: {
+      borderColor: 'rgba(255, 255, 255, 0.08)',
+      scaleMargins: { top: 0.15, bottom: 0.15 },
+      autoScale: true,
+    },
+    timeScale: {
+      borderColor: 'rgba(255, 255, 255, 0.08)',
+      timeVisible: true,
+      secondsVisible: true,
+      rightOffset: 5,
+    },
+    handleScroll: {
+      mouseWheel: true,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
+      vertTouchDrag: true,
+    },
+    handleScale: {
+      axisPressedMouseMove: true,
+      mouseWheel: true,
+      pinch: true,
+    },
+  });
+
+  lwEquitySeries = lwEquityChart.addAreaSeries({
+    topColor: 'rgba(99, 102, 241, 0.4)',
+    bottomColor: 'rgba(99, 102, 241, 0.02)',
+    lineColor: '#6366f1',
+    lineWidth: 2,
+    priceFormat: {
+      type: 'price',
+      precision: 2,
+      minMove: 0.01,
+    },
+  });
+
+  const resizeObserver = new ResizeObserver(entries => {
+    if (!entries || !entries.length) return;
+    const { width, height } = entries[0].contentRect;
+    if (width > 0 && height > 0) {
+      lwEquityChart.applyOptions({ width, height });
+    }
+  });
+  resizeObserver.observe(container);
+
+  const btnReset = document.getElementById("eq-zoom-reset");
+  if (btnReset) {
+    btnReset.addEventListener("click", () => {
+      resetEquityZoom();
+    });
+  }
+}
+
+function updateLightweightEquityChart() {
+  if (!lwEquityChart) {
+    if (window.LightweightCharts) {
+      initLightweightEquityChart();
+    }
+  }
+  if (!lwEquitySeries) return;
+
+  if (!equityHistory.length) {
+    lwEquitySeries.setData([]);
+    return;
+  }
+
+  const pointsByTime = new Map();
+  for (const p of equityHistory) {
+    if (p && Number.isFinite(Number(p.t)) && Number.isFinite(Number(p.v))) {
+      const t = Math.floor(Number(p.t));
+      const v = Number(p.v);
+      pointsByTime.set(t, { time: t, value: v });
+    }
+  }
+
+  const chartData = [...pointsByTime.values()].sort((a, b) => a.time - b.time);
+  lwEquitySeries.setData(chartData);
+
+  if (chartData.length >= 2) {
+    const firstVal = chartData[0].value;
+    const lastVal = chartData[chartData.length - 1].value;
+    const isUp = lastVal >= firstVal;
+    lwEquitySeries.applyOptions({
+      lineColor: isUp ? '#10b981' : '#ef4444',
+      topColor: isUp ? 'rgba(16, 185, 129, 0.4)' : 'rgba(239, 68, 68, 0.4)',
+      bottomColor: isUp ? 'rgba(16, 185, 129, 0.02)' : 'rgba(239, 68, 68, 0.02)',
+    });
+  }
+
+  if (liveStrategyTrades && liveStrategyTrades.length) {
+    const markers = [];
+    for (const tr of liveStrategyTrades) {
+      if (tr && Number.isFinite(Number(tr.t))) {
+        const trTime = Math.floor(Number(tr.t));
+        const won = !!tr.won;
+        const pnl = Number(tr.pnl || 0);
+        markers.push({
+          time: trTime,
+          position: won ? "belowBar" : "aboveBar",
+          color: won ? "#10b981" : "#ef4444",
+          shape: won ? "arrowUp" : "arrowDown",
+          text: won ? `+${fmtUsd(pnl)}` : `-${fmtUsd(Math.abs(pnl))}`,
+        });
+      }
+    }
+    markers.sort((a, b) => a.time - b.time);
+    try {
+      lwEquitySeries.setMarkers(markers);
+    } catch (_) {}
+  }
+}
+
+function resetEquityZoom() {
+  if (lwEquityChart) {
+    lwEquityChart.timeScale().fitContent();
+  }
+  eqViewState.isUserZoomed = false;
+  eqViewState.autoScroll = true;
+  eqViewState.xMin = null;
+  eqViewState.xMax = null;
+  needsRedraw = true;
+}
+
+async function resetAccount() {
+  const confirmed = confirm(
+    "Are you sure you want to reset your account balance to $100.00 and delete all prior trading data?\n\nThis action cannot be undone."
+  );
+  if (!confirmed) return;
+
+  try {
+    const res = await fetch("/api/account/reset", { method: "POST" });
+    if (!res.ok) {
+      alert("Failed to reset account. Please try again.");
+      return;
+    }
+    equityHistory = [];
+    liveStrategyTrades = [];
+    if (lwEquitySeries) {
+      lwEquitySeries.setData([]);
+      try { lwEquitySeries.setMarkers([]); } catch (_) {}
+    }
+    await pollStatus();
+  } catch (err) {
+    console.error("Failed to reset account:", err);
+    alert("Error resetting account: " + err.message);
+  }
+}
+
 function drawEquityChart() {
-  const canvas = document.getElementById("equity-chart");
+  if (window.LightweightCharts) {
+    initLightweightEquityChart();
+    updateLightweightEquityChart();
+    return true;
+  }
+  initEquityChartInteractivity();
+  const canvas = document.getElementById("live-equity-chart");
   if (!canvas) return false;
   const setup = setupCanvas(canvas);
   if (!setup) return false;
@@ -1188,86 +2003,278 @@ function drawEquityChart() {
     .map(p => ({ ...p, t: Number(p.t), v: Number(p.v) }));
   if (!visible.length) return true;
 
-  const pad = { l: 58, r: 12, t: 8, b: 22 };
+  const pad = { l: 58, r: 16, t: 28, b: 24 };
   const plotW = W - pad.l - pad.r;
   const plotH = H - pad.t - pad.b;
+
   const first = visible[0];
   const last = visible[visible.length - 1];
-  const tMin = first.t;
-  const tMax = Math.max(last.t, tMin + 1);
-  // Equity changes only at settlement.  Keeping the initial balance in the
-  // domain stops minor moves from being magnified into a full-height climb.
+  const fullMin = first.t;
+  const fullMax = Math.max(last.t, fullMin + 1);
+
+  let tMin, tMax;
+  if (!eqViewState.isUserZoomed || eqViewState.autoScroll) {
+    tMin = fullMin;
+    tMax = fullMax;
+  } else {
+    tMin = eqViewState.xMin != null ? eqViewState.xMin : fullMin;
+    tMax = eqViewState.xMax != null ? eqViewState.xMax : fullMax;
+  }
+
   const initial = Number.isFinite(equityInitial) ? equityInitial : Number(first.v);
-  const vals = [...visible.map(p => p.v), initial];
+  const inView = visible.filter(p => p.t >= tMin - 60 && p.t <= tMax + 60);
+  const chartPoints = inView.length ? inView : visible;
+
+  const vals = [...chartPoints.map(p => p.v), initial];
   const lo = Math.min(...vals), hi = Math.max(...vals);
   const spread = Math.max(hi - lo, Math.max(Math.abs(hi) * 0.01, 0.01));
-  const yMin = lo - spread * 0.2;
-  const yMax = hi + spread * 0.2;
+  const yMin = lo - spread * 0.15;
+  const yMax = hi + spread * 0.15;
+
   const xS = t => pad.l + ((t - tMin) / (tMax - tMin)) * plotW;
   const yS = v => pad.t + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
 
+  // Grid
   ctx.strokeStyle = "#1a2438";
   ctx.lineWidth = 1;
   ctx.font = "10px JetBrains Mono, monospace";
-  for (let i = 0; i <= 3; i++) {
-    const y = pad.t + (plotH / 3) * i;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (plotH / 4) * i;
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
     ctx.fillStyle = "#5a6d8a";
     ctx.textAlign = "right";
-    ctx.fillText(fmtUsdCompact(yMax - ((yMax - yMin) / 3) * i), pad.l - 4, y + 3);
+    ctx.fillText(fmtUsdCompact(yMax - ((yMax - yMin) / 4) * i), pad.l - 4, y + 3);
   }
 
   const positive = Number(last.v) >= Number(first.v);
   const color = positive ? "#0ecb81" : "#f6465d";
-  const baseline = yS(initial);
-  ctx.fillStyle = positive ? "rgba(14, 203, 129, 0.12)" : "rgba(246, 70, 93, 0.12)";
+  const baseline = Math.max(pad.t, Math.min(pad.t + plotH, yS(initial)));
+
+  // Area fill gradient
+  const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + plotH);
+  if (positive) {
+    grad.addColorStop(0, "rgba(14, 203, 129, 0.22)");
+    grad.addColorStop(1, "rgba(14, 203, 129, 0.0)");
+  } else {
+    grad.addColorStop(0, "rgba(246, 70, 93, 0.22)");
+    grad.addColorStop(1, "rgba(246, 70, 93, 0.0)");
+  }
+
+  ctx.fillStyle = grad;
   ctx.beginPath();
   visible.forEach((p, i) => {
-    if (!i) ctx.moveTo(xS(p.t), yS(p.v));
+    const x = xS(p.t);
+    const y = yS(p.v);
+    if (!i) ctx.moveTo(x, y);
     else {
       const prev = visible[i - 1];
-      ctx.lineTo(xS(p.t), yS(prev.v));
-      ctx.lineTo(xS(p.t), yS(p.v));
+      ctx.lineTo(x, yS(prev.v));
+      ctx.lineTo(x, y);
     }
   });
   ctx.lineTo(xS(last.t), baseline); ctx.lineTo(xS(first.t), baseline); ctx.closePath(); ctx.fill();
 
+  // Equity step stroke line
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
   ctx.lineJoin = "round";
   ctx.beginPath();
   visible.forEach((p, i) => {
-    if (!i) ctx.moveTo(xS(p.t), yS(p.v));
+    const x = xS(p.t);
+    const y = yS(p.v);
+    if (!i) ctx.moveTo(x, y);
     else {
       const prev = visible[i - 1];
-      ctx.lineTo(xS(p.t), yS(prev.v));
-      ctx.lineTo(xS(p.t), yS(p.v));
+      ctx.lineTo(x, yS(prev.v));
+      ctx.lineTo(x, y);
     }
   });
   ctx.stroke();
-  ctx.fillStyle = color;
-  ctx.beginPath(); ctx.arc(xS(last.t), yS(last.v), 3.5, 0, Math.PI * 2); ctx.fill();
 
+  // Last point marker
+  if (xS(last.t) >= pad.l && xS(last.t) <= W - pad.r) {
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(xS(last.t), yS(last.v), 4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // Draw Trade Markers taken by the engine
+  let hoveredTrade = null;
+  let minDist = 22;
+
+  liveStrategyTrades.forEach(tr => {
+    const trT = Number(tr.t);
+    if (isNaN(trT) || trT < tMin || trT > tMax) return;
+    const x = xS(trT);
+    if (x < pad.l - 5 || x > W - pad.r + 5) return;
+
+    let eqVal = Number(tr.equity_after);
+    if (!Number.isFinite(eqVal)) {
+      const closest = visible.reduce((best, p) => Math.abs(p.t - trT) < Math.abs(best.t - trT) ? p : best, visible[0]);
+      eqVal = closest ? closest.v : initial;
+    }
+    const y = Math.max(pad.t + 10, Math.min(pad.t + plotH - 10, yS(eqVal)));
+
+    const won = Boolean(tr.won);
+    const side = String(tr.side || "UP").toUpperCase();
+    const pnl = Number(tr.pnl || 0);
+    const pnlStr = pnl !== 0 ? `${pnl > 0 ? "+" : ""}$${pnl.toFixed(1)}` : "";
+
+    const badgeColor = won ? "#0ecb81" : "#f6465d";
+    const badgeBg = won ? "rgba(14, 203, 129, 0.9)" : "rgba(246, 70, 93, 0.9)";
+    const arrow = won ? "▲" : "▼";
+    const label = `${arrow} ${side} ${pnlStr}`;
+
+    ctx.font = "bold 9px JetBrains Mono, monospace";
+    const tw = ctx.measureText(label).width;
+    const bw = tw + 8;
+    const bh = 15;
+    const bx = x - bw / 2;
+    const by = won ? y - 20 : y + 6;
+
+    ctx.strokeStyle = badgeColor;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x, by + (won ? bh : 0));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = badgeBg;
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, 3);
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.fillText(label, x, by + 11);
+
+    if (eqHoverState.active) {
+      const dist = Math.hypot(eqHoverState.x - x, eqHoverState.y - (by + bh / 2));
+      if (dist < minDist) {
+        minDist = dist;
+        hoveredTrade = tr;
+      }
+    }
+  });
+
+  // Crosshair & Tooltip
+  const tooltip = document.getElementById("equity-tooltip");
+  if (eqHoverState.active) {
+    const mouseX = Math.max(pad.l, Math.min(W - pad.r, eqHoverState.x));
+    const mouseY = Math.max(pad.t, Math.min(H - pad.b, eqHoverState.y));
+
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(mouseX, pad.t); ctx.lineTo(mouseX, H - pad.b); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad.l, mouseY); ctx.lineTo(W - pad.r, mouseY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const hoverT = tMin + ((mouseX - pad.l) / plotW) * (tMax - tMin);
+    const hoverVal = yMax - ((mouseY - pad.t) / plotH) * (yMax - yMin);
+
+    const tStr = new Date(hoverT * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    ctx.fillStyle = "#1e293b";
+    ctx.fillRect(mouseX - 26, H - pad.b, 52, 16);
+    ctx.strokeStyle = "#475569"; ctx.strokeRect(mouseX - 26, H - pad.b, 52, 16);
+    ctx.fillStyle = "#f8fafc"; ctx.font = "9px JetBrains Mono, monospace"; ctx.textAlign = "center";
+    ctx.fillText(tStr, mouseX, H - pad.b + 11);
+
+    const valStr = fmtUsdCompact(hoverVal);
+    ctx.fillStyle = "#1e293b";
+    ctx.fillRect(0, mouseY - 8, pad.l - 2, 16);
+    ctx.strokeStyle = "#475569"; ctx.strokeRect(0, mouseY - 8, pad.l - 2, 16);
+    ctx.fillStyle = "#f8fafc"; ctx.textAlign = "right";
+    ctx.fillText(valStr, pad.l - 4, mouseY + 4);
+
+    if (tooltip) {
+      tooltip.classList.remove("hidden");
+      const container = document.getElementById("equity-chart-container");
+      const containerW = container ? container.clientWidth : W;
+
+      if (hoveredTrade) {
+        const won = Boolean(hoveredTrade.won);
+        const pnl = Number(hoveredTrade.pnl || 0);
+        const eqAfter = Number(hoveredTrade.equity_after);
+        tooltip.innerHTML = `
+          <div class="eq-tooltip-header">
+            <span>TRADE SETTLED</span>
+            <span class="eq-tooltip-badge ${won ? "win" : "loss"}">${won ? "WIN" : "LOSS"} ${String(hoveredTrade.side || "").toUpperCase()}</span>
+          </div>
+          <div class="eq-tooltip-row">
+            <span class="eq-tooltip-label">Market</span>
+            <span class="eq-tooltip-val">${esc(hoveredTrade.title || hoveredTrade.slug || "BTC 5M")}</span>
+          </div>
+          <div class="eq-tooltip-row">
+            <span class="eq-tooltip-label">Entry / Stake</span>
+            <span class="eq-tooltip-val">@${Number(hoveredTrade.entry_price || 0).toFixed(2)} (${hoveredTrade.size_label || ""} $${Number(hoveredTrade.stake || 0).toFixed(2)})</span>
+          </div>
+          <div class="eq-tooltip-row">
+            <span class="eq-tooltip-label">PnL</span>
+            <span class="eq-tooltip-val" style="color:${won ? '#0ecb81' : '#f6465d'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span>
+          </div>
+          <div class="eq-tooltip-row">
+            <span class="eq-tooltip-label">Equity After</span>
+            <span class="eq-tooltip-val">$${Number.isFinite(eqAfter) ? eqAfter.toFixed(2) : "—"}</span>
+          </div>
+          ${hoveredTrade.reason ? `<div class="eq-tooltip-row"><span class="eq-tooltip-label">Signal</span><span class="eq-tooltip-val" style="font-size:9px;color:#94a3b8">${esc(hoveredTrade.reason)}</span></div>` : ""}
+        `;
+      } else {
+        const closestPoint = visible.reduce((best, p) => Math.abs(p.t - hoverT) < Math.abs(best.t - hoverT) ? p : best, visible[0]);
+        const dateStr = new Date(hoverT * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        tooltip.innerHTML = `
+          <div class="eq-tooltip-header">
+            <span>EQUITY POINT</span>
+            <span style="color:#64748b">${dateStr}</span>
+          </div>
+          <div class="eq-tooltip-row">
+            <span class="eq-tooltip-label">Balance</span>
+            <span class="eq-tooltip-val" style="color:${color}">${closestPoint ? '$' + Number(closestPoint.v).toFixed(2) : '—'}</span>
+          </div>
+        `;
+      }
+
+      let tooltipX = mouseX + 12;
+      if (tooltipX + 220 > containerW) tooltipX = mouseX - 230;
+      let tooltipY = mouseY - 20;
+      if (tooltipY < 10) tooltipY = 10;
+      tooltip.style.left = `${Math.max(10, tooltipX)}px`;
+      tooltip.style.top = `${tooltipY}px`;
+    }
+  } else if (tooltip) {
+    tooltip.classList.add("hidden");
+  }
+
+  // Time labels
   ctx.fillStyle = "#5a6d8a";
   ctx.font = "9px JetBrains Mono, monospace";
   ctx.textAlign = "left";
-  ctx.fillText(new Date(first.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), pad.l, H - 7);
+  ctx.fillText(new Date(tMin * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), pad.l, H - 7);
   ctx.textAlign = "right";
-  ctx.fillText(new Date(last.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), W - pad.r, H - 7);
+  ctx.fillText(new Date(tMax * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), W - pad.r, H - 7);
+
   return true;
 }
 
 function renderLoop() {
-  if (lastBtcSnapshot) {
+  if (viewActive && lastBtcSnapshot) {
     if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
   }
-  // Keep redrawing while live so both charts advance the right edge smoothly.
-  const animating = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
-  if (needsRedraw || animating) {
-    drawPriceChart();
-    drawBtcChart();
-    drawEquityChart();
-    if (!animating) needsRedraw = false;
+  // Paint only while Live is visible; WS still merges state in the background.
+  if (viewActive) {
+    const animating = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
+    if (needsRedraw || animating) {
+      drawPriceChart();
+      drawBtcChart();
+      drawSimChart();
+      drawEquityChart();
+      if (!animating) needsRedraw = false;
+    }
   }
   requestAnimationFrame(renderLoop);
 }
@@ -1324,4 +2331,9 @@ async function stopBot() {
   finally { botBusy = false; }
 }
 
-window.addEventListener("resize", () => { needsRedraw = true; });
+window.addEventListener("resize", () => {
+  if (viewActive) needsRedraw = true;
+});
+
+window.SignullLive = { init, setActive };
+})();

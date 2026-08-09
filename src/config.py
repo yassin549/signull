@@ -60,7 +60,8 @@ class BotConfig:
     strategy_btc_align_min: float
     strategy_big_equity_buffer: float
     strategy_risk_pct: float
-    strategy_id: str = "signull_1_1"
+    strategy_id: str = "signull_1_5"
+    custom_strategy_params: dict | None = None
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -71,11 +72,7 @@ class BotConfig:
         mode = os.getenv("TRADING_MODE", "paper").lower()
         if mode not in ("paper", "live"):
             raise ValueError("TRADING_MODE must be 'paper' or 'live'")
-        strategy_id = os.getenv("BOT_STRATEGY", "signull_1_1").lower()
-        if strategy_id not in ("signull_1_0", "signull_1_1", "signull_1_2"):
-            raise ValueError(
-                "BOT_STRATEGY must be 'signull_1_0', 'signull_1_1', or 'signull_1_2'"
-            )
+        strategy_id = os.getenv("BOT_STRATEGY", "signull_1_5").lower()
 
         funder = os.getenv("FUNDER_ADDRESS") or os.getenv("DEPOSIT_WALLET_ADDRESS")
 
@@ -93,18 +90,20 @@ class BotConfig:
             dashboard_push_ms=int(os.getenv("DASHBOARD_PUSH_MS", "50")),
             bot_poll_interval_sec=float(os.getenv("BOT_POLL_INTERVAL_SEC", "2")),
             paper_initial_capital=float(os.getenv("PAPER_INITIAL_CAPITAL", "100")),
-            strategy_threshold=float(os.getenv("SIGNULL_THRESHOLD", "0.70")),
+            strategy_threshold=float(os.getenv("SIGNULL_THRESHOLD", "0.75")),
             strategy_min_risk_pct=float(os.getenv("SIGNULL_MIN_RISK_PCT", "0.05")),
             strategy_max_risk_pct=float(os.getenv("SIGNULL_MAX_RISK_PCT", "0.50")),
             strategy_trust_lookback=int(os.getenv("SIGNULL_TRUST_LOOKBACK", "3")),
             strategy_btc_align_min=float(os.getenv("SIGNULL_BTC_ALIGN_MIN", "0.55")),
             strategy_big_equity_buffer=float(os.getenv("SIGNULL_BIG_EQUITY_BUFFER", "1.25")),
-            strategy_risk_pct=float(os.getenv("SIGNULL_RISK_PCT", "0.10")),
+            strategy_risk_pct=float(os.getenv("SIGNULL_RISK_PCT", "0.20")),
             strategy_id=strategy_id,
         )
 
     def strategy_params(self) -> dict:
         """Parameters for the configured live strategy."""
+        if self.custom_strategy_params is not None:
+            return dict(self.custom_strategy_params)
         if self.strategy_id == "signull_1_1":
             return {
                 "threshold": self.strategy_threshold,
@@ -115,6 +114,20 @@ class BotConfig:
                 "threshold": self.strategy_threshold,
                 # Do not carry paper/backtest observations into live sizing.
                 "persist_calibration": self.is_live,
+            }
+        if self.strategy_id == "signull_1_3":
+            return {
+                "threshold": self.strategy_threshold,
+            }
+        if self.strategy_id == "signull_1_4":
+            return {
+                "threshold": self.strategy_threshold,
+                "risk_pct": self.strategy_risk_pct,
+            }
+        if self.strategy_id == "signull_1_5":
+            return {
+                "target_delta": float(os.getenv("SIGNULL_TARGET_DELTA", "30.0")),
+                "risk_pct": self.strategy_risk_pct,
             }
         return {
             "threshold": self.strategy_threshold,
