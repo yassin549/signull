@@ -23,8 +23,10 @@ try {
     --exclude=mcps `
     --exclude=agent-tools `
     --exclude=data/backtest_cache `
+    --exclude=data/backtest_cache_predict `
     --exclude=data/btc_klines `
     --exclude=data/btc_1s `
+    --exclude=.env `
     --exclude=*.pyc `
     .
   if ($LASTEXITCODE -ne 0) { throw "tar failed" }
