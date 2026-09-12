@@ -26,6 +26,7 @@ try {
     --exclude=data/backtest_cache_predict `
     --exclude=data/btc_klines `
     --exclude=data/btc_1s `
+    --exclude=data/sessions `
     --exclude=.env `
     --exclude=*.pyc `
     .
