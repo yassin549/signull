@@ -39,6 +39,7 @@ class BacktestRequest(BaseModel):
     initial_capital: float = Field(default=100.0, gt=0)
     params: dict | None = None
     use_cache: bool = True
+    invert_signals: bool = False
 
 
 def _live_execution_config() -> dict:
@@ -100,6 +101,7 @@ def _run_backtest(
         fixed_stake_usdc=exec_cfg["fixed_stake_usdc"],
         taker_fee_rate=exec_cfg["taker_fee_rate"],
         maker_fee_rate=exec_cfg["maker_fee_rate"],
+        invert_signals=req.invert_signals,
         progress_callback=progress_callback,
     ).to_dict()
     # A requested period can contain gaps when a historical event is unavailable,

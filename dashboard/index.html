@@ -507,6 +507,11 @@
               <input id="initial-capital" type="number" min="1" step="1" value="100" />
               <p class="hint">Simulated initial bankroll.</p>
             </div>
+            <label class="invert-toggle" for="invert-signals">
+              <input id="invert-signals" type="checkbox" />
+              <span class="invert-track"><span class="invert-thumb"></span></span>
+              <span class="invert-label">Invert strategy <em>(buy the opposite side)</em></span>
+            </label>
             <p class="hint">Sizing, fees, and fills mirror the live bot (fixed USD or % of balance from <code>.env</code>, plus taker fees and real fill risk).</p>
           </div>
         </div>

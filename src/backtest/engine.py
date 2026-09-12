@@ -59,6 +59,7 @@ def run_backtest(
     asset: str = "btc",
     btc_series: BtcSeries | None = None,
     load_btc: bool = True,
+    invert_signals: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> BacktestResult:
     """Simulate *strategy* across resolved candles with live execution."""
@@ -148,6 +149,18 @@ def run_backtest(
             )
             signal = strategy.evaluate(tick, ctx, entered=entered)
             if signal is not None:
+                if invert_signals:
+                    original_side = signal.side
+                    other = "down" if original_side == "up" else "up"
+                    other_price = float(tick.down) if other == "down" else float(tick.up)
+                    signal = TradeSignal(
+                        side=other,
+                        price=other_price,
+                        reason=(
+                            f"{signal.reason} · inverted {original_side.upper()}→{other.upper()}"
+                        ),
+                        taker_fee_rate=signal.taker_fee_rate,
+                    )
                 entry_ts = tick_t
                 entry_tick = tick
                 entered = True
@@ -297,6 +310,7 @@ def run_backtest(
         elapsed_ms=elapsed_ms,
         fetch_failures=fetch_failures,
         synthetic_candles=sum(1 for c in candles if c.synthetic),
+        invert_signals=invert_signals,
     )
 
 

@@ -185,5 +185,49 @@ class SingleBookBacktestTests(unittest.TestCase):
             self.assertIn(key, payload)
 
 
+class InvertSignalsTests(unittest.TestCase):
+    def test_invert_flips_side_and_settles_the_opposite(self):
+        # Strategy buys UP; inverted must buy DOWN and lose on an UP candle.
+        candle = _candle(
+            [(0, 0.50, 0.50), (10, 0.72, 0.28), (40, 0.80, 0.20)],
+            winner="up",
+        )
+        result = run_backtest(
+            AlwaysUp(), [candle], initial_capital=100.0, invert_signals=True
+        )
+
+        trade = result.trades[0]
+        self.assertEqual(trade.side, "down")
+        self.assertTrue(trade.filled)
+        self.assertFalse(trade.won)
+        self.assertLess(trade.pnl, 0)
+        self.assertTrue(result.invert_signals)
+
+    def test_invert_wins_when_the_original_strategy_would_lose(self):
+        candle = _candle(
+            [(0, 0.50, 0.50), (10, 0.72, 0.28), (40, 0.80, 0.20)],
+            winner="down",
+        )
+        result = run_backtest(
+            AlwaysUp(), [candle], initial_capital=100.0, invert_signals=True
+        )
+
+        trade = result.trades[0]
+        self.assertEqual(trade.side, "down")
+        self.assertTrue(trade.filled)
+        self.assertTrue(trade.won)
+        self.assertGreater(trade.pnl, 0)
+        self.assertIn("inverted", trade.reason)
+
+    def test_default_does_not_invert(self):
+        candle = _candle(
+            [(0, 0.50, 0.50), (10, 0.72, 0.28), (30, 0.70, 0.30)],
+            winner="up",
+        )
+        result = run_backtest(AlwaysUp(), [candle], initial_capital=100.0)
+        self.assertEqual(result.trades[0].side, "up")
+        self.assertFalse(result.invert_signals)
+
+
 if __name__ == "__main__":
     unittest.main()

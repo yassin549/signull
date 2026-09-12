@@ -44,6 +44,7 @@ def compute_metrics(
     elapsed_ms: float,
     fetch_failures: int = 0,
     synthetic_candles: int = 0,
+    invert_signals: bool = False,
 ) -> BacktestResult:
     filled = [t for t in trades if t.filled]
     unfilled = len(trades) - len(filled)
@@ -77,4 +78,5 @@ def compute_metrics(
         fill_rate=round(fill_rate, 2),
         fetch_failures=fetch_failures,
         synthetic_candles=synthetic_candles,
+        invert_signals=invert_signals,
     )

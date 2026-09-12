@@ -114,6 +114,7 @@ class BacktestResult:
     fetch_failures: int = 0
     synthetic_candles: int = 0
     data_source: str = "predict.fun"
+    invert_signals: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,4 +142,5 @@ class BacktestResult:
             "fetch_failures": self.fetch_failures,
             "synthetic_candles": self.synthetic_candles,
             "data_source": self.data_source,
+            "invert_signals": self.invert_signals,
         }

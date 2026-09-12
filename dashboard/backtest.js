@@ -304,6 +304,7 @@ async function runBacktest() {
   const riskValueEl = document.getElementById("risk-value");
   const riskType = riskTypeEl ? riskTypeEl.value : "percent_balance";
   const riskVal = riskValueEl && riskValueEl.value !== "" ? parseFloat(riskValueEl.value) : null;
+  const invertEl = document.getElementById("invert-signals");
 
   const body = {
     strategy_id: selectedId,
@@ -311,6 +312,7 @@ async function runBacktest() {
     initial_capital: parseFloat(document.getElementById("initial-capital").value),
     risk_type: riskType,
     risk_value: Number.isFinite(riskVal) ? riskVal : null,
+    invert_signals: !!(invertEl && invertEl.checked),
     params: gatherParams(),
     use_cache: true,
   };
@@ -590,6 +592,7 @@ function renderResult(r) {
       + (paramStr ? ` / ${paramStr}` : "")
       + covStr
       + (r.unfilled ? ` / ${r.unfilled} unfilled signals` : "")
+      + (r.invert_signals ? " / INVERTED" : "")
   );
   renderTradeList(r.trades);
   liveRun = null;
