@@ -169,6 +169,13 @@ class BotConfig:
                 "min_edge": float(os.getenv("SIGNULL_OPEN_EDGE", "0.0")),
                 "asset": self.asset,
             }
+        if self.strategy_id == "signull_1_9":
+            return {
+                "risk_pct": self.strategy_risk_pct,
+                "entry_seconds": float(os.getenv("SIGNULL_FAV_ENTRY_SECONDS", "180.0")),
+                "min_edge": float(os.getenv("SIGNULL_OPEN_EDGE", "0.0")),
+                "asset": self.asset,
+            }
         return {
             "threshold": self.strategy_threshold,
             "min_risk_pct": self.strategy_min_risk_pct,
