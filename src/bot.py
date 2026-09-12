@@ -175,6 +175,9 @@ class TradingBot:
             spec_str = "open favorite"
         elif self.config.strategy_id == "signull_1_9":
             spec_str = "3-min favorite"
+        elif self.config.strategy_id == "signull_1_10":
+            target = self.strategy.params.get("target_delta", 10.0)
+            spec_str = f"regime ±${float(target):.0f}"
         else:
             target = self.strategy.params.get("target_delta", 10.0)
             spec_str = f"target ±${float(target):.0f}"
@@ -520,6 +523,9 @@ class TradingBot:
             return "Waiting for the opening favorite…"
         if self.config.strategy_id == "signull_1_9":
             return "Waiting for the 3-minute favorite…"
+        if self.config.strategy_id == "signull_1_10":
+            target = float(self.strategy.params.get("target_delta", 10.0))
+            return f"Waiting for a ±${target:.0f} break (regime-adaptive)…"
         if self.config.strategy_id == "signull_1_7":
             return "Waiting for BTC to cross this candle's adaptive point-of-no-return..."
         if self.config.strategy_id == "signull_1_6":

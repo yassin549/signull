@@ -176,6 +176,18 @@ class BotConfig:
                 "min_edge": float(os.getenv("SIGNULL_OPEN_EDGE", "0.0")),
                 "asset": self.asset,
             }
+        if self.strategy_id == "signull_1_10":
+            return {
+                "target_delta": float(os.getenv("SIGNULL_TARGET_DELTA", "10.0")),
+                "risk_pct": self.strategy_risk_pct,
+                "vol_lookback_min": int(os.getenv("SIGNULL_REGIME_SHORT_MIN", "30")),
+                "baseline_lookback_min": int(os.getenv("SIGNULL_REGIME_BASE_MIN", "180")),
+                "vol_multiplier": float(os.getenv("SIGNULL_REGIME_VOL_MULT", "1.2")),
+                "min_vol": float(os.getenv("SIGNULL_REGIME_MIN_VOL", "0.0")),
+                "invert_when_volatile": os.getenv("SIGNULL_REGIME_INVERT", "true").lower()
+                in ("true", "1", "yes"),
+                "asset": self.asset,
+            }
         return {
             "threshold": self.strategy_threshold,
             "min_risk_pct": self.strategy_min_risk_pct,

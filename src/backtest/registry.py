@@ -46,10 +46,11 @@ def list_strategies() -> list[dict]:
         "signull_1_7": 7,
         "signull_1_8": 8,
         "signull_1_9": 9,
-        "smart_sizer": 10,
-        "model_prob_threshold": 11,
-        "prob_70": 12,
-        "tcn_sizer": 13,
+        "signull_1_10": 10,
+        "smart_sizer": 11,
+        "model_prob_threshold": 12,
+        "prob_70": 13,
+        "tcn_sizer": 14,
     }
     for sid, cls in sorted(
         _discover().items(),
