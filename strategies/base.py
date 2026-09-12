@@ -25,6 +25,7 @@ class TickContext:
     seconds_into_candle: float
     seconds_to_close: float
     btc_price: float | None = 0.0
+    btc_price_to_beat: float | None = None
 
 
 

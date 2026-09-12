@@ -1,4 +1,4 @@
-"""Tests for Signull 1.5 strategy (BTC ±$30 Target)."""
+"""Tests for Signull 1.5 strategy (BTC ±$10 Target)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from strategies.signull_1_5 import Signull15Strategy
 
 
 class Signull15StrategyTests(unittest.TestCase):
+    def test_default_params_use_10_dollar_target_and_10_percent_risk(self):
+        self.assertEqual(Signull15Strategy.meta.default_params["target_delta"], 10.0)
+        self.assertEqual(Signull15Strategy.meta.default_params["risk_pct"], 0.10)
+
     def test_evaluate_triggers_up_when_btc_rises_30_dollars(self):
         strategy = Signull15Strategy({"target_delta": 30.0})
         candle = CandleContext(slug="c1", title="c1", start_ts=1000, end_ts=1300, winner="up")
@@ -35,6 +39,26 @@ class Signull15StrategyTests(unittest.TestCase):
         self.assertEqual(signal.side, "up")
         self.assertAlmostEqual(signal.price, 0.68)
         self.assertIn("BTC reached +35.00$", signal.reason)
+
+    def test_evaluate_uses_locked_price_to_beat_as_live_baseline(self):
+        strategy = Signull15Strategy({"target_delta": 10.0})
+        candle = CandleContext(slug="c1", title="c1", start_ts=1000, end_ts=1300, winner="up")
+
+        tick = TickContext(
+            t=1030,
+            up=0.62,
+            down=0.38,
+            seconds_into_candle=30,
+            seconds_to_close=270,
+            btc_price=90012.0,
+            btc_price_to_beat=90000.0,
+        )
+        signal = strategy.evaluate(tick, candle, entered=False)
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.side, "up")
+        self.assertIn("BTC reached +12.00$", signal.reason)
 
     def test_evaluate_triggers_down_when_btc_drops_30_dollars(self):
         strategy = Signull15Strategy({"target_delta": 30.0})

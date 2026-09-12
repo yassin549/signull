@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -18,9 +20,11 @@ from .bot import TradingBot
 from .config import BotConfig
 from .btc_feed import BtcPriceFeed
 from .feed import MarketFeed
+from .health import HealthMonitor
 from .backtest.registry import get_strategy
 from .session_store import clear_session, load_session
 from .state import BotState
+from .wallet_monitor import WalletMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +36,26 @@ class StrategyUpdateRequest(BaseModel):
     params: dict | None = None
 
 
+class CancelOrderRequest(BaseModel):
+    order_id: str
+
+
 class BroadcastHub:
-    """Push state to all dashboard clients as fast as the feed updates."""
+    """Push state to all dashboard clients as fast as the feed updates.
+
+    Full-snapshot pushes are expensive (serialising history for every client).
+    This hub sends delta-only pushes at high frequency and full snapshots at
+    a much lower cadence, dramatically reducing payload size.
+    """
 
     def __init__(self, state: BotState, push_interval_ms: int = 50):
         self.state = state
         self.push_interval = push_interval_ms / 1000
         self.clients: set[WebSocket] = set()
         self._last_version = -1
+        self._last_full_broadcast = 0.0
+        self._full_broadcast_interval = 2.0  # full snapshot every 2s is enough
+        self._prev_snapshot: dict = {}
 
     def add(self, ws: WebSocket) -> None:
         self.clients.add(ws)
@@ -47,16 +63,130 @@ class BroadcastHub:
     def remove(self, ws: WebSocket) -> None:
         self.clients.discard(ws)
 
+    def _build_delta(self, full: dict) -> dict:
+        """Return only the fields that changed since the last push."""
+        now = time.time()
+        delta: dict[str, any] = {"t": now}
+
+        # Always include version so the client can detect changes
+        delta["version"] = full.get("version")
+
+        # Small / fast-changing fields — include on every push
+        for key in ("prices", "signal", "mode", "asset", "running", "last_tick_at", "trades_placed"):
+            prev = self._prev_snapshot.get(key)
+            cur = full.get(key)
+            if cur != prev:
+                delta[key] = cur
+
+        # BTC panel — always include (compact and fast-changing)
+        delta["btc"] = full.get("btc")
+
+        # Feed status — always include
+        delta["feed"] = full.get("feed")
+
+        # Health — include every push (small payload)
+        delta["health"] = full.get("health")
+
+        # Strategy state — include when changed
+        strat = full.get("strategy")
+        prev_strat = self._prev_snapshot.get("strategy")
+        if strat != prev_strat:
+            delta["strategy"] = strat
+
+        # Account — include when changed
+        acc = full.get("account")
+        prev_acc = self._prev_snapshot.get("account")
+        if acc != prev_acc:
+            delta["account"] = acc
+
+        # Market — only send when slug changes
+        mkt = full.get("market")
+        prev_mkt = self._prev_snapshot.get("market")
+        if (mkt or {}).get("slug") != (prev_mkt or {}).get("slug"):
+            delta["market"] = mkt
+        elif mkt != prev_mkt:
+            delta["market"] = mkt
+
+        # Order books — include when changed
+        ob = full.get("orderbooks")
+        prev_ob = self._prev_snapshot.get("orderbooks")
+        if ob != prev_ob:
+            delta["orderbooks"] = ob
+
+        # Open orders — include when changed
+        oo = full.get("open_orders")
+        prev_oo = self._prev_snapshot.get("open_orders")
+        if oo != prev_oo:
+            delta["open_orders"] = oo
+
+        # History tails — only send every 2s
+        if now - self._last_full_broadcast >= self._full_broadcast_interval:
+            # Send only the latest 50 points of each history for merge recovery
+            for hkey in ("btc_history", "sim_history"):
+                hval = full.get(hkey, [])
+                if hval:
+                    delta[hkey] = hval[-50:]
+            # Full equity history is small enough to always include
+            eq = full.get("equity_history")
+            if eq:
+                delta["equity_history"] = eq
+            # Price history — only latest 50 points
+            ph = full.get("price_history", [])
+            if ph:
+                delta["price_history"] = ph[-50:]
+
+        # Strategy trades — include when changed
+        st = full.get("strategy_trades")
+        prev_st = self._prev_snapshot.get("strategy_trades")
+        if st != prev_st:
+            delta["strategy_trades"] = st
+
+        # Error state
+        err = full.get("last_error")
+        prev_err = self._prev_snapshot.get("last_error")
+        if err != prev_err:
+            delta["last_error"] = err
+
+        # Candle sequence / active window
+        for key in ("btc_candle_start_ts", "candle_seq"):
+            cur = full.get(key)
+            prev = self._prev_snapshot.get(key)
+            if cur != prev:
+                delta[key] = cur
+
+        # Activity log (only latest entry if changed)
+        act = full.get("activity", [])
+        prev_act = self._prev_snapshot.get("activity", [])
+        if act and (not prev_act or act[0].get("timestamp") != prev_act[0].get("timestamp")):
+            delta["activity"] = act[:5]
+
+        return delta
+
     async def run(self) -> None:
         while True:
             version = self.state.version
             if version != self._last_version and self.clients:
                 self._last_version = version
-                # The browser retains history between messages; a short tail is
-                # enough for recovery and avoids serializing thousands of chart
-                # points for every market update/client.
-                # ~45s tail at 20 Hz for merge recovery without huge payloads.
-                payload = self.state.get_snapshot(history_points=900)
+                now = time.time()
+                send_full = (now - self._last_full_broadcast >= self._full_broadcast_interval)
+
+                # Only serialise histories on the periodic full snapshot. Delta
+                # pushes don't need them, and slicing 900 points per push is the
+                # main CPU cost on small boxes.
+                full = self.state.get_snapshot(history_points=900 if send_full else 0)
+
+                if send_full:
+                    payload = full
+                    self._last_full_broadcast = now
+                else:
+                    payload = self._build_delta(full)
+
+                self._prev_snapshot = full
+
+                if not payload or (len(payload) <= 2 and "t" in payload):
+                    await asyncio.sleep(self.push_interval)
+                    continue
+
                 dead: list[WebSocket] = []
                 for ws in list(self.clients):
                     try:
@@ -104,12 +234,16 @@ class BotService:
         self.hub = BroadcastHub(self.state, config.dashboard_push_ms)
         self.feed = MarketFeed(config, self.state)
         self.btc_feed = BtcPriceFeed(self.state, asset=config.asset)
+        self.wallet = WalletMonitor(config, self.state)
+        self.health = HealthMonitor(config, self.state)
         self._bot: TradingBot | None = None
         self._thread: threading.Thread | None = None
         self._feed_task: asyncio.Task | None = None
         self._btc_feed_task: asyncio.Task | None = None
         self._hub_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
+        self._wallet_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
@@ -188,11 +322,22 @@ class BotService:
         while not self.state.should_shutdown():
             await self.ensure_feed()
             await self.ensure_btc_feed()
+            self.health.set_bot_alive(self.is_running)
             await asyncio.sleep(5)
 
     async def start_hub(self) -> None:
         if self._hub_task is None or self._hub_task.done():
             self._hub_task = asyncio.create_task(self.hub.run())
+
+    async def ensure_wallet_monitor(self) -> None:
+        if self._wallet_task is None or self._wallet_task.done():
+            logger.info("Starting wallet monitor")
+            self._wallet_task = asyncio.create_task(self.wallet.run())
+
+    async def ensure_health_monitor(self) -> None:
+        if self._health_task is None or self._health_task.done():
+            self.health.set_bot_alive(self.is_running)
+            self._health_task = asyncio.create_task(self.health.run())
 
     async def shutdown_background_tasks(self) -> None:
         """Cancel and join service tasks so Uvicorn can exit cleanly."""
@@ -203,6 +348,8 @@ class BotService:
                 self._feed_task,
                 self._btc_feed_task,
                 self._hub_task,
+                self._wallet_task,
+                self._health_task,
             )
             if task is not None and not task.done()
         ]
@@ -229,7 +376,7 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.get("/api/status")
     async def status():
-        snap = service.state.get_snapshot(history_points=6000)
+        snap = service.state.get_snapshot(history_points=900)
         snap["bot_thread_alive"] = service.is_running
         return snap
 
@@ -248,14 +395,13 @@ def create_app(config: BotConfig) -> FastAPI:
             "dashboard_push_ms": config.dashboard_push_ms,
             "bot_poll_interval_sec": config.bot_poll_interval_sec,
             "has_wallet": config.has_wallet,
-            "signature_type": config.signature_type,
-            "signature_label": config.signature_label,
             "strategy": config.strategy_id,
             "strategy_name": (
                 strat.meta.name if strat is not None else config.strategy_id
             ),
             "paper_initial_capital": config.paper_initial_capital,
             "strategy_params": strat.params if strat is not None else config.strategy_params(),
+            "gas_warn_bnb": config.gas_warn_bnb,
         }
 
     @app.post("/api/strategy/update")
@@ -267,9 +413,48 @@ def create_app(config: BotConfig) -> FastAPI:
         except Exception as err:
             raise HTTPException(status_code=422, detail=str(err))
 
+    @app.get("/api/health")
+    async def health():
+        service.health.set_bot_alive(service.is_running)
+        return service.health.snapshot()
+
     @app.get("/api/wallet/verify")
     async def wallet_verify():
-        return verify_wallet(config).to_dict()
+        check = await asyncio.to_thread(verify_wallet, config)
+        service.state.merge_account({
+            "connected": check.api_connected,
+            "verified": check.ok,
+            "signer_address": check.signer_address,
+            "funder_address": check.funder_address,
+            "signature_type": check.signature_type,
+            "signature_label": check.signature_label,
+            "balance_usdt": check.balance_usdt,
+            "balance_usdc": check.balance_usdt,
+            "gas_bnb": check.gas_bnb,
+            "gas_pol": check.gas_bnb,
+            "issues": check.issues,
+            "tips": check.tips,
+            "updated_at": time.time(),
+            "mode": config.trading_mode,
+        })
+        return check.to_dict()
+
+    @app.post("/api/orders/cancel")
+    async def cancel_order(req: CancelOrderRequest):
+        if not config.is_live:
+            raise HTTPException(status_code=400, detail="Cancel is only available in live mode")
+        client = None
+        if service._bot is not None:
+            client = service._bot.client
+        elif service.wallet.client is not None:
+            client = service.wallet.client
+        if client is None or not client.is_authenticated:
+            raise HTTPException(status_code=503, detail="Wallet is not authenticated")
+        try:
+            result = await asyncio.to_thread(client.cancel_order, req.order_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"ok": True, "result": result}
 
     @app.post("/api/bot/start")
     async def bot_start():
@@ -283,6 +468,11 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.post("/api/account/reset")
     async def account_reset():
+        if config.is_live:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot reset a live wallet. Paper reset is disabled in TRADING_MODE=live.",
+            )
         service.reset_account(100.0)
         return {"ok": True, "balance": 100.0, "message": "Account reset to $100"}
 
@@ -292,9 +482,22 @@ def create_app(config: BotConfig) -> FastAPI:
         service.hub.add(ws)
         try:
             # Send immediate full snapshot on connect
-            await ws.send_json(service.state.get_snapshot(history_points=6000))
+            await ws.send_json(service.state.get_snapshot(history_points=900))
             while True:
-                await asyncio.sleep(60)
+                try:
+                    raw = await asyncio.wait_for(ws.receive_text(), timeout=60)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == "ping":
+                    await ws.send_json({
+                        "type": "pong",
+                        "t": msg.get("t"),
+                        "server_t": time.time(),
+                    })
         except (WebSocketDisconnect, asyncio.CancelledError):
             # Normal disconnect or application shutdown. CancelledError is a
             # BaseException in modern Python, so it is not covered below.
@@ -313,6 +516,8 @@ def create_app(config: BotConfig) -> FastAPI:
         service.start_bot()
         await service.ensure_feed()
         await service.ensure_btc_feed()
+        await service.ensure_wallet_monitor()
+        await service.ensure_health_monitor()
         await service.start_hub()
         service._watchdog_task = asyncio.create_task(service.feed_watchdog())
 

@@ -22,8 +22,8 @@ let obRenderPending = false;
 
 const CANDLE_SEC = 300;
 const RING_LEN = 97.4;
-const POLL_MS = 1000;
-const POLL_FAST_MS = 250;
+const POLL_MS = 2000;
+const POLL_FAST_MS = 1000;
 const smooth = { up: null, down: null, btcDelta: null };
 let needsRedraw = true;
 let lastServerTs = null;
@@ -33,14 +33,25 @@ let activeCandleStartTs = null;
 let lastBtcSnapshot = null;
 let feedReconnecting = false;
 let localWindowStart = null;
+let lastPingAt = 0;
+let lastRttMs = null;
+let pingTimer = null;
+let netOnline = typeof navigator === "undefined" ? true : navigator.onLine;
 /** When false, WS/state keep updating but canvas paint is skipped. */
 let viewActive = true;
 let liveInited = false;
+let candleTransitionTs = 0;
+let candleTransitionTimer = null;
 
 let cachedConfig = null;
 let latestSnapshotStrategy = null;
+let latestSnapshot = null;
 let lwEquityChart = null;
 let lwEquitySeries = null;
+/** Cache to avoid re-rendering unchanged innerHTML content (fixes blinking) */
+let _renderedOpenOrders = "";
+let _renderedPositions = "";
+let _renderedActiveBook = "";
 
 function safe(fn) {
   return (...args) => {
@@ -58,17 +69,27 @@ function init() {
     needsRedraw = true;
   });
   initTabs("info-tabs", (tab) => {
-    document.getElementById("info-wallet").classList.toggle("hidden", tab !== "wallet");
-    document.getElementById("info-log").classList.toggle("hidden", tab !== "log");
+    const walletEl = document.getElementById("info-wallet");
+    const logEl = document.getElementById("info-log");
+    if (!walletEl || !logEl) return;
+    if (tab === "wallet") {
+      walletEl.classList.remove("hidden");
+      logEl.classList.add("hidden");
+    } else {
+      walletEl.classList.add("hidden");
+      logEl.classList.remove("hidden");
+    }
   });
   const startBtn = document.getElementById("btn-start");
   const stopBtn = document.getElementById("btn-stop");
-  const resetBtn = document.getElementById("btn-reset");
-  const resetInfoBtn = document.getElementById("btn-reset-info");
   if (startBtn) startBtn.addEventListener("click", startBot);
   if (stopBtn) stopBtn.addEventListener("click", stopBot);
-  if (resetBtn) resetBtn.addEventListener("click", resetAccount);
-  if (resetInfoBtn) resetInfoBtn.addEventListener("click", resetAccount);
+  const verifyBtn = document.getElementById("btn-verify-wallet");
+  if (verifyBtn) verifyBtn.addEventListener("click", verifyWallet);
+  initStrategyCollapse();
+  initHealthPopover();
+  initNetWatch();
+  initCopyButtons();
 
   initLiveStrategyControl();
 
@@ -79,12 +100,14 @@ function init() {
       const el = document.getElementById("asset-badge");
       if (el) el.textContent = (c.asset || "btc").toUpperCase();
       updateStrategyParams(latestSnapshotStrategy || {});
+      updateSimCardHeader();
     })
     .catch(() => {});
   pollStatus();
   connect();
   setInterval(tickCountdown, 250);
   setInterval(tickSyncAge, 1000);
+  setInterval(refreshTradeDetail, 1000);
   requestAnimationFrame(renderLoop);
 }
 
@@ -119,11 +142,16 @@ function connect() {
     clearInterval(pollTimer);
     pollTimer = null;
     setSyncStatus(true);
+    startPing();
     pollStatus();
   };
   ws.onmessage = (e) => {
     try {
       const d = JSON.parse(e.data);
+      if (d && d.type === "pong") {
+        handlePong(d);
+        return;
+      }
       applySnapshot(d, false);
     } catch (err) {
       console.error("ws parse", err);
@@ -132,10 +160,13 @@ function connect() {
   ws.onerror = () => {
     isLive = false;
     setSyncStatus(false);
+    updateNetBanner();
   };
   ws.onclose = () => {
     isLive = false;
     setSyncStatus(false);
+    stopPing();
+    updateNetBanner();
     if (!pollTimer) pollTimer = setInterval(pollStatus, POLL_MS);
     reconnectTimer = setTimeout(connect, 1500);
   };
@@ -153,62 +184,97 @@ async function pollStatus() {
 function applySnapshot(d, isFull) {
   if (!d) return;
 
+  // Delta merges may be partial — keep existing state for missing fields
+  const prevVersion = lastVersion;
+
   lastVersion = d.version ?? lastVersion;
   lastUpdateAt = Date.now();
   setSyncStatus(true);
 
-  const equityIncoming = d.equity_history || [];
-  if (isFull) {
-    equityHistory = [];
-    mergeEquityHistory(equityIncoming);
-  }
-  else if (equityIncoming.length) mergeEquityHistory(equityIncoming);
-
-  onUpdate(d);
-
-  const incoming = d.price_history || [];
-  if (isFull) {
-    history = incoming.slice();
-  } else if (incoming.length) {
-    mergeHistory(incoming);
+  // Detect version reset (server restart) — force reload
+  if (isFull && prevVersion >= 0 && d.version != null && d.version < prevVersion - 100) {
+    location.reload();
+    return;
   }
 
-  syncCandleWindow(d);
-
-  const btcIncoming = d.btc_history || [];
-  if (isFull) {
-    btcHistory = filterBtcHistoryForCandle(
-      (btcIncoming || []).map(normalizeBtcPoint)
-    );
-  } else if (btcIncoming.length) {
-    mergeBtcHistory(btcIncoming);
+  // Always update fast-changing fields
+  if (d.btc != null) {
+    lastBtcSnapshot = d.btc;
+    const prevBeat = priceToBeat;
+    if (d.btc.price_to_beat != null) {
+      const nextBeat = Number(d.btc.price_to_beat);
+      if (priceToBeat == null || Math.abs(nextBeat - priceToBeat) > 1e-9) {
+        priceToBeat = nextBeat;
+        if (prevBeat !== priceToBeat) recomputeBtcDeltas();
+      }
+    }
+    seedBtcLivePoint(d.btc);
   }
 
-  const simIncoming = d.sim_history || [];
-  if (isFull) {
-    simHistory = filterBtcHistoryForCandle(
-      (simIncoming || []).map(normalizeSimPoint)
-    );
-  } else if (simIncoming.length) {
-    mergeSimHistory(simIncoming);
+  if (d.feed != null) feedReconnecting = !!d.feed.reconnecting;
+
+  if (d.prices != null) {
+    if (d.prices.up != null) smooth.up = lerp(smooth.up, d.prices.up, 0.35);
+    if (d.prices.down != null) smooth.down = lerp(smooth.down, d.prices.down, 0.35);
   }
 
-  // Live tail after history merge so it never blocks server points.
-  if (d.btc) seedBtcLivePoint(d.btc);
+  // Candle detection
+  const incomingStart = d.btc_candle_start_ts != null && Number.isFinite(Number(d.btc_candle_start_ts))
+    ? Number(d.btc_candle_start_ts) : null;
+  if (incomingStart != null && incomingStart !== activeCandleStartTs) {
+    const isRollover = activeCandleStartTs != null;
+    activeCandleStartTs = incomingStart;
+    if (d.market?.slug) activeCandleSlug = d.market.slug;
+    if (isRollover) rollToCandle(incomingStart, d.market?.provisional ? "soft" : "full");
+    isFull = true; // treat candle roll as full reset
+  }
 
-  // Shared wall-clock "now" for charts (odds + BTC + SIM must share the axis).
-  const oddsT = history.length ? history[history.length - 1].t : null;
-  const btcT = btcHistory.length ? btcHistory[btcHistory.length - 1].t : null;
-  const simT = simHistory.length ? simHistory[simHistory.length - 1].t : null;
+  // Market metadata
+  if (d.market) {
+    if (!activeCandleSlug && d.market.slug) activeCandleSlug = d.market.slug;
+    countdownBase = { market: d.market };
+  }
+
+  // Merge history tails
+  if (d.equity_history != null) {
+    if (isFull || !equityHistory.length) equityHistory = [];
+    mergeEquityHistory(d.equity_history);
+  }
+
+  if (d.price_history != null) {
+    if (isFull || !history.length) history = [];
+    mergeHistory(d.price_history);
+  }
+
+  if (d.btc_history != null) {
+    if (isFull || !btcHistory.length) {
+      btcHistory = filterBtcHistoryForCandle(d.btc_history.map(normalizeBtcPoint));
+    } else {
+      mergeBtcHistory(d.btc_history);
+    }
+  }
+
+  if (d.sim_history != null) {
+    if (isFull || !simHistory.length) {
+      simHistory = filterBtcHistoryForCandle(d.sim_history.map(normalizeSimPoint));
+    } else {
+      mergeSimHistory(d.sim_history);
+    }
+  }
+
+  // Shared wall-clock "now"
+  const oddsT = history.length ? history[history.length - 1].t : 0;
+  const btcT = btcHistory.length ? btcHistory[btcHistory.length - 1].t : 0;
+  const simT = simHistory.length ? simHistory[simHistory.length - 1].t : 0;
   lastServerTs = Math.max(
-    oddsT || 0,
-    btcT || 0,
-    simT || 0,
+    oddsT, btcT, simT,
     d.feed?.last_update_at || 0,
     d.btc?.updated_at || 0,
     Date.now() / 1000 - 1
   );
   needsRedraw = true;
+
+  onUpdate(d);
 }
 
 function mergeEquityHistory(incoming) {
@@ -235,7 +301,7 @@ function mergeHistory(incoming) {
   const lastT = history[history.length - 1].t;
   for (const p of incoming) {
     if (p.t > lastT) history.push(p);
-    else if (p.t === lastT) history[history.length - 1] = p;
+    // Never mutate existing points
   }
   if (history.length > 6000) history = history.slice(-6000);
 }
@@ -267,25 +333,20 @@ function filterBtcHistoryForCandle(points) {
 }
 
 function mergeBtcHistory(incoming) {
-  incoming = filterBtcHistoryForCandle(incoming.map(normalizeBtcPoint));
+  incoming = incoming.map(normalizeBtcPoint);
   if (!incoming.length) return;
   btcHistory = filterBtcHistoryForCandle(btcHistory);
   if (!btcHistory.length) {
     btcHistory = incoming.slice();
     return;
   }
-  // Index by rounded time so slower server samples can update/extend even if
-  // the client live-tail timestamp is slightly ahead.
-  const byT = new Map();
-  for (const p of btcHistory) byT.set(Math.round(p.t * 20) / 20, p);
+  const lastT = btcHistory[btcHistory.length - 1].t;
   for (const pt of incoming) {
-    const key = Math.round(pt.t * 20) / 20;
-    const prev = byT.get(key);
-    if (!prev || (pt.v != null && (prev.v == null || pt.t >= prev.t))) {
-      byT.set(key, pt);
+    if (pt.t > lastT && pt.v != null) {
+      btcHistory.push(pt);
     }
   }
-  btcHistory = filterBtcHistoryForCandle([...byT.values()].sort((a, b) => a.t - b.t));
+  btcHistory = filterBtcHistoryForCandle(btcHistory);
   if (btcHistory.length > 6000) btcHistory = btcHistory.slice(-6000);
 }
 
@@ -293,6 +354,7 @@ function normalizeBtcPoint(p) {
   if (!p) return { t: 0 };
   const out = { t: Number(p.t) };
   if (p.v != null && !isNaN(Number(p.v))) out.v = Number(p.v);
+  if (p.cs != null && Number.isFinite(Number(p.cs))) out.cs = Number(p.cs);
   // Prefer absolute price vs locked beat when both known — never trust a stale d.
   if (out.v != null && priceToBeat != null) {
     out.d = out.v - priceToBeat;
@@ -311,23 +373,20 @@ function normalizeSimPoint(p) {
 }
 
 function mergeSimHistory(incoming) {
-  incoming = filterBtcHistoryForCandle(incoming.map(normalizeSimPoint));
+  incoming = incoming.map(normalizeSimPoint);
   if (!incoming.length) return;
   simHistory = filterBtcHistoryForCandle(simHistory);
   if (!simHistory.length) {
     simHistory = incoming.slice();
     return;
   }
-  const byT = new Map();
-  for (const p of simHistory) byT.set(Math.round(p.t * 20) / 20, p);
+  const lastT = simHistory[simHistory.length - 1].t;
   for (const pt of incoming) {
-    const key = Math.round(pt.t * 20) / 20;
-    const prev = byT.get(key);
-    if (!prev || (pt.v != null && (prev.v == null || pt.t >= prev.t))) {
-      byT.set(key, pt);
+    if (pt.t > lastT && pt.v != null) {
+      simHistory.push(pt);
     }
   }
-  simHistory = filterBtcHistoryForCandle([...byT.values()].sort((a, b) => a.t - b.t));
+  simHistory = filterBtcHistoryForCandle(simHistory);
   if (simHistory.length > 6000) simHistory = simHistory.slice(-6000);
 }
 
@@ -365,9 +424,13 @@ function currentBtcSpot(btc, now = Date.now() / 1000) {
 /**
  * Push a live sample from the latest BTC panel tick.
  * Always uses wall clock so a frozen server updated_at cannot pin the series.
+ * Only seeds when the snapshot is fresh (Binance < 2s or Chainlink) to avoid
+ * injecting fake flat-line points during disconnection.
  */
 function seedBtcLivePoint(btc) {
-  const { value: v } = currentBtcSpot(btc);
+  const spot = currentBtcSpot(btc);
+  if (spot.source === "stale-binance" || spot.source == null) return false;
+  const v = spot.value;
   if (v == null) return false;
 
   const now = Date.now() / 1000;
@@ -383,9 +446,8 @@ function seedBtcLivePoint(btc) {
     return true;
   }
   const last = btcHistory[btcHistory.length - 1];
-  if (now - last.t < 0.045) {
-    btcHistory[btcHistory.length - 1] = { ...last, ...point };
-  } else {
+  // Only append if at least 50ms has passed — never overwrite
+  if (now - last.t >= 0.05) {
     btcHistory.push(point);
     if (btcHistory.length > 6000) btcHistory = btcHistory.slice(-6000);
   }
@@ -398,46 +460,98 @@ function liveBtcSpotPrice() {
 }
 
 const onUpdate = safe(function onUpdate(d) {
+  latestSnapshot = d;
   detectCandleChange(d.market);
   updateTopbar(d);
   updateHero(d);
   updateStrategy(d);
-  updateWallet(d);
-  updateOrderbooks(d.orderbooks || {});
-  updateTape(d.trades || []);
+  if (d.account) updateWallet(d);
+  if (d.orderbooks) updateOrderbooks(d.orderbooks);
   updateStrategyTrades(d.strategy_trades || []);
-  updateLog(d.activity || []);
+  updateTape();
+  if (d.activity) updateLog(d.activity);
   updateBtcPanel(d.btc);
   updateBotButtons(d.running);
 });
 
-function detectCandleChange(market) {
-  const slug = market?.slug;
-  if (!slug || slug === activeCandleSlug) return;
-  const isRollover = activeCandleSlug !== null;
-  activeCandleSlug = slug;
-  countdownBase = { market };
-  if (market?.candle_start_ts != null) {
-    activeCandleStartTs = Number(market.candle_start_ts);
-  } else if (slug.startsWith("local-")) {
-    activeCandleStartTs = Number(slug.slice("local-".length)) || clockWindowStart();
+function candleStartFromMarket(market) {
+  if (!market) return null;
+  if (market.candle_start_ts != null && Number.isFinite(Number(market.candle_start_ts))) {
+    return Number(market.candle_start_ts);
   }
+  const slug = String(market.slug || "");
+  const m = slug.match(/(\d{9,})$/);
+  return m ? Number(m[1]) : null;
+}
+
+function detectCandleChange(market) {
+  if (!market) return;
+  const nextStart = candleStartFromMarket(market);
+  if (nextStart == null) {
+    if (market.slug) activeCandleSlug = market.slug;
+    countdownBase = { market };
+    return;
+  }
+  if (activeCandleStartTs === nextStart) {
+    activeCandleSlug = market.slug || activeCandleSlug;
+    countdownBase = { market };
+    return;
+  }
+  const isRollover = activeCandleStartTs != null;
+  activeCandleSlug = market.slug || null;
+  activeCandleStartTs = nextStart;
+  countdownBase = { market };
   if (isRollover) {
-    resetCandleUI(market?.provisional ? "soft" : "full");
-    pollStatus();
+    rollToCandle(nextStart, market.provisional ? "soft" : "full");
   }
 }
 
-function resetCandleUI(mode = "full") {
-  // Soft: keep last odds prices briefly while provisional window loads.
-  // Drop prior-candle BTC samples instead of rebasing them onto a new beat,
-  // which pinned Δ near 0 and made the chart look frozen.
+function rollToCandle(startTs, mode = "full") {
+  clearTimeout(candleTransitionTimer);
+  if (candleTransitionTimer && candleTransitionTimer._cleanup) clearTimeout(candleTransitionTimer._cleanup);
+  candleTransitionTs = Date.now();
+
+  // Show settlement outcome from latest trade if we just had one
+  const latestTrade = liveStrategyTrades.length ? liveStrategyTrades[liveStrategyTrades.length - 1] : null;
+  const recentTrade = latestTrade && (Date.now() / 1000 - Number(latestTrade.t) < 10);
+  const outcomeWon = recentTrade ? !!latestTrade.won : null;
+  const outcomeSide = recentTrade ? latestTrade.side : null;
+
+  resetCandleUI(mode, outcomeWon, outcomeSide);
+
+  // After showing the outcome, transition to "loading new candle" phase
+  const loadingTm = setTimeout(() => {
+    if (Date.now() - candleTransitionTs < 4000) {
+      resetCandleUI(mode, null, null, true);
+    }
+  }, 1800);
+
+  // Clear transition state after 3.2s so new candle data can take over
+  const cleanupTm = setTimeout(() => {
+    candleTransitionTs = 0;
+  }, 3200);
+
+  // Store both timers so repeat calls clear them all
+  candleTransitionTimer = loadingTm;
+  candleTransitionTimer._cleanup = cleanupTm;
+}
+
+function resetCandleUI(mode = "full", outcomeWon = null, outcomeSide = null, showLoading = false) {
   history = [];
   btcHistory = filterBtcHistoryForCandle(btcHistory);
   priceToBeat = null;
   smooth.btcDelta = null;
   lastServerTs = null;
   lastTradeId = null;
+  clearCachedYRanges();
+  _renderedOpenOrders = "";
+  _renderedPositions = "";
+  _renderedActiveBook = "";
+  _lastStratTradesHTML = "";
+  _lastLogHTML = "";
+  _tapeKeys = [];
+  _tapeLimit = TAPE_BATCH;
+  _lastStratParamsHTML = "";
   needsRedraw = true;
   if (mode === "full") {
     smooth.up = smooth.down = null;
@@ -453,9 +567,20 @@ function resetCandleUI(mode = "full") {
   setText("btc-chart-meta", "—");
   const probEl = document.getElementById("prob-up");
   if (probEl && mode === "full") probEl.style.width = "50%";
-  setText("signal-side", "HOLD");
-  setClass("signal-side", "signal-badge hold");
-  setText("signal-reason", mode === "soft" ? "Rolling into new candle…" : "New candle — warming up");
+
+  if (showLoading) {
+    setText("signal-side", "LOADING");
+    setClass("signal-side", "signal-badge hold");
+    setText("signal-reason", "Loading new candle data…");
+  } else if (outcomeWon != null) {
+    setText("signal-side", outcomeWon ? "WIN" : "LOSS");
+    setClass("signal-side", "signal-badge " + (outcomeWon ? "up" : "down"));
+    setText("signal-reason", `Last candle closed — ${outcomeWon ? "Correct" : "Wrong"} ${(outcomeSide || "").toUpperCase()} call`);
+  } else {
+    setText("signal-side", "HOLD");
+    setClass("signal-side", "signal-badge hold");
+    setText("signal-reason", mode === "soft" ? "Rolling into new candle…" : "New candle — warming up");
+  }
 }
 
 /** UTC 5m window: seconds remaining in the current wall-clock candle. */
@@ -495,6 +620,7 @@ function marketIsStale(market) {
 
 function updateTopbar(d) {
   const feed = d.feed || {};
+  const health = d.health || {};
   feedReconnecting = !!feed.reconnecting;
   let feedCls = "status-item";
   if (feed.reconnecting) feedCls += " warn";
@@ -507,19 +633,47 @@ function updateTopbar(d) {
   else if (feed.reconnecting) feedLabel = "…";
   setText("feed-rate", feedLabel);
   const feedEl = document.getElementById("feed-status");
-  if (feedEl) feedEl.title = feed.error || (feed.reconnecting ? "Reconnecting…" : "Feed");
+  if (feedEl) {
+    const t = feed.error || (feed.reconnecting ? "Reconnecting…" : "CLOB feed");
+    if (feedEl.title !== t) feedEl.title = t;
+  }
 
-  const isLiveMode = d.mode === "live";
-  setClass("mode-status", "status-item" + (isLiveMode ? " live" : " warn"));
-  setText("mode-text", isLiveMode ? "Live" : "Paper");
+  setClass("mode-status", "status-item live");
+  setText("mode-text", "LIVE");
 
   setClass("bot-status", "status-item" + (d.running ? " live" : " off"));
   setText("bot-text", d.running ? "On" : "Off");
 
+  const netOk = netOnline && isLive;
+  setClass("net-status", "status-item" + (netOk ? " live" : " off"));
+  setText("net-text", lastRttMs != null ? `${Math.round(lastRttMs)}ms` : (netOk ? "on" : "off"));
+
+  const srv = health.loop_lag_ms != null && health.loop_lag_ms > 80 ? "warn"
+    : (health.updated_at ? "live" : "");
+  setClass("srv-status", "status-item" + (srv ? " " + srv : ""));
+  setText("srv-text", health.loop_lag_ms != null ? `${Math.round(health.loop_lag_ms)}ms` : "ok");
+
+  const spot = health.spot || {};
+  const spotAge = spot.age_sec;
+  const spotCls = spot.connected && (spotAge == null || spotAge < 3) ? "live"
+    : (spot.connected ? "warn" : "off");
+  setClass("spot-status", "status-item " + spotCls);
+  setText("spot-text", spot.connected ? "live" : "off");
+
+  const wal = health.wallet || d.account || {};
+  const walOk = !!(wal.connected || wal.ok);
+  setClass("wallet-status-dot", "status-item" + (walOk ? " live" : " off"));
+  setText("wallet-dot-text", walOk ? "ready" : "off");
+
   if (d.market?.title) setText("market-short", shortenMarket(d.market.title));
+  updateHealthPopover(d);
+  updateNetBanner();
 }
 
+let _lastSyncOk = null;
 function setSyncStatus(ok) {
+  if (_lastSyncOk === ok) return;
+  _lastSyncOk = ok;
   setClass("sync-status", "status-item" + (ok ? " live" : " off"));
   tickSyncAge();
 }
@@ -538,6 +692,7 @@ function shortenMarket(title) {
   return m ? m[1].replace(/\s+/g, " ") : title.slice(0, 36);
 }
 
+let _probWidth = "";
 function updateHero(d) {
   const prices = d.prices || {};
   const up = prices.up;
@@ -545,69 +700,99 @@ function updateHero(d) {
 
   if (up != null) {
     smooth.up = lerp(smooth.up, up, 0.35);
-    setText("price-up", fmt(up));
+    if (setText("price-up", fmt(up))) flashEl("price-up");
     setText("pct-up", pct(up));
-    flashEl("price-up");
   }
   if (down != null) {
     smooth.down = lerp(smooth.down, down, 0.35);
-    setText("price-down", fmt(down));
+    if (setText("price-down", fmt(down))) flashEl("price-down");
     setText("pct-down", pct(down));
-    flashEl("price-down");
   }
 
   if (up != null && down != null) {
     const total = up + down;
     const upPct = total > 0 ? (up / total) * 100 : 50;
-    const probEl = document.getElementById("prob-up");
-    if (probEl) probEl.style.width = upPct + "%";
+    const w = upPct.toFixed(1) + "%";
+    if (_probWidth !== w) { _probWidth = w; const probEl = document.getElementById("prob-up"); if (probEl) probEl.style.width = w; }
     const delta = up - down;
-    setText("prob-delta", (delta >= 0 ? "▲ " : "▼ ") + Math.abs(delta * 100).toFixed(1) + "¢");
+    const deltaStr = (delta >= 0 ? "▲ " : "▼ ") + Math.abs(delta * 100).toFixed(1) + "¢";
+    setText("prob-delta", deltaStr);
     needsRedraw = true;
   }
 
   if (d.market) {
-    const secs = Math.max(0, Math.round(marketSecsToClose(d.market) || 0));
     countdownBase = { market: d.market };
-    renderCountdown(secs);
-    updateTimerRing(secs, d.market);
   }
 
   if (d.signal) {
     const side = (d.signal.side || "hold").toLowerCase();
-    const badge = document.getElementById("signal-side");
-    if (badge) {
-      badge.textContent = side.toUpperCase();
-      badge.className = "signal-badge " + side;
-    }
+    setText("signal-side", side.toUpperCase());
+    setClass("signal-side", "signal-badge " + side);
     setText("signal-reason", d.signal.reason || "");
   }
 }
 
+function _setEl(id, txt, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (txt != null && el.textContent !== txt) el.textContent = txt;
+  if (cls != null && el.className !== cls) el.className = cls;
+}
+
 function updateStrategy(d) {
   const s = d.strategy || {};
-  setText("strat-name", s.name || "Signull 1.0");
-  if (s.equity != null) {
-    setText("strat-equity", `Equity $${Number(s.equity).toFixed(2)}`);
-  }
-  if (s.return_pct != null) {
-    const r = Number(s.return_pct);
-    const el = document.getElementById("strat-return");
-    if (el) {
-      el.textContent = `${r >= 0 ? "+" : ""}${r.toFixed(1)}%`;
-      el.className = "strat-ret " + (r >= 0 ? "up" : "down");
-    }
-  }
+  const prices = d.prices || {};
   const p = s.pending;
   if (p) {
-    setText(
-      "strat-pending",
-      `${(p.mode || "paper").toUpperCase()} ${String(p.side).toUpperCase()} @ ${Number(p.entry_price).toFixed(2)} · ${p.size_label} $${Number(p.stake).toFixed(2)}`
-    );
+    setText("strat-pending", `LIVE ${String(p.side).toUpperCase()} @ ${Number(p.entry_price).toFixed(2)} · ${p.size_label} $${Number(p.stake).toFixed(2)}`);
+    const stake = Number(p.stake) || 0;
+    const entryPrice = Number(p.entry_price) || 1;
+    const shares = entryPrice > 0 ? stake / entryPrice : 0;
+    const fee = Number(p.entry_fee) || 0;
+    const potentialGain = shares * 1.0 - stake - fee;
+    const side = String(p.side || "").toUpperCase();
+    const currentPrice = side === "UP" ? prices.up : (side === "DOWN" ? prices.down : null);
+    const currentValue = currentPrice != null && currentPrice > 0 ? shares * currentPrice : null;
+    const unrealizedPnl = currentValue != null ? currentValue - stake : null;
+    setText("td-side", side);
+    _setEl("td-side", side, "td-value td-side " + side.toLowerCase());
+    setText("td-entry-price", `@ ${entryPrice.toFixed(2)} (${(entryPrice * 100).toFixed(0)}¢)`);
+    setText("td-stake", `$${stake.toFixed(2)}`);
+    setText("td-risk-pct", p.risk_pct != null ? `${Number(p.risk_pct).toFixed(1)}%` : "—");
+    setText("td-entry-fee", fee > 0 ? `-$${fee.toFixed(4)}` : "—");
+    setText("td-potential-gain", `+$${potentialGain.toFixed(2)}`);
+    setText("td-current-value", currentValue != null ? `$${currentValue.toFixed(2)}` : "—");
+    if (unrealizedPnl != null) {
+      const uval = `${unrealizedPnl >= 0 ? "+" : ""}$${unrealizedPnl.toFixed(2)}`;
+      const ucls = "td-value td-pnl " + (unrealizedPnl >= 0 ? "up" : "down");
+      _setEl("td-unrealized-pnl", uval, ucls);
+    } else {
+      setText("td-unrealized-pnl", "—");
+    }
+    const requested = Number(p.requested_shares) || 0;
+    const filled = Number(p.filled_shares) || 0;
+    setText("td-fill", p.mode === "live" && requested > 0 ? `${(filled / requested * 100).toFixed(1)}% (${filled.toFixed(2)} / ${requested.toFixed(2)} shrs)` : "—");
+    const entryTs = Number(p.entry_ts) || 0;
+    setText("td-elapsed", entryTs > 0 ? (() => { const e = Math.max(0, Date.now() / 1000 - entryTs); return `${Math.floor(e / 60)}m ${Math.floor(e % 60)}s`; })() : "—");
+    if (s.wins_streak != null) _setEl("td-win-streak", String(s.wins_streak), "td-value td-win" + (s.wins_streak > 0 ? "" : " muted"));
+    if (s.losses_streak != null) _setEl("td-loss-streak", String(s.losses_streak), "td-value td-loss" + (s.losses_streak > 0 ? "" : " muted"));
+    setText("td-wins-recent", s.wins_recent != null ? `${s.wins_recent}/10` : "—");
+    const hbOk = s.heartbeat_last_ok;
+    setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
   } else {
     setText("strat-pending", s.entered_this_candle ? "Entered · waiting resolve" : "No position");
+    const hbOk = s.heartbeat_last_ok;
+    setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
   }
 }
+
+let _lastStratTradesHTML = "";
+let _lastLogHTML = "";
+let _lastStratParamsHTML = "";
+const TAPE_BATCH = 30;
+let _tapeEl = null;
+let _tapeKeys = [];
+let _tapeLimit = TAPE_BATCH;
 
 function updateStrategyTrades(trades) {
   if (Array.isArray(trades)) {
@@ -620,34 +805,35 @@ function updateStrategyTrades(trades) {
 
   const countEl = document.getElementById("equity-trades-count");
   if (countEl) {
-    countEl.textContent = `${liveStrategyTrades.length} trade${liveStrategyTrades.length === 1 ? "" : "s"}`;
+    const ct = `${liveStrategyTrades.length} trade${liveStrategyTrades.length === 1 ? "" : "s"}`;
+    if (countEl.textContent !== ct) countEl.textContent = ct;
   }
 
   const el = document.getElementById("strat-trades");
   if (!el) return;
+  let html;
   if (!liveStrategyTrades.length) {
-    el.innerHTML = '<div class="placeholder">No Signull trades yet</div>';
-    return;
+    html = '<div class="placeholder">No Signull trades yet</div>';
+  } else {
+    const sortedDesc = [...liveStrategyTrades].reverse();
+    html = sortedDesc.slice(0, 20).map(t => {
+      const cls = t.won ? "win" : "loss";
+      const pnl = tradePnl(t);
+      const fee = Number(t.entry_fee || 0);
+      const fillInfo = t.filled_shares != null && t.mode === "live" ? `fill=${t.filled_shares}shrs` : "";
+      const tip = [t.won ? "WIN" : "LOSS", `side=${t.side}`, `winner=${t.winner || "?"}`, t.resolve_source ? `via ${t.resolve_source}` : "", fillInfo, fee > 0 ? `fee=${fee.toFixed(4)}` : "", `stake=$${Number(t.stake).toFixed(2)}`, t.title || t.slug || ""].filter(Boolean).join(" · ");
+      return `<div class="strat-trade ${cls}" title="${esc(tip)}">
+        <span class="st-side">${String(t.side || "").toUpperCase()}</span>
+        <span class="st-px">@${Number(t.entry_price).toFixed(2)}</span>
+        <span class="st-sz">${t.size_label || ""} $${Number(t.stake).toFixed(2)}</span>
+        <span class="st-pnl">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>
+        <span class="st-eq">$${Number(t.equity_after).toFixed(2)}</span>
+        ${fee > 0 ? `<span class="st-fee">-$${fee.toFixed(4)}</span>` : ""}
+        ${t.filled_shares != null && t.mode === "live" ? `<span class="st-fill">${t.filled_shares}shrs</span>` : ""}
+      </div>`;
+    }).join("");
   }
-  const sortedDesc = [...liveStrategyTrades].reverse();
-  el.innerHTML = sortedDesc.slice(0, 20).map(t => {
-    const cls = t.won ? "win" : "loss";
-    const pnl = Number(t.pnl || 0);
-    const tip = [
-      t.won ? "WIN" : "LOSS",
-      `side=${t.side}`,
-      `winner=${t.winner || "?"}`,
-      t.resolve_source ? `via ${t.resolve_source}` : "",
-      t.title || t.slug || "",
-    ].filter(Boolean).join(" · ");
-    return `<div class="strat-trade ${cls}" title="${esc(tip)}">
-      <span class="st-side">${String(t.side || "").toUpperCase()}</span>
-      <span class="st-px">@${Number(t.entry_price).toFixed(2)}</span>
-      <span class="st-sz">${t.size_label || ""} $${Number(t.stake).toFixed(2)}</span>
-      <span class="st-pnl">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>
-      <span class="st-eq">$${Number(t.equity_after).toFixed(2)}</span>
-    </div>`;
-  }).join("");
+  if (_lastStratTradesHTML !== html) { el.innerHTML = html; _lastStratTradesHTML = html; }
   needsRedraw = true;
 }
 
@@ -659,15 +845,54 @@ function flashEl(id) {
   el.classList.add("flash");
 }
 
+function refreshTradeDetail() {
+  const d = latestSnapshot;
+  if (!d) return;
+  const s = d.strategy || {};
+  const p = s.pending;
+  if (!p) {
+    const hbOk = s.heartbeat_last_ok;
+    setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
+    return;
+  }
+  const stake = Number(p.stake) || 0;
+  const entryPrice = Number(p.entry_price) || 1;
+  const shares = entryPrice > 0 ? stake / entryPrice : 0;
+  const prices = d.prices || {};
+  const side = String(p.side || "").toUpperCase();
+  const currentPrice = side === "UP" ? prices.up : (side === "DOWN" ? prices.down : null);
+  const currentValue = currentPrice != null && currentPrice > 0 ? shares * currentPrice : null;
+  const unrealizedPnl = currentValue != null ? currentValue - stake : null;
+  setText("td-current-value", currentValue != null ? `$${currentValue.toFixed(2)}` : "—");
+  if (unrealizedPnl != null) {
+    const pnlEl = document.getElementById("td-unrealized-pnl");
+    if (pnlEl) {
+      const txt = `${unrealizedPnl >= 0 ? "+" : ""}$${unrealizedPnl.toFixed(2)}`;
+      const cls = "td-value td-pnl " + (unrealizedPnl >= 0 ? "up" : "down");
+      if (pnlEl.textContent !== txt) pnlEl.textContent = txt;
+      if (pnlEl.className !== cls) pnlEl.className = cls;
+    }
+  }
+  setText("td-elapsed", (() => {
+    const ts = Number(p.entry_ts) || 0;
+    if (!ts) return "—";
+    const elapsed = Math.max(0, Date.now() / 1000 - ts);
+    return `${Math.floor(elapsed / 60)}m ${Math.floor(elapsed % 60)}s`;
+  })());
+  const hbOk = s.heartbeat_last_ok;
+  setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
+}
+
 function tickCountdown() {
   // Local 5m boundary — refresh UI even if the server is still on the old slug.
   const win = clockWindowStart();
   if (localWindowStart != null && win !== localWindowStart) {
     if (marketIsStale(countdownBase?.market) || !countdownBase?.market) {
-      // Inject a provisional market so the timer jumps to ~5:00 immediately.
+      // Same slug shape as the server stub so hydrate is not a second reset.
+      const asset = (cachedConfig?.asset || "btc").toLowerCase();
       const endMs = (win + CANDLE_SEC) * 1000;
       const provisional = {
-        slug: `local-${win}`,
+        slug: `${asset}-updown-5m-${win}`,
         end_date: new Date(endMs).toISOString(),
         candle_start_ts: win,
         candle_duration_sec: CANDLE_SEC,
@@ -710,15 +935,13 @@ function renderCountdown(secs, stale) {
   const loading = !!stale && secs > 290;
 
   if (el) {
-    el.textContent = atBoundary
-      ? "0:00"
-      : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    const t = atBoundary ? "0:00" : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    if (el.textContent !== t) el.textContent = t;
     el.classList.toggle("rolling", atBoundary || loading);
   }
   if (label) {
-    if (atBoundary) label.textContent = "rolling over";
-    else if (loading) label.textContent = "loading market";
-    else label.textContent = "to close";
+    const t = atBoundary ? "rolling over" : (loading ? "loading market" : "to close");
+    if (label.textContent !== t) label.textContent = t;
   }
 }
 
@@ -737,44 +960,86 @@ function updateWallet(d) {
   const a = d.account || {};
   const s = d.strategy || {};
   const connected = !!a.connected;
-  const isPaper = (a.mode || d.mode || "paper") !== "live";
 
   const balLabel = document.getElementById("wallet-balance-label");
-  if (balLabel) balLabel.textContent = isPaper ? "Paper equity" : "USDC Balance";
-
-  const equity = a.paper_equity != null ? a.paper_equity : a.balance_usdc;
-  if (a.paper_initial != null && Number.isFinite(Number(a.paper_initial))) {
-    equityInitial = Number(a.paper_initial);
+  if (balLabel) {
+    if (balLabel.textContent !== "CLOB USDC") balLabel.textContent = "CLOB USDC";
   }
-  setText("wallet-balance", equity != null ? `$${Number(equity).toFixed(2)}` : "—");
-  setText("wallet-funder", fmtAddr(a.funder_address));
-  setText("wallet-signer", fmtAddr(a.signer_address));
+
+  const liveBal = a.balance_usdc;
+  setText("wallet-balance", liveBal != null && Number.isFinite(Number(liveBal)) ? `$${Number(liveBal).toFixed(2)}` : "—");
+  setText("wallet-onchain-usdc", a.onchain_usdc != null ? `$${Number(a.onchain_usdc).toFixed(2)}` : "—");
+  const isGasless = a.signature_type !== 0;
+  const gasText = a.gas_pol != null
+    ? `${Number(a.gas_pol).toFixed(4)} POL${a.gas_low ? " · low" : (isGasless ? " (gasless)" : "")}`
+    : "—";
+  setText("wallet-gas", gasText);
+  { const gasEl = document.getElementById("wallet-gas"); if (gasEl) gasEl.classList.toggle("warn", !!a.gas_low); }
+  setText("wallet-available", a.available_usdc != null ? `$${Number(a.available_usdc).toFixed(2)}` : "—");
+  setText("wallet-reserved", a.reserved_usdc != null ? `$${Number(a.reserved_usdc).toFixed(2)}` : "—");
+  const fmtAllowance = (val) => {
+    if (val == null) return "—";
+    const num = Number(val);
+    if (!Number.isFinite(num)) return "—";
+    if (num >= 1e9) return "Unlimited ($1.00B+)";
+    return `$${num.toFixed(2)}`;
+  };
+  setText("wallet-allowance", fmtAllowance(a.allowance_usdc));
+
+  setText("wallet-funder", a.funder_address || "—");
+  setText("wallet-signer", a.signer_address || "—");
+  setText("wallet-funder-short", fmtAddr(a.funder_address));
+  setText("wallet-signer-short", fmtAddr(a.signer_address));
+  setText("wallet-gas-addr", a.gas_address || "—");
   setText("wallet-type", a.signature_label || "—");
-  setText("wallet-mode", (a.mode || d.mode || "paper").toUpperCase());
-  setText("wallet-strategy", s.name || "Signull 1.0");
+  setText("wallet-strategy", s.name || cachedConfig?.strategy_name || getActiveSimLabel());
   const thr = s.params?.threshold;
   setText("wallet-threshold", thr != null ? `${(Number(thr) * 100).toFixed(0)}¢ limit` : "—");
-  updateEquityMeta(equity, a.paper_initial);
+
+  const ageEl = document.getElementById("wallet-updated");
+  if (ageEl) {
+    if (a.updated_at) {
+      const age = Math.max(0, Date.now() / 1000 - Number(a.updated_at));
+      const t = age < 1.5 ? "just now" : `${age.toFixed(1)}s ago`;
+      if (ageEl.textContent !== t) ageEl.textContent = t;
+    } else {
+      setText("wallet-updated", "—");
+    }
+  }
+
+  updateEquityMeta(liveBal);
+  setExplorerLinks(a);
+  renderOpenOrders(d.open_orders || a.open_orders || []);
+  renderPositions(d.positions || a.positions || []);
 
   const statusEl = document.getElementById("wallet-status");
   if (statusEl) {
-    if (isPaper) {
-      statusEl.textContent = "Paper · live markets";
-      statusEl.className = "wallet-pill ok";
+    let stxt, scls;
+    if (!a.has_wallet && !a.funder_address && !a.signer_address) { stxt = "No wallet configured"; scls = "wallet-pill off"; }
+    else if (connected) { stxt = "Live trading"; scls = "wallet-pill ok"; }
+    else if (a.has_wallet) { stxt = "CLOB offline"; scls = "wallet-pill off"; }
+    else { stxt = "Not verified"; scls = "wallet-pill off"; }
+    if (statusEl.textContent !== stxt) statusEl.textContent = stxt;
+    if (statusEl.className !== scls) statusEl.className = scls;
+  }
+
+  const issuesEl = document.getElementById("wallet-issues");
+  if (issuesEl) {
+    if (a.issues?.length) {
+      const h = a.issues.map(t => `<div class="wallet-issue">${esc(t)}</div>`).join("");
+      if (issuesEl.innerHTML !== h) { issuesEl.innerHTML = h; issuesEl.classList.remove("hidden"); }
     } else {
-      statusEl.textContent = connected ? "Connected" : "Not connected";
-      statusEl.className = "wallet-pill " + (connected ? "ok" : "off");
+      if (!issuesEl.classList.contains("hidden")) issuesEl.classList.add("hidden");
     }
   }
 
   const tipsEl = document.getElementById("wallet-tips");
   if (tipsEl) {
     if (a.tips?.length) {
-      tipsEl.classList.remove("hidden");
-      tipsEl.innerHTML = a.tips.map(t => `<div class="wallet-tip">${esc(t)}</div>`).join("");
+      const h = a.tips.map(t => `<div class="wallet-tip">${esc(t)}</div>`).join("");
+      if (tipsEl.innerHTML !== h) { tipsEl.innerHTML = h; tipsEl.classList.remove("hidden"); }
     } else {
-      tipsEl.classList.add("hidden");
-      tipsEl.innerHTML = "";
+      if (!tipsEl.classList.contains("hidden")) tipsEl.classList.add("hidden");
     }
   }
 
@@ -802,9 +1067,14 @@ function initLiveStrategyControl() {
     .then(r => r.json())
     .then(data => {
       liveStrategies = data.strategies || [];
-      if (!liveStrategies.length) return;
+      if (!liveStrategies.length) {
+        renderLiveParamsBox({});
+        const desc = document.getElementById("live-strategy-desc");
+        if (desc) desc.textContent = "No strategies found.";
+        return;
+      }
       sel.innerHTML = liveStrategies.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
-      const activeId = cachedConfig?.strategy || latestSnapshotStrategy?.id || liveStrategies[0].id;
+      const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy || liveStrategies[0].id;
       sel.value = activeId;
       onLiveStrategyChange();
     })
@@ -823,12 +1093,28 @@ function onLiveStrategyChange() {
     descEl.textContent = strat ? strat.description : "No description available.";
   }
 
-  const activeId = cachedConfig?.strategy || latestSnapshotStrategy?.id;
-  const currentParams = (selectedId === activeId)
-    ? (latestSnapshotStrategy?.params || cachedConfig?.strategy_params || strat?.default_params || {})
-    : (strat?.default_params || {});
+  const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy;
+  const activeParams = latestSnapshotStrategy?.params || cachedConfig?.strategy_params || {};
+  const defaultParams = strat?.default_params || {};
+  const currentParams = selectedId === activeId
+    ? { ...defaultParams, ...activeParams }
+    : defaultParams;
 
   renderLiveParamsBox(currentParams);
+}
+
+function liveParamLabel(k) {
+  const labels = {
+    threshold: "threshold (model P)",
+    risk_pct: "risk per trade",
+    min_seconds_elapsed: "min seconds",
+    max_seconds_elapsed: "max seconds",
+    live_sample_sec: "live sample sec",
+    late_entry_seconds: "late entry seconds",
+    target_delta: "target delta",
+    taker_fee_rate: "taker fee rate",
+  };
+  return labels[k] || k.replace(/_/g, " ");
 }
 
 function renderLiveParamsBox(params) {
@@ -842,12 +1128,13 @@ function renderLiveParamsBox(params) {
   }
 
   box.innerHTML = entries.map(([k, v]) => {
-    const label = k.replace(/_/g, " ");
     const step = paramStepVal(v);
+    const min = k === "threshold" ? "0.5" : (k.includes("pct") || k.includes("rate") ? "0" : "");
+    const max = k === "threshold" ? "0.99" : (k.includes("pct") || k.includes("rate") ? "1" : "");
     return `
       <div class="live-param-chip">
-        <label title="${esc(k)}">${esc(label)}</label>
-        <input type="number" step="${step}" data-live-param="${esc(k)}" value="${v}" />
+        <label title="${esc(k)}">${esc(liveParamLabel(k))}</label>
+        <input type="number" step="${step}" ${min !== "" ? `min="${min}"` : ""} ${max !== "" ? `max="${max}"` : ""} data-live-param="${esc(k)}" value="${esc(String(v))}" />
       </div>
     `;
   }).join("");
@@ -859,9 +1146,10 @@ function renderLiveParamsBox(params) {
 }
 
 function paramStepVal(v) {
-  if (typeof v === "number") {
-    if (Number.isInteger(v)) return "1";
-    if (Math.abs(v) >= 1) return "0.05";
+  const n = Number(v);
+  if (Number.isFinite(n)) {
+    if (Number.isInteger(n)) return "1";
+    if (Math.abs(n) >= 1) return "0.05";
     return "0.01";
   }
   return "any";
@@ -885,7 +1173,7 @@ async function applyLiveStrategy() {
 
   if (applyBtn) {
     applyBtn.disabled = true;
-    applyBtn.textContent = "Applying…";
+    applyBtn.textContent = "Applying...";
   }
   if (msgEl) {
     msgEl.textContent = "";
@@ -916,12 +1204,14 @@ async function applyLiveStrategy() {
       latestSnapshotStrategy.name = data.strategy_name;
       latestSnapshotStrategy.params = data.params;
     }
+    updateSimCardHeader();
+    needsRedraw = true;
 
     if (msgEl) {
-      msgEl.textContent = "✓ Applied!";
+      msgEl.textContent = "Applied";
       msgEl.className = "strat-update-msg ok";
       setTimeout(() => {
-        if (msgEl.textContent === "✓ Applied!") msgEl.textContent = "";
+        if (msgEl.textContent === "Applied") msgEl.textContent = "";
       }, 3500);
     }
 
@@ -929,7 +1219,7 @@ async function applyLiveStrategy() {
     fetch("/api/config").then(r => r.json()).then(c => { cachedConfig = c; }).catch(() => {});
   } catch (e) {
     if (msgEl) {
-      msgEl.textContent = `❌ ${e.message}`;
+      msgEl.textContent = e.message;
       msgEl.className = "strat-update-msg err";
     }
   } finally {
@@ -940,17 +1230,43 @@ async function applyLiveStrategy() {
   }
 }
 
+function getActiveSimLabel() {
+  const activeName = latestSnapshotStrategy?.name || cachedConfig?.strategy_name || "";
+  const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy || "";
+
+  const match = activeName.match(/(?:SIM|Signull)\s*(\d+\.\d+)/i);
+  if (match) {
+    return `SIM ${match[1]}`;
+  }
+
+  const idMatch = activeId.match(/signull_(\d+)_(\d+)/i);
+  if (idMatch) {
+    return `SIM ${idMatch[1]}.${idMatch[2]}`;
+  }
+
+  if (activeName) {
+    return activeName.split("(")[0].trim();
+  }
+
+  return "SIM 1.1";
+}
+
+function updateSimCardHeader() {
+  const label = getActiveSimLabel();
+  setText("sim-card-title", `${label} Model Probability`);
+}
+
 function updateStrategyParams(s) {
   if (s && Object.keys(s).length) {
     latestSnapshotStrategy = s;
   }
+  updateSimCardHeader();
+  needsRedraw = true;
   const grid = document.getElementById("strat-params-grid");
   const nameEl = document.getElementById("strat-params-name");
 
   const stratName = s?.name || cachedConfig?.strategy_name || cachedConfig?.strategy || "Signull 1.1 (Always In)";
-  if (nameEl) {
-    nameEl.textContent = stratName;
-  }
+  if (nameEl && nameEl.textContent !== stratName) nameEl.textContent = stratName;
 
   const activeId = s?.id || cachedConfig?.strategy;
   const sel = document.getElementById("live-strategy-select");
@@ -967,59 +1283,60 @@ function updateStrategyParams(s) {
 
   const keys = Object.keys(params);
   if (!grid) return;
+  let html;
   if (!keys.length) {
-    grid.innerHTML = '<div class="placeholder">No parameters loaded</div>';
-    return;
-  }
-
-  grid.innerHTML = keys.map(k => {
-    const rawVal = params[k];
-    let displayVal = rawVal;
-    if (typeof rawVal === "number") {
-      if (Number.isInteger(rawVal)) {
-        displayVal = rawVal.toString();
-      } else if (k.includes("pct") || k.includes("rate") || k.includes("threshold")) {
-        displayVal = `${(rawVal * 100).toFixed(rawVal * 100 % 1 === 0 ? 0 : 1)}%`;
-      } else if (k.includes("usdc") || k.includes("stake")) {
-        displayVal = `$${rawVal.toFixed(2)}`;
-      } else if (k.includes("seconds") || k.includes("sec")) {
-        displayVal = `${rawVal.toFixed(0)}s`;
-      } else {
-        displayVal = rawVal.toFixed(3);
-      }
-    } else if (typeof rawVal === "boolean") {
-      displayVal = rawVal ? "True" : "False";
-    }
-    const label = k.replace(/_/g, " ");
-    return `
-      <div class="param-card">
+    html = '<div class="placeholder">No parameters loaded</div>';
+  } else {
+    html = keys.map(k => {
+      const rawVal = params[k];
+      let displayVal = rawVal;
+      if (typeof rawVal === "number") {
+        if (Number.isInteger(rawVal)) displayVal = rawVal.toString();
+        else if (k.includes("pct") || k.includes("rate") || k.includes("threshold")) displayVal = `${(rawVal * 100).toFixed(rawVal * 100 % 1 === 0 ? 0 : 1)}%`;
+        else if (k.includes("usdc") || k.includes("stake")) displayVal = `$${rawVal.toFixed(2)}`;
+        else if (k.includes("seconds") || k.includes("sec")) displayVal = `${rawVal.toFixed(0)}s`;
+        else displayVal = rawVal.toFixed(3);
+      } else if (typeof rawVal === "boolean") displayVal = rawVal ? "True" : "False";
+      const label = k.replace(/_/g, " ");
+      return `<div class="param-card">
         <span class="param-key" title="${esc(k)}">${esc(label)}</span>
         <span class="param-val mono" title="${esc(String(rawVal))}">${esc(String(displayVal))}</span>
-      </div>
-    `;
-  }).join("");
+      </div>`;
+    }).join("");
+  }
+  if (_lastStratParamsHTML !== html) { grid.innerHTML = html; _lastStratParamsHTML = html; }
 }
 
 function updateEquityMeta(equity, initial) {
-  if (!equityHistory.length || equity == null) {
+  if (!equityHistory.length) {
+    setText("equity-chart-meta", "Waiting for balance data");
+    return;
+  }
+  const latest = equityHistory[equityHistory.length - 1];
+  const current = Number.isFinite(Number(latest.v)) ? Number(latest.v) : (equity != null ? Number(equity) : null);
+  if (current == null) {
     setText("equity-chart-meta", "Waiting for balance data");
     return;
   }
   const start = initial != null ? Number(initial) : Number(equityHistory[0].v);
-  const change = Number(equity) - start;
+  const change = current - start;
   const pctChange = start ? (change / start) * 100 : 0;
   setText(
     "equity-chart-meta",
-    `${change >= 0 ? "+" : "−"}${fmtUsdCompact(Math.abs(change))} (${pctChange >= 0 ? "+" : ""}${pctChange.toFixed(2)}%)`
+    `$${current.toFixed(2)} · ${change >= 0 ? "+" : "−"}${fmtUsdCompact(Math.abs(change))} (${pctChange >= 0 ? "+" : ""}${pctChange.toFixed(2)}%)`
   );
 }
 
+let _lastBookRender = 0;
 function updateOrderbooks(books) {
   cachedBooks = books;
   if (!obRenderPending) {
     obRenderPending = true;
     requestAnimationFrame(() => {
       obRenderPending = false;
+      const now = Date.now();
+      if (now - _lastBookRender < 300) return;
+      _lastBookRender = now;
       renderActiveBook();
       needsRedraw = true;
     });
@@ -1038,42 +1355,34 @@ function renderActiveBook() {
   setText("book-mid", book?.mid != null ? fmt(book.mid) : "—");
   setText("book-spread", book?.spread != null ? fmt(book.spread) : "—");
 
+  let html;
   if (!book || !hasLevels) {
     if (book?.best_bid != null && book?.best_ask != null) {
-      body.innerHTML = '<div class="placeholder">Depth loading…</div>';
+      html = '<div class="placeholder">Depth loading…</div>';
     } else {
-      body.innerHTML = '<div class="placeholder">Waiting for book…</div>';
+      html = '<div class="placeholder">Waiting for book…</div>';
     }
-    return;
+  } else {
+    const asks = [...(book.asks || [])].sort((a, b) => b.price - a.price).slice(0, 10);
+    const bids = [...(book.bids || [])].sort((a, b) => b.price - a.price).slice(0, 10);
+    const maxSize = Math.max(...asks.map(l => l.size), ...bids.map(l => l.size), 1);
+    let askTotal = 0;
+    let bidTotal = 0;
+    html = '<div class="book-section asks-section">';
+    asks.forEach(l => { askTotal += l.size; html += bookRow(l, maxSize, "ask", askTotal); });
+    html += '</div>';
+    html += `<div class="book-spread-row">
+      <span class="spread-lbl">Spread</span>
+      <span class="spread-val">${fmt(book.spread)}</span>
+    </div>`;
+    html += '<div class="book-section bids-section">';
+    bids.forEach(l => { bidTotal += l.size; html += bookRow(l, maxSize, "bid", bidTotal); });
+    html += '</div>';
   }
-
-  const asks = [...(book.asks || [])].sort((a, b) => b.price - a.price).slice(0, 10);
-  const bids = [...(book.bids || [])].sort((a, b) => b.price - a.price).slice(0, 10);
-  const maxSize = Math.max(...asks.map(l => l.size), ...bids.map(l => l.size), 1);
-
-  let askTotal = 0;
-  let bidTotal = 0;
-
-  let html = '<div class="book-section asks-section">';
-  asks.forEach(l => {
-    askTotal += l.size;
-    html += bookRow(l, maxSize, "ask", askTotal);
-  });
-  html += '</div>';
-
-  html += `<div class="book-spread-row">
-    <span class="spread-lbl">Spread</span>
-    <span class="spread-val">${fmt(book.spread)}</span>
-  </div>`;
-
-  html += '<div class="book-section bids-section">';
-  bids.forEach(l => {
-    bidTotal += l.size;
-    html += bookRow(l, maxSize, "bid", bidTotal);
-  });
-  html += '</div>';
-
-  body.innerHTML = html;
+  if (_renderedActiveBook !== html) {
+    body.innerHTML = html;
+    _renderedActiveBook = html;
+  }
 }
 
 function bookRow(level, maxSize, cls, cumulative) {
@@ -1088,53 +1397,119 @@ function bookRow(level, maxSize, cls, cumulative) {
   </div>`;
 }
 
-function updateTape(trades) {
+function tapeKey(t) {
+  return t.slug || `${t.t}_${t.side}`;
+}
+
+function tapeRowHTML(t) {
+  const won = !!t.won;
+  const pnl = tradePnl(t);
+  const time = new Date(t.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return `<div class="tape-row">
+    <span class="tape-time">${time}</span>
+    <span class="tape-side ${won ? "buy" : "sell"}">${won ? "WIN" : "LOSS"}</span>
+    <span class="tape-outcome ${(t.side || "").toLowerCase()}">${String(t.side || "").toUpperCase()}</span>
+    <span class="tape-price">@${Number(t.entry_price).toFixed(2)} $${Number(t.stake).toFixed(2)}</span>
+    <span class="tape-size" style="color:${won ? "#0ecb81" : "#f6465d"}">${won ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}</span>
+  </div>`;
+}
+
+function bindTapeScroll(el) {
+  if (el === _tapeEl) return;
+  _tapeEl = el;
+  _tapeKeys = [];
+  el.addEventListener("scroll", () => {
+    if (_tapeLimit >= liveStrategyTrades.length) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+      _tapeLimit += TAPE_BATCH;
+      updateTape();
+    }
+  }, { passive: true });
+}
+
+function updateTape() {
   const el = document.getElementById("trade-tape");
   if (!el) return;
+  bindTapeScroll(el);
 
-  setText("tape-count", `${trades?.length || 0} trade${trades?.length === 1 ? "" : "s"}`);
+  const strategyTrades = liveStrategyTrades;
+  const ct = `${strategyTrades.length} trade${strategyTrades.length === 1 ? "" : "s"}`;
+  setText("tape-count", ct);
 
-  if (!trades?.length) {
-    el.innerHTML = '<div class="placeholder">No trades yet</div>';
-    lastTradeId = null;
+  if (!strategyTrades.length) {
+    if (_tapeKeys.length || !el.querySelector(".placeholder")) {
+      el.innerHTML = '<div class="placeholder">Monitor active — waiting for first signal entry…</div>';
+      _tapeKeys = [];
+      _tapeLimit = TAPE_BATCH;
+    }
     return;
   }
 
-  const newest = trades[0];
-  const tradeKey = `${newest.t}-${newest.price}-${newest.size}`;
-  const isNew = tradeKey !== lastTradeId;
-  lastTradeId = tradeKey;
+  const desc = [...strategyTrades].reverse();
+  const desired = desc.slice(0, Math.min(_tapeLimit, desc.length));
+  const desiredKeys = desired.map(tapeKey);
 
-  el.innerHTML = trades.slice(0, 24).map((t, i) => {
-    const isBuy = (t.trade_side || "").toLowerCase() === "buy";
-    const side = (t.side || "").toLowerCase();
-    const time = new Date(t.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    const flash = isNew && i === 0 ? " flash" : "";
-    return `<div class="tape-row${flash}">
-      <span class="tape-time">${time}</span>
-      <span class="tape-side ${isBuy ? "buy" : "sell"}">${isBuy ? "BUY" : "SELL"}</span>
-      <span class="tape-outcome ${side}">${(t.side || "").toUpperCase()}</span>
-      <span class="tape-price">${fmt(t.price)}</span>
-      <span class="tape-size">${fmtSize(t.size)}</span>
-    </div>`;
-  }).join("");
+  if (desiredKeys.length === _tapeKeys.length && desiredKeys.every((k, i) => k === _tapeKeys[i])) {
+    return;
+  }
+
+  const ph = el.querySelector(".placeholder");
+  if (ph) ph.remove();
+
+  let offset = _tapeKeys.length ? desiredKeys.indexOf(_tapeKeys[0]) : -1;
+  let reusable = offset >= 0;
+  if (reusable) {
+    const overlap = Math.min(_tapeKeys.length, desiredKeys.length - offset);
+    for (let i = 0; i < overlap; i++) {
+      if (desiredKeys[offset + i] !== _tapeKeys[i]) { reusable = false; break; }
+    }
+  }
+
+  if (!reusable) {
+    el.innerHTML = desired.map(tapeRowHTML).join("");
+    _tapeKeys = desiredKeys;
+    return;
+  }
+
+  const oldLen = _tapeKeys.length;
+  const keepOld = Math.max(0, Math.min(oldLen, desiredKeys.length - offset));
+  const prependCount = offset;
+  const newTailCount = desiredKeys.length - offset - keepOld;
+
+  if (prependCount > 0) {
+    const prevHeight = el.scrollHeight;
+    const prevScroll = el.scrollTop;
+    el.insertAdjacentHTML("afterbegin", desired.slice(0, prependCount).map(tapeRowHTML).join(""));
+    const delta = el.scrollHeight - prevHeight;
+    if (prevScroll > 0) el.scrollTop = prevScroll + delta;
+  }
+  if (newTailCount > 0) {
+    el.insertAdjacentHTML("beforeend", desired.slice(offset + keepOld).map(tapeRowHTML).join(""));
+  }
+  for (let i = oldLen; i > keepOld; i--) {
+    if (el.lastElementChild) el.removeChild(el.lastElementChild);
+  }
+
+  _tapeKeys = desiredKeys;
 }
 
 function updateLog(entries) {
   const el = document.getElementById("activity-log");
   if (!el) return;
+  let html;
   if (!entries?.length) {
-    el.innerHTML = '<div class="placeholder">No activity</div>';
-    return;
+    html = '<div class="placeholder">No activity</div>';
+  } else {
+    html = entries.slice(0, 30).map(e => {
+      const lvl = (e.level || "info").toLowerCase();
+      return `<div class="activity-item ${lvl}">
+        <span class="activity-dot"></span>
+        <span class="activity-time">${e.time || ""}</span>
+        <span class="activity-msg">${esc(e.message)}</span>
+      </div>`;
+    }).join("");
   }
-  el.innerHTML = entries.slice(0, 30).map(e => {
-    const lvl = (e.level || "info").toLowerCase();
-    return `<div class="activity-item ${lvl}">
-      <span class="activity-dot"></span>
-      <span class="activity-time">${e.time || ""}</span>
-      <span class="activity-msg">${esc(e.message)}</span>
-    </div>`;
-  }).join("");
+  if (_lastLogHTML !== html) { el.innerHTML = html; _lastLogHTML = html; }
 }
 
 function updateBtcPanel(btc) {
@@ -1159,8 +1534,7 @@ function updateBtcPanel(btc) {
   const livePrice = spot.value;
   if (livePrice != null) {
     setText("btc-spot", fmtUsd(livePrice));
-    setText("hero-btc-price", fmtUsd(livePrice));
-    flashEl("hero-btc-price");
+    if (setText("hero-btc-price", fmtUsd(livePrice))) flashEl("hero-btc-price");
   }
   if (btc.price_to_beat != null) {
     setText("btc-beat", beatText);
@@ -1188,8 +1562,7 @@ function updateBtcPanel(btc) {
     const stale = spot.source === "chainlink" ? " · oracle fallback"
       : (spot.source === "stale-binance" || binanceAge > 3 ? " · lag" : "");
     setText("btc-chart-meta", `${fmtDelta(delta)} · ${chartWindowLabel()}${stale}`);
-    const metaEl = document.getElementById("btc-chart-meta");
-    if (metaEl) metaEl.className = deltaCls;
+    setClass("btc-chart-meta", deltaCls);
   } else if (livePrice != null) {
     setText("btc-chart-meta", fmtUsd(livePrice));
   } else {
@@ -1197,10 +1570,8 @@ function updateBtcPanel(btc) {
   }
 
   for (const id of ["btc-delta", "hero-btc-delta"]) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    el.textContent = deltaText;
-    el.className = deltaCls;
+    setText(id, deltaText);
+    setClass(id, deltaCls);
   }
   needsRedraw = true;
 }
@@ -1209,17 +1580,25 @@ function updateBotButtons(running) {
   const start = document.querySelector(".btn-start");
   const stop = document.querySelector(".btn-stop");
   if (start) {
-    start.disabled = running;
-    start.classList.toggle("disabled", running);
+    if (start.disabled !== !!running) start.disabled = running;
+    start.classList.toggle("disabled", !!running);
   }
   if (stop) {
-    stop.disabled = !running;
+    if (stop.disabled === !!running) stop.disabled = !running;
     stop.classList.toggle("disabled", !running);
   }
 }
 
+// Canvas context cache — avoid re-creating on every frame
+let _canvasCache = {};
+
 function setupCanvas(canvas) {
   if (!canvas) return null;
+  const key = canvas.id || canvas;
+  const cached = _canvasCache[key];
+  if (cached && cached.w === canvas.parentElement?.clientWidth && cached.h === canvas.parentElement?.clientHeight) {
+    return cached;
+  }
   const parent = canvas.parentElement;
   if (!parent) return null;
   const dpr = window.devicePixelRatio || 1;
@@ -1230,33 +1609,72 @@ function setupCanvas(canvas) {
   canvas.height = Math.round(h * dpr);
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  return { ctx, w, h };
+  const result = { ctx, w, h, _key: key };
+  _canvasCache[key] = result;
+  return result;
+}
+
+function clearCanvasCache() {
+  _canvasCache = {};
 }
 
 function chartNow() {
-  // Shared clock for both canvases so BTC and odds stay correlated in time.
   const oddsT = history.length ? history[history.length - 1].t : 0;
   const btcT = btcHistory.length ? btcHistory[btcHistory.length - 1].t : 0;
   return Math.max(lastServerTs || 0, oddsT, btcT, Date.now() / 1000 - 0.5);
 }
 
 function chartWindowSec() {
-  const now = chartNow();
-  const candleStart = candleWindowStart();
-  const candleSpan = Math.max(0, now - candleStart);
-  let earliest = candleStart;
-  if (history.length) earliest = Math.min(earliest, history[0].t);
-  if (btcHistory.length) earliest = Math.min(earliest, btcHistory[0].t);
-  const span = Math.max(candleSpan, now - earliest);
-  if (!history.length && !btcHistory.length) {
-    return Math.min(CANDLE_SEC, Math.max(45, candleSpan + 2));
-  }
-  return Math.min(CANDLE_SEC, Math.max(45, span + 2));
+  // Locked to candle duration (300s). Never changes once the candle is known.
+  return CANDLE_SEC;
 }
 
 function chartWindowLabel() {
-  const windowSec = chartWindowSec();
-  return windowSec >= CANDLE_SEC - 1 ? "5m" : `${Math.round(windowSec)}s`;
+  return "5m";
+}
+
+// Y-ranges computed each frame so charts auto-scale to latest data
+function clearCachedYRanges() {}
+
+function getPriceYRange(candleStart, history) {
+  const vals = [];
+  for (const p of history) {
+    if (p.up != null) vals.push(p.up);
+    if (p.down != null) vals.push(p.down);
+  }
+  let yMin = 0;
+  let yMax = 1;
+  if (vals.length >= 2) {
+    yMin = Math.max(0, Math.min(...vals) - 0.05);
+    yMax = Math.min(1, Math.max(...vals) + 0.05);
+    if (yMax - yMin < 0.10) {
+      const mid = (yMax + yMin) / 2;
+      yMin = Math.max(0, mid - 0.05);
+      yMax = Math.min(1, mid + 0.05);
+    }
+  } else {
+    yMin = 0;
+    yMax = 1;
+  }
+  return { yMin, yMax };
+}
+
+function getBtcYRange(candleStart, btcHistory, beat) {
+  const vals = [];
+  for (const p of btcHistory) {
+    if (p.v != null) vals.push(p.v);
+  }
+  if (beat != null) vals.push(beat);
+  if (vals.length < 2) {
+    return { yMin: (beat || 78000) - 200, yMax: (beat || 78000) + 200 };
+  }
+  let yMin = Math.min(...vals);
+  let yMax = Math.max(...vals);
+  const span = yMax - yMin || 1;
+  const padY = Math.max(span * 0.10, beat != null ? Math.max(20, beat * 0.0003) : 20);
+  yMin -= padY;
+  yMax += padY;
+  return { yMin, yMax };
 }
 
 function drawPriceChart() {
@@ -1276,32 +1694,24 @@ function drawPriceChart() {
   const pad = { l: 44, r: 12, t: 12, b: 26 };
   const plotW = W - pad.l - pad.r;
   const plotH = H - pad.t - pad.b;
-  const windowSec = chartWindowSec();
   const now = chartNow();
-  const tMin = now - windowSec;
+  const tMin = candleWindowStart();
+  const tMax = Math.max(tMin + CANDLE_SEC, now + 2);
+  const windowSec = tMax - tMin;
 
-  let visible = history.filter(p => p.t >= tMin && p.up != null && p.down != null);
+  let visible = history.filter(p => p.up != null && p.down != null);
   if (visible.length < 2) {
     ctx.fillStyle = "#06090f";
     ctx.fillRect(0, 0, W, H);
     setText("chart-meta", "—");
     return true;
   }
-  if (smooth.up != null && smooth.down != null) {
-    visible = [...visible, { t: now, up: smooth.up, down: smooth.down }];
-  }
 
-  const vals = visible.flatMap(p => [p.up, p.down]);
-  let yMin = Math.max(0, Math.min(...vals) - 0.03);
-  let yMax = Math.min(1, Math.max(...vals) + 0.03);
-  if (yMax - yMin < 0.06) {
-    const mid = (yMax + yMin) / 2;
-    yMin = Math.max(0, mid - 0.03);
-    yMax = Math.min(1, mid + 0.03);
-  }
+  const candleStart = tMin;
+  const yRange = getPriceYRange(candleStart, history);
 
   const xS = t => pad.l + ((t - tMin) / windowSec) * plotW;
-  const yS = v => pad.t + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+  const yS = v => pad.t + plotH - ((v - yRange.yMin) / (yRange.yMax - yRange.yMin)) * plotH;
 
   ctx.fillStyle = "#06090f";
   ctx.fillRect(0, 0, W, H);
@@ -1317,10 +1727,10 @@ function drawPriceChart() {
     ctx.stroke();
     ctx.fillStyle = "#5a6d8a";
     ctx.textAlign = "right";
-    ctx.fillText((yMax - ((yMax - yMin) / 4) * i).toFixed(2), pad.l - 4, y + 3);
+    ctx.fillText((yRange.yMax - ((yRange.yMax - yRange.yMin) / 4) * i).toFixed(2), pad.l - 4, y + 3);
   }
 
-  if (yMin < 0.5 && yMax > 0.5) {
+  if (yRange.yMin < 0.5 && yRange.yMax > 0.5) {
     const y50 = yS(0.5);
     ctx.strokeStyle = "rgba(110,128,153,0.2)";
     ctx.setLineDash([4, 4]);
@@ -1385,17 +1795,11 @@ function drawBtcChart() {
   ctx.fillRect(0, 0, W, H);
 
   const now = chartNow();
-  const windowSec = chartWindowSec();
-  const tMin = Math.max(candleWindowStart(), now - windowSec);
-  const liveSpot = liveBtcSpotPrice();
+  const tMin = candleWindowStart();
+  const tMax = Math.max(tMin + CANDLE_SEC, now + 2);
+  const windowSec = tMax - tMin;
 
-  let visible = filterBtcHistoryForCandle(btcHistory)
-    .filter(p => p.t >= tMin && p.v != null)
-    .map(p => ({ t: p.t, v: Number(p.v) }));
-
-  if (liveSpot != null) {
-    visible = [...visible, { t: now, v: Number(liveSpot) }];
-  }
+  let visible = btcHistory.filter(p => p.v != null).map(p => ({ t: p.t, v: Number(p.v) }));
 
   if (visible.length === 1) {
     visible = [
@@ -1409,22 +1813,11 @@ function drawBtcChart() {
   }
 
   const beat = priceToBeat != null ? Number(priceToBeat) : null;
-  const vals = visible.map(p => p.v);
-  if (beat != null) vals.push(beat);
-  let yMin = Math.min(...vals);
-  let yMax = Math.max(...vals);
-  const span = yMax - yMin;
-  const padY = Math.max(span * 0.08, beat != null ? Math.max(8, beat * 0.00015) : 8);
-  yMin -= padY;
-  yMax += padY;
-  if (yMax - yMin < 1) {
-    const mid = (yMax + yMin) / 2;
-    yMin = mid - 0.5;
-    yMax = mid + 0.5;
-  }
+  const candleStart = tMin;
+  const yRange = getBtcYRange(candleStart, btcHistory, beat);
 
   const xS = t => pad.l + ((t - tMin) / windowSec) * plotW;
-  const yS = price => pad.t + plotH - ((price - yMin) / (yMax - yMin)) * plotH;
+  const yS = price => pad.t + plotH - ((price - yRange.yMin) / (yRange.yMax - yRange.yMin)) * plotH;
 
   if (beat != null) {
     const yBeat = yS(beat);
@@ -1457,7 +1850,7 @@ function drawBtcChart() {
     ctx.stroke();
     ctx.fillStyle = "#5a6d8a";
     ctx.textAlign = "right";
-    const tickVal = yMax - ((yMax - yMin) / 4) * i;
+    const tickVal = yRange.yMax - ((yRange.yMax - yRange.yMin) / 4) * i;
     ctx.fillText(fmtUsdCompact(tickVal), pad.l - 4, y + 3);
   }
 
@@ -1499,15 +1892,14 @@ function drawSimChart() {
   ctx.fillRect(0, 0, W, H);
 
   const now = chartNow();
-  const windowSec = chartWindowSec();
-  const tMin = Math.max(candleWindowStart(), now - windowSec);
+  const tMin = candleWindowStart();
+  const tMax = Math.max(tMin + CANDLE_SEC, now + 2);
+  const windowSec = tMax - tMin;
 
-  let visible = filterBtcHistoryForCandle(simHistory)
-    .filter(p => p.t >= tMin && p.v != null)
-    .map(p => ({ t: p.t, v: Number(p.v) }));
+  let visible = simHistory.filter(p => p.v != null).map(p => ({ t: p.t, v: Number(p.v) }));
 
-  if (!visible.length && lastBtcSnapshot && lastBtcSnapshot.btc && lastBtcSnapshot.btc.sim_prob != null) {
-    visible.push({ t: now, v: Number(lastBtcSnapshot.btc.sim_prob) });
+  if (!visible.length && lastBtcSnapshot && lastBtcSnapshot.sim_prob != null) {
+    visible.push({ t: now, v: Number(lastBtcSnapshot.sim_prob) });
   }
 
   if (visible.length === 1) {
@@ -1603,7 +1995,7 @@ function drawSimChart() {
   ctx.fill();
 
   setText("sim-spot-prob", `P(Up) ${(lastProb * 100).toFixed(1)}%`);
-  setText("sim-chart-meta", `SIM 1.0 · ${chartWindowLabel()}`);
+  setText("sim-chart-meta", `${getActiveSimLabel()} · ${chartWindowLabel()}`);
 
   return true;
 }
@@ -1930,7 +2322,7 @@ function updateLightweightEquityChart() {
       if (tr && Number.isFinite(Number(tr.t))) {
         const trTime = Math.floor(Number(tr.t));
         const won = !!tr.won;
-        const pnl = Number(tr.pnl || 0);
+        const pnl = tradePnl(tr);
         markers.push({
           time: trTime,
           position: won ? "belowBar" : "aboveBar",
@@ -1956,31 +2348,6 @@ function resetEquityZoom() {
   eqViewState.xMin = null;
   eqViewState.xMax = null;
   needsRedraw = true;
-}
-
-async function resetAccount() {
-  const confirmed = confirm(
-    "Are you sure you want to reset your account balance to $100.00 and delete all prior trading data?\n\nThis action cannot be undone."
-  );
-  if (!confirmed) return;
-
-  try {
-    const res = await fetch("/api/account/reset", { method: "POST" });
-    if (!res.ok) {
-      alert("Failed to reset account. Please try again.");
-      return;
-    }
-    equityHistory = [];
-    liveStrategyTrades = [];
-    if (lwEquitySeries) {
-      lwEquitySeries.setData([]);
-      try { lwEquitySeries.setMarkers([]); } catch (_) {}
-    }
-    await pollStatus();
-  } catch (err) {
-    console.error("Failed to reset account:", err);
-    alert("Error resetting account: " + err.message);
-  }
 }
 
 function drawEquityChart() {
@@ -2117,7 +2484,7 @@ function drawEquityChart() {
 
     const won = Boolean(tr.won);
     const side = String(tr.side || "UP").toUpperCase();
-    const pnl = Number(tr.pnl || 0);
+    const pnl = tradePnl(tr);
     const pnlStr = pnl !== 0 ? `${pnl > 0 ? "+" : ""}$${pnl.toFixed(1)}` : "";
 
     const badgeColor = won ? "#0ecb81" : "#f6465d";
@@ -2199,7 +2566,7 @@ function drawEquityChart() {
 
       if (hoveredTrade) {
         const won = Boolean(hoveredTrade.won);
-        const pnl = Number(hoveredTrade.pnl || 0);
+        const pnl = tradePnl(hoveredTrade);
         const eqAfter = Number(hoveredTrade.equity_after);
         tooltip.innerHTML = `
           <div class="eq-tooltip-header">
@@ -2261,32 +2628,409 @@ function drawEquityChart() {
   return true;
 }
 
-function renderLoop() {
-  if (viewActive && lastBtcSnapshot) {
-    if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
+function drawEquityGridChart() {
+  const canvas = document.getElementById("equity-grid-chart");
+  if (!canvas) return false;
+  const setup = setupCanvas(canvas);
+  if (!setup) return false;
+  const { ctx, w: W, h: H } = setup;
+  ctx.fillStyle = "#06090f";
+  ctx.fillRect(0, 0, W, H);
+
+  const visible = equityHistory
+    .filter(p => Number.isFinite(Number(p.t)) && Number.isFinite(Number(p.v)))
+    .map(p => ({ ...p, t: Number(p.t), v: Number(p.v) }));
+  if (!visible.length) return true;
+
+  const pad = { l: 52, r: 12, t: 12, b: 26 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+
+  const first = visible[0];
+  const last = visible[visible.length - 1];
+  const tMin = first.t;
+  const tMax = Math.max(last.t, tMin + 1);
+
+  const initial = Number.isFinite(equityInitial) ? equityInitial : Number(first.v);
+  const vals = [...visible.map(p => p.v), initial];
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const spread = Math.max(hi - lo, Math.max(Math.abs(hi) * 0.01, 0.1));
+  const yMin = lo - spread * 0.15;
+  const yMax = hi + spread * 0.15;
+
+  const xS = t => pad.l + ((t - tMin) / (tMax - tMin)) * plotW;
+  const yS = v => pad.t + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  ctx.strokeStyle = "#1a2438";
+  ctx.lineWidth = 1;
+  ctx.font = "10px JetBrains Mono, monospace";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (plotH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillStyle = "#5a6d8a";
+    ctx.textAlign = "right";
+    ctx.fillText(fmtUsdCompact(yMax - ((yMax - yMin) / 4) * i), pad.l - 4, y + 3);
   }
-  // Paint only while Live is visible; WS still merges state in the background.
+
+  const positive = Number(last.v) >= Number(first.v);
+  const color = positive ? "#0ecb81" : "#f6465d";
+  const baseline = Math.max(pad.t, Math.min(pad.t + plotH, yS(initial)));
+
+  const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + plotH);
+  if (positive) {
+    grad.addColorStop(0, "rgba(14, 203, 129, 0.22)");
+    grad.addColorStop(1, "rgba(14, 203, 129, 0.0)");
+  } else {
+    grad.addColorStop(0, "rgba(246, 70, 93, 0.22)");
+    grad.addColorStop(1, "rgba(246, 70, 93, 0.0)");
+  }
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  visible.forEach((p, i) => {
+    const x = xS(p.t);
+    if (i === 0) { ctx.moveTo(x, yS(p.v)); return; }
+    ctx.lineTo(x, yS(visible[i - 1].v));
+    ctx.lineTo(x, yS(p.v));
+  });
+  ctx.lineTo(xS(last.t), baseline);
+  ctx.lineTo(xS(first.t), baseline);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  visible.forEach((p, i) => {
+    const x = xS(p.t);
+    if (i === 0) ctx.moveTo(x, yS(p.v));
+    else { ctx.lineTo(x, yS(visible[i - 1].v)); ctx.lineTo(x, yS(p.v)); }
+  });
+  ctx.stroke();
+
+  const lastX = xS(last.t);
+  if (lastX >= pad.l && lastX <= W - pad.r) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(lastX, yS(last.v), 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  liveStrategyTrades.forEach(tr => {
+    const trT = Number(tr.t);
+    if (isNaN(trT) || trT < tMin || trT > tMax) return;
+    const x = xS(trT);
+    if (x < pad.l - 5 || x > W - pad.r + 5) return;
+    let eqVal = Number(tr.equity_after);
+    if (!Number.isFinite(eqVal)) eqVal = initial;
+    const y = Math.max(pad.t + 6, Math.min(pad.t + plotH - 6, yS(eqVal)));
+    const won = Boolean(tr.won);
+    const badgeColor = won ? "#0ecb81" : "#f6465d";
+    ctx.fillStyle = badgeColor;
+    ctx.beginPath();
+    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  ctx.fillStyle = "#5a6d8a";
+  ctx.font = "9px JetBrains Mono, monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(new Date(tMin * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), pad.l, H - 7);
+  ctx.textAlign = "right";
+  ctx.fillText(new Date(tMax * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), W - pad.r, H - 7);
+  return true;
+}
+
+function renderLoop() {
   if (viewActive) {
-    const animating = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
-    if (needsRedraw || animating) {
+    const needsAnim = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
+    if (needsRedraw || needsAnim) {
+      if (lastBtcSnapshot) {
+        if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
+      }
       drawPriceChart();
       drawBtcChart();
       drawSimChart();
-      drawEquityChart();
-      if (!animating) needsRedraw = false;
+      drawEquityGridChart();
+      needsRedraw = false;
     }
   }
-  requestAnimationFrame(renderLoop);
+  if (viewActive) requestAnimationFrame(renderLoop);
 }
+
+// Pause rendering when tab is hidden to save CPU/battery
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    viewActive = false;
+  } else {
+    viewActive = true;
+    clearCanvasCache();
+    needsRedraw = true;
+  }
+});
 
 function setText(id, val) {
   const el = document.getElementById(id);
-  if (el) el.textContent = val;
+  if (!el) return false;
+  const next = val == null ? "" : String(val);
+  if (el.textContent === next) return false;
+  el.textContent = next;
+  return true;
+}
+
+function tradePnl(t) {
+  if (!t) return 0;
+  if (t.pnl != null) return Number(t.pnl) || 0;
+  const stake = Number(t.stake) || 0;
+  const entry = Number(t.entry_price) || 0;
+  const fee = Number(t.entry_fee) || 0;
+  if (entry <= 0 || stake <= 0) return 0;
+  return t.won ? (stake / entry - stake - fee) : (-stake - fee);
+}
+
+function startPing() {
+  stopPing();
+  pingTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    lastPingAt = Date.now();
+    try { ws.send(JSON.stringify({ type: "ping", t: lastPingAt })); } catch (_) {}
+  }, 2000);
+}
+
+function stopPing() {
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
+}
+
+function handlePong(d) {
+  const sent = Number(d.t || lastPingAt);
+  if (sent) lastRttMs = Date.now() - sent;
+  if (lastRttMs != null) setText("net-text", `${Math.round(lastRttMs)}ms`);
+  setClass("net-status", "status-item live");
+}
+
+function initNetWatch() {
+  window.addEventListener("online", () => { netOnline = true; updateNetBanner(); });
+  window.addEventListener("offline", () => { netOnline = false; updateNetBanner(); });
+  updateNetBanner();
+}
+
+let _lastBannerText = "";
+function updateNetBanner() {
+  const banner = document.getElementById("net-banner");
+  if (!banner) return;
+  const down = !netOnline || (lastUpdateAt > 0 && !isLive);
+  banner.classList.toggle("hidden", !down);
+  if (down) {
+    const t = !netOnline
+      ? "No internet — live prices are frozen. The bot thread is still running on this machine."
+      : "Dashboard disconnected — live prices are frozen. The bot thread is still running on the server.";
+    if (_lastBannerText !== t) { banner.textContent = t; _lastBannerText = t; }
+  } else {
+    _lastBannerText = "";
+  }
+}
+
+function initStrategyCollapse() {
+  const panel = document.getElementById("live-model-panel");
+  const toggle = document.getElementById("live-model-toggle");
+  if (!panel || !toggle) return;
+  panel.classList.add("collapsed");
+  toggle.addEventListener("click", () => {
+    panel.classList.toggle("collapsed");
+    const btn = document.getElementById("live-model-collapse-btn");
+    if (btn) btn.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
+  });
+}
+
+function initHealthPopover() {
+  const btn = document.getElementById("health-toggle");
+  const pop = document.getElementById("health-popover");
+  if (!btn || !pop) return;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    pop.classList.toggle("hidden");
+  });
+  document.addEventListener("click", (e) => {
+    if (!pop.classList.contains("hidden") && !pop.contains(e.target) && e.target !== btn) {
+      pop.classList.add("hidden");
+    }
+  });
+}
+
+function updateHealthPopover(d) {
+  const h = d.health || {};
+  const set = (id, val) => setText(id, val);
+  set("hp-uptime", h.uptime_sec != null ? formatUptime(h.uptime_sec) : "—");
+  set("hp-lag", h.loop_lag_ms != null ? `${Number(h.loop_lag_ms).toFixed(1)} ms` : "—");
+  set("hp-bot", (h.bot_alive || d.running) ? "alive" : "stopped");
+  const feed = h.feed || d.feed || {};
+  set("hp-clob", feed.connected ? `${feed.updates_per_sec ?? "—"}/s` : (feed.reconnecting ? "reconnecting" : "down"));
+  const spot = h.spot || {};
+  set("hp-spot", spot.connected ? (spot.age_sec != null ? `${spot.age_sec.toFixed(1)}s ago` : "live") : "down");
+  const rpc = h.rpc || {};
+  set("hp-rpc", rpc.ok ? `block ${rpc.block ?? "—"} · ${rpc.rtt_ms ?? "—"}ms` : (rpc.error || "down"));
+  const wal = h.wallet || {};
+  set("hp-wallet", wal.connected || wal.ok ? (wal.age_sec != null ? `${wal.age_sec.toFixed(1)}s ago` : "ready") : (wal.error || "off"));
+}
+
+function formatUptime(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function initCopyButtons() {
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-copy]");
+    if (!btn) return;
+    const id = btn.getAttribute("data-copy");
+    const el = document.getElementById(id);
+    const text = el ? el.textContent.trim() : "";
+    if (!text || text === "—") return;
+    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+  });
+}
+
+function setExplorerLinks(a) {
+  const set = (id, addr) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (addr && addr.startsWith("0x")) {
+      const href = `https://polygonscan.com/address/${addr}`;
+      if (el.href !== href) el.href = href;
+      if (el.classList.contains("hidden")) el.classList.remove("hidden");
+    } else {
+      el.removeAttribute("href");
+      if (!el.classList.contains("hidden")) el.classList.add("hidden");
+    }
+  };
+  set("wallet-funder-link", a.funder_address);
+  set("wallet-signer-link", a.signer_address);
+}
+
+function renderOpenOrders(orders) {
+  const el = document.getElementById("wallet-orders");
+  if (!el) return;
+  if (!orders.length) {
+    const html = '<div class="placeholder">No open orders</div>';
+    if (_renderedOpenOrders !== html) { el.innerHTML = html; _renderedOpenOrders = html; }
+    return;
+  }
+  const html = orders.slice(0, 12).map(o => {
+    const id = o.id || o.order_id || o.orderID || o.orderId || "";
+    const side = String(o.side || o.outcome || "").toUpperCase();
+    const price = o.price != null ? Number(o.price).toFixed(2)
+      : o.pricePerShare != null ? (Number(o.pricePerShare) / 1e18).toFixed(2)
+      : "—";
+    const rawSize = o.original_size || o.originalSize || o.size || o.quantity || o.originalQuantity || 0;
+    const size = typeof rawSize === "number" ? (rawSize >= 1e12 ? (rawSize / 1e18).toFixed(2) : rawSize.toFixed(2)) : String(rawSize);
+    const rawMatched = o.size_matched || o.sizeMatched || o.matched_size || o.matchedSize || o.takerAmount || o.taker_amount || 0;
+    const matched = typeof rawMatched === "number" ? (rawMatched >= 1e12 ? (rawMatched / 1e18).toFixed(2) : rawMatched.toFixed(2)) : String(rawMatched);
+    const status = o.status || "";
+    const statusBadge = status ? `<span class="order-status ${status.toLowerCase()}">${esc(status)}</span>` : "";
+    const cancel = id
+      ? `<button type="button" class="btn btn-cancel-order" data-order-id="${esc(String(id))}">Cancel</button>`
+      : "";
+    return `<div class="inv-row">
+      <span class="inv-side">${esc(side)}</span>
+      <span class="inv-px">@${esc(String(price))}</span>
+      <span class="inv-sz">${esc(String(size))} / ${esc(String(matched))}</span>
+      ${statusBadge}
+      ${cancel}
+    </div>`;
+  }).join("");
+  if (_renderedOpenOrders !== html) {
+    el.innerHTML = html;
+    _renderedOpenOrders = html;
+  }
+  el.querySelectorAll("[data-order-id]").forEach(btn => {
+    btn.addEventListener("click", () => cancelOrder(btn.getAttribute("data-order-id")));
+  });
+}
+
+function renderPositions(positions) {
+  const el = document.getElementById("wallet-positions");
+  if (!el) return;
+  if (!positions.length) {
+    const html = '<div class="placeholder">No positions</div>';
+    if (_renderedPositions !== html) { el.innerHTML = html; _renderedPositions = html; }
+    return;
+  }
+  const html = positions.slice(0, 12).map(p => {
+    const title = p.title || p.slug || p.market || "Position";
+    const size = p.size != null ? Number(p.size).toFixed(2) : "—";
+    const avg = p.avgPrice || p.avg_price || p.price;
+    return `<div class="inv-row">
+      <span class="inv-title">${esc(String(title))}</span>
+      <span class="inv-sz">${esc(String(size))}</span>
+      <span class="inv-px">${avg != null ? "@" + Number(avg).toFixed(2) : ""}</span>
+    </div>`;
+  }).join("");
+  if (_renderedPositions !== html) {
+    el.innerHTML = html;
+    _renderedPositions = html;
+  }
+}
+
+async function verifyWallet() {
+  const btn = document.getElementById("btn-verify-wallet");
+  const msg = document.getElementById("wallet-verify-msg");
+  if (btn) { btn.disabled = true; btn.textContent = "Verifying…"; }
+  if (msg) { msg.textContent = ""; msg.className = "wallet-verify-msg"; }
+  try {
+    const res = await fetch("/api/wallet/verify");
+    const data = await res.json();
+    if (msg) {
+      msg.textContent = data.ok ? "Wallet ready" : (data.issues && data.issues[0]) || "Not ready";
+      msg.className = "wallet-verify-msg " + (data.ok ? "ok" : "err");
+    }
+    pollStatus();
+  } catch (e) {
+    if (msg) {
+      msg.textContent = e.message || "Verify failed";
+      msg.className = "wallet-verify-msg err";
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Verify wallet"; }
+  }
+}
+
+async function cancelOrder(orderId) {
+  if (!orderId) return;
+  try {
+    const res = await fetch("/api/orders/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order_id: orderId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    pollStatus();
+  } catch (e) {
+    console.error("cancel failed", e);
+  }
 }
 
 function setClass(id, cls) {
   const el = document.getElementById(id);
-  if (el) el.className = cls;
+  if (!el) return;
+  const active = cls.split(/\s+/);
+  const current = Array.from(el.classList);
+  current.filter(c => !active.includes(c)).forEach(c => el.classList.remove(c));
+  active.filter(c => !current.includes(c)).forEach(c => el.classList.add(c));
 }
 
 function fmt(n) { return n == null || isNaN(n) ? "—" : Number(n).toFixed(3); }
@@ -2332,7 +3076,10 @@ async function stopBot() {
 }
 
 window.addEventListener("resize", () => {
-  if (viewActive) needsRedraw = true;
+  if (viewActive) {
+    clearCanvasCache();
+    needsRedraw = true;
+  }
 });
 
 window.SignullLive = { init, setActive };

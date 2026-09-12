@@ -1,7 +1,10 @@
-"""Signull — Polymarket 5M Up/Down trading bot."""
+"""Signull — Predict.fun 5M Up/Down trading bot."""
 
 import logging
 import sys
+
+# Inject regex shim BEFORE any other imports
+import regex_shim  # noqa: F401
 
 import uvicorn
 
@@ -63,7 +66,15 @@ def main() -> None:
         count = int(sys.argv[3]) if len(sys.argv) > 3 else 100
         strategy = get_strategy(strategy_id)
         candles = fetch_candles(asset=config.asset, count=count)
-        result = run_backtest(strategy, candles, initial_capital=100.0)
+        result = run_backtest(
+            strategy, candles,
+            initial_capital=config.paper_initial_capital,
+            asset=config.asset,
+            use_fixed_stake=config.use_fixed_stake,
+            fixed_stake_usdc=config.fixed_stake_usdc,
+            taker_fee_rate=config.taker_fee_rate,
+            maker_fee_rate=config.maker_fee_rate,
+        )
         r = result.to_dict()
         print(f"\n=== {r['strategy_name']} ({count} candles) ===")
         print(f"Start:    ${r['initial_capital']:.2f}")

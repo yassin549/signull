@@ -21,7 +21,12 @@ class CandleDataset:
     winner: str  # "up" | "down"
     up_token_id: str
     down_token_id: str
-    ticks: list[tuple[int, float, float]]  # (t, up, down)
+    ticks: list[tuple[int, float, float]]  # (t, up, down) real Predict.fun trade prints
+    market_id: int = 0
+    fee_rate_bps: int = 200
+    # True when ticks were reconstructed from the venue's low-resolution chance
+    # series instead of the real trade tape.  Fills on such candles are flagged.
+    synthetic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +38,9 @@ class CandleDataset:
             "up_token_id": self.up_token_id,
             "down_token_id": self.down_token_id,
             "ticks": [{"t": t, "up": u, "down": d} for t, u, d in self.ticks],
+            "market_id": self.market_id,
+            "fee_rate_bps": self.fee_rate_bps,
+            "synthetic": self.synthetic,
         }
 
     @classmethod
@@ -47,6 +55,9 @@ class CandleDataset:
             up_token_id=data["up_token_id"],
             down_token_id=data["down_token_id"],
             ticks=ticks,
+            market_id=int(data.get("market_id", 0)),
+            fee_rate_bps=int(data.get("fee_rate_bps", 200)),
+            synthetic=bool(data.get("synthetic", False)),
         )
 
 
@@ -69,6 +80,11 @@ class TradeRecord:
     entry_fee: float = 0.0
     sim_entry_prob: float | None = None
     sim_lifetime_probs: list[dict[str, Any]] | None = None
+    # Whether the live-style limit order actually filled against the tape.
+    filled: bool = True
+    fill_reason: str = "filled"
+    limit_price: float = 0.0
+    synthetic: bool = False
 
 
 @dataclass
@@ -91,6 +107,13 @@ class BacktestResult:
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[dict[str, float]] = field(default_factory=list)
     elapsed_ms: float = 0.0
+    # Fill accounting: signals that could not be filled by the real tape.
+    fills: int = 0
+    unfilled: int = 0
+    fill_rate: float = 100.0
+    fetch_failures: int = 0
+    synthetic_candles: int = 0
+    data_source: str = "predict.fun"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,4 +135,10 @@ class BacktestResult:
             "trades": [t.__dict__ for t in self.trades],
             "equity_curve": self.equity_curve,
             "elapsed_ms": self.elapsed_ms,
+            "fills": self.fills,
+            "unfilled": self.unfilled,
+            "fill_rate": self.fill_rate,
+            "fetch_failures": self.fetch_failures,
+            "synthetic_candles": self.synthetic_candles,
+            "data_source": self.data_source,
         }

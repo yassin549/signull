@@ -1,13 +1,11 @@
-"""Real-time Polymarket CLOB WebSocket feed."""
+"""Real-time Predict.fun orderbook polling feed."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import time
 from typing import Any
-
-import websockets
 
 from .config import BotConfig
 from .markets import (
@@ -19,113 +17,122 @@ from .markets import (
     market_to_dict,
     provisional_market_dict,
 )
-from .polymarket import PolymarketClient
+from .predict_client import PredictClient
 from .state import BotState
 
 logger = logging.getLogger(__name__)
 
-PM_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-PING_INTERVAL = 10
-PREFETCH_SEC = 120  # start prefetching 2 minutes before close
+PREFETCH_SEC = 120
+ORDERBOOK_POLL_SEC = 1.5
 
 
 class MarketFeed:
-    """Streams orderbook + price updates from Polymarket's public market channel."""
-
     def __init__(self, config: BotConfig, state: BotState):
         self.config = config
         self.state = state
-        self._client = PolymarketClient(config)
-        self._token_map: dict[str, str] = {}  # token_id -> "up" | "down"
+        self._client = PredictClient(config)
         self._active_slug: str | None = None
         self._active_market: CandleMarket | None = None
         self._next_market: CandleMarket | None = None
         self._switching = False
         self._provisional_pushed_for: int | None = None
-        self._beat_task: asyncio.Task | None = None
 
     async def close(self) -> None:
-        """Stop auxiliary work spawned by the feed during application shutdown."""
-        if self._beat_task is not None and not self._beat_task.done():
-            self._beat_task.cancel()
-            await asyncio.gather(self._beat_task, return_exceptions=True)
+        pass
 
     async def run(self) -> None:
         while not self.state.should_shutdown():
             try:
-                await self._connect_and_stream()
+                await self._poll_loop()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("Feed reconnecting: %s", exc)
+                import traceback
+                logger.warning("Feed reconnecting: %s\n%s", exc, traceback.format_exc())
                 self.state.set_feed_status(False, {"error": str(exc), "reconnecting": True})
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(1.0)
 
-    async def _connect_and_stream(self) -> None:
-        market = await asyncio.to_thread(get_current_candle, self.config.asset)
-        if market is None:
-            # Still roll the clock so the UI never freezes at 0:00
-            self._push_provisional_now()
-            self.state.set_feed_status(False, {"error": "no active market", "reconnecting": True})
-            await asyncio.sleep(0.5)
+    async def _poll_loop(self) -> None:
+        while not self.state.should_shutdown():
+            market = await asyncio.to_thread(get_current_candle, self.config.asset)
+            if market is None:
+                self._push_provisional_now()
+                self.state.set_feed_status(False, {"error": "no active market"})
+                await asyncio.sleep(ORDERBOOK_POLL_SEC)
+                continue
+
+            if market.slug != self._active_slug:
+                await self._switch_candle(market)
+
+            await self._poll_orderbook(market)
+            await self._candle_watch_check(market)
+            await asyncio.sleep(ORDERBOOK_POLL_SEC)
+
+    async def _poll_orderbook(self, market: CandleMarket) -> None:
+        if market.market_id <= 0:
             return
+        try:
+            book = await asyncio.to_thread(self._client.get_order_book, market.market_id)
+            bids = _normalize_levels(book.get("bids", []))
+            asks = _normalize_levels(book.get("asks", []))
+            if bids or asks:
+                self.state.update_feed_book("up", bids, asks)
+                no_bids = _complement_levels(asks, market.tick_size)
+                no_asks = _complement_levels(bids, market.tick_size)
+                self.state.update_feed_book("down", no_bids, no_asks)
+        except Exception as exc:
+            logger.debug("Orderbook poll failed: %s", exc)
 
-        if market.slug != self._active_slug:
-            await self._switch_candle(market)
+    def _seed_prices_from_category(self, market: CandleMarket) -> None:
+        cat_raw = self._client.get_category(market.slug) if self._client else None
+        if not cat_raw:
+            return
+        markets = cat_raw.get("markets", [])
+        if not markets:
+            return
+        m = markets[0]
+        outcomes = m.get("outcomes", [])
+        up = next((o for o in outcomes if o.get("name") == "Up"), None)
+        down = next((o for o in outcomes if o.get("name") == "Down"), None)
 
-        asset_ids = [market.up_token_id, market.down_token_id]
-        self.state.set_feed_status(True, {"subscribed": asset_ids, "reconnecting": False})
-
-        async with websockets.connect(PM_WS_URL, ping_interval=None) as ws:
-            await ws.send(json.dumps({
-                "assets_ids": asset_ids,
-                "type": "market",
-                "custom_feature_enabled": True,
-            }))
-
-            ping_task = asyncio.create_task(self._ping_loop(ws))
-            watch_task = asyncio.create_task(self._candle_watch_loop(ws))
+        def _extract_price(obj, field: str) -> float | None:
+            val = obj.get(field) if obj else None
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                val = val.get("price") or val.get("value") or next(iter(val.values()), None)
+            if val is None:
+                return None
             try:
-                async for raw in ws:
-                    if self.state.should_shutdown():
-                        break
-                    await self._handle_message(raw)
-            finally:
-                for task in (ping_task, watch_task):
-                    task.cancel()
-                await asyncio.gather(ping_task, watch_task, return_exceptions=True)
+                return float(val)
+            except (TypeError, ValueError):
+                return None
 
-    async def _ping_loop(self, ws) -> None:
-        while True:
-            await asyncio.sleep(PING_INTERVAL)
-            try:
-                await ws.send("PING")
-            except Exception:
-                break
+        up_px = _extract_price(up, "bestBid") or _extract_price(up, "bestAsk")
+        down_px = _extract_price(down, "bestBid") or _extract_price(down, "bestAsk")
 
-    async def _capture_beat_when_ready(self) -> None:
-        for _ in range(24):
-            if self.state.should_shutdown():
-                return
-            await asyncio.sleep(0.25)
-            beat = self.state.get_btc_price()
-            if beat is not None:
-                start = (
-                    self._active_market.candle_start_ts
-                    if self._active_market is not None
-                    else None
-                )
-                self.state.set_price_to_beat(beat, candle_start_ts=start)
-                return
+        if up_px is None or down_px is None:
+            op = m.get("outcomePrices")
+            if op and isinstance(op, (list, str)):
+                import json
+                if isinstance(op, str):
+                    op = json.loads(op)
+                if isinstance(op, (list, tuple)) and len(op) == 2:
+                    try:
+                        up_px = float(op[0])
+                        down_px = float(op[1])
+                    except (TypeError, ValueError):
+                        pass
+        if up_px is not None and down_px is not None:
+            self.state.update_feed_best("up", up_px, round(1.0 - up_px, 2))
+            self.state.update_feed_best("down", down_px, round(1.0 - down_px, 2))
 
     def _push_provisional_now(self) -> None:
-        """Publish clock-based market so countdown rolls without waiting on Gamma."""
         start = expected_candle_start_ts()
         if self._provisional_pushed_for == start:
             return
         self._provisional_pushed_for = start
         stub = provisional_market_dict(self.config.asset, start)
-        # Don't wipe books if we're still on the same provisional window
         self.state.update(
             market=stub,
             signal={"side": "hold", "reason": "Rolling into new candle…"},
@@ -142,85 +149,50 @@ class MarketFeed:
             and self._next_market.candle_start_ts > self._active_market.candle_start_ts
         ):
             return
-
         nxt = await asyncio.to_thread(
-            get_next_candle,
-            self.config.asset,
-            self._active_market,
-            max_wait_sec=0.35,
+            get_next_candle, self.config.asset, self._active_market, max_wait_sec=0.35,
         )
         if nxt is not None:
             self._next_market = nxt
             logger.info("Prefetched next candle %s", nxt.slug)
 
-    async def _candle_watch_loop(self, ws) -> None:
-        """Prefetch next candle; switch the instant the current window ends."""
-        while not self.state.should_shutdown():
-            market = self._active_market
-            if market is None:
-                await asyncio.sleep(0.15)
-                continue
+    async def _candle_watch_check(self, market: CandleMarket) -> None:
+        await self._prefetch_next()
 
-            await self._prefetch_next()
+        secs = market.seconds_to_close
+        clock_start = expected_candle_start_ts()
+        window_rolled = (
+            market.candle_start_ts is not None
+            and clock_start > market.candle_start_ts
+        )
 
-            secs = market.seconds_to_close
-            # Also watch the wall clock — end_date skew shouldn't trap us
-            clock_start = expected_candle_start_ts()
-            window_rolled = (
-                market.candle_start_ts is not None
-                and clock_start > market.candle_start_ts
+        if secs > 0.2 and not window_rolled:
+            return
+
+        self._push_provisional_now()
+
+        if self._switching:
+            return
+
+        nxt = self._next_market
+        if nxt is None or nxt.candle_start_ts < clock_start:
+            nxt = await asyncio.to_thread(
+                get_next_candle, self.config.asset, market, max_wait_sec=0.5,
             )
 
-            if secs > 0.2 and not window_rolled:
-                # Near the end, wake more often
-                if secs <= 5:
-                    await asyncio.sleep(0.1)
-                elif secs <= 30:
-                    await asyncio.sleep(0.25)
-                else:
-                    await asyncio.sleep(min(0.5, secs - 0.15))
-                continue
+        if nxt is None or nxt.seconds_to_close <= 0:
+            nxt = await asyncio.to_thread(get_current_candle, self.config.asset)
 
-            # Window closed (or clock says it has) — roll UI immediately
-            self._push_provisional_now()
-
-            if self._switching:
-                await asyncio.sleep(0.05)
-                continue
-
-            nxt = self._next_market
-            if nxt is None or nxt.candle_start_ts < clock_start:
-                nxt = await asyncio.to_thread(
-                    get_next_candle,
-                    self.config.asset,
-                    market,
-                    max_wait_sec=0.5,
-                )
-
-            # If Gamma still lagging, try the exact expected slug once more
-            if nxt is None or nxt.seconds_to_close <= 0:
-                nxt = await asyncio.to_thread(
-                    get_current_candle,
-                    self.config.asset,
-                )
-
-            if nxt is None or nxt.slug == self._active_slug:
-                # Keep provisional countdown; retry quickly
-                await asyncio.sleep(0.2)
-                continue
-
-            self._switching = True
-            try:
-                self._next_market = None
-                await self._switch_candle(nxt)
-                self.state.set_feed_status(False, {"reconnecting": True})
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-            finally:
-                self._switching = False
+        if nxt is None or nxt.slug == self._active_slug:
+            await asyncio.sleep(0.2)
             return
+
+        self._switching = True
+        try:
+            self._next_market = None
+            await self._switch_candle(nxt)
+        finally:
+            self._switching = False
 
     async def _switch_candle(self, market: CandleMarket) -> None:
         prev_start = (
@@ -229,107 +201,118 @@ class MarketFeed:
         self._active_slug = market.slug
         self._active_market = market
         self._provisional_pushed_for = market.candle_start_ts
-        self._token_map = {
-            market.up_token_id: "up",
-            market.down_token_id: "down",
-        }
-        beat = self.state.get_btc_price()
-        # Freeze closed-window beat/oracle before wiping price_to_beat so
-        # bot settlement never reads the next open (feed may roll first).
+
         self.state.clear_market_data(closing_start_ts=prev_start)
-        if beat is not None:
-            # Lock beat to this candle start — bot must not overwrite later.
-            self.state.set_price_to_beat(
-                beat, candle_start_ts=market.candle_start_ts
-            )
-        else:
-            if self._beat_task is not None and not self._beat_task.done():
-                self._beat_task.cancel()
-            self._beat_task = asyncio.create_task(self._capture_beat_when_ready())
+        await self._init_candle_beat_and_history(market)
         self.state.update(
             market=market_to_dict(market),
             prices=None,
             signal={"side": "hold", "reason": "New candle — warming up"},
         )
         self.state.log("info", f"New candle: {market.title}")
-        await asyncio.gather(
-            self._bootstrap_book(market.up_token_id, "up"),
-            self._bootstrap_book(market.down_token_id, "down"),
-        )
+        await self._bootstrap_book(market)
+        self._seed_prices_from_category(market)
 
-    async def _bootstrap_book(self, token_id: str, side: str) -> None:
+    async def _bootstrap_book(self, market: CandleMarket) -> None:
+        if market.market_id <= 0:
+            return
         try:
-            book = await asyncio.to_thread(self._client.get_order_book, token_id)
-            bids = _normalize_levels(getattr(book, "bids", []) or [])
-            asks = _normalize_levels(getattr(book, "asks", []) or [])
-            if bids or asks:
-                self.state.update_feed_book(side, bids, asks)
+            book = await asyncio.to_thread(self._client.get_order_book, market.market_id)
+            bids = _normalize_levels(book.get("bids", []))
+            asks = _normalize_levels(book.get("asks", []))
+            if bids:
+                self.state.update_feed_book("up", bids, asks)
+            if asks:
+                no_bids = _complement_levels(asks, market.tick_size)
+                no_asks = _complement_levels(bids, market.tick_size)
+                self.state.update_feed_book("down", no_bids, no_asks)
         except Exception as exc:
-            # The WebSocket remains the source of truth. A transient REST
-            # bootstrap failure (network drop, DNS blip, or upstream close)
-            # must not produce a traceback or stop the next reconnect.
-            logger.warning("REST book bootstrap unavailable for %s: %s", side, exc)
+            logger.warning("REST book bootstrap unavailable: %s", exc)
 
-    async def _handle_message(self, raw: str | bytes) -> None:
-        if raw in ("PONG", "PING"):
+    async def _init_candle_beat_and_history(self, market: CandleMarket) -> None:
+        import time as _time
+        cs = market.candle_start_ts
+        now = _time.time()
+        elapsed = now - cs
+
+        from .btc_feed import fetch_candle_history, fetch_candle_open_price, fetch_outcome_price_history
+
+        open_px = await asyncio.to_thread(fetch_candle_open_price, self.config.asset, cs)
+
+        if open_px is not None:
+            if elapsed > 1.0:
+                btc_hist, outcome_hist = await asyncio.gather(
+                    asyncio.to_thread(fetch_candle_history, self.config.asset, cs, now),
+                    asyncio.to_thread(
+                        fetch_outcome_price_history,
+                        market.up_token_id,
+                        market.down_token_id,
+                        cs,
+                        now,
+                    ),
+                )
+                self.state.backfill_btc_history(cs, open_px, btc_hist)
+                self.state.backfill_price_history(outcome_hist)
+                logger.info(
+                    "Backfilled candle %s open_px=%.2f with %d BTC points and %d outcome points",
+                    cs, open_px, len(btc_hist), len(outcome_hist),
+                )
+            else:
+                self.state.set_price_to_beat(open_px, candle_start_ts=cs, force=True)
+                logger.info("Locked candle %s open_px=%.2f from REST", cs, open_px)
             return
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
 
-        if isinstance(msg, list):
-            for item in msg:
-                self._process_event(item)
-        else:
-            self._process_event(msg)
-
-    def _process_event(self, msg: dict[str, Any]) -> None:
-        event_type = msg.get("event_type")
-        asset_id = msg.get("asset_id", "")
-        side = self._token_map.get(asset_id)
-
-        if event_type == "book" and side:
-            bids = _normalize_levels(msg.get("bids", []))
-            asks = _normalize_levels(msg.get("asks", []))
-            self.state.update_feed_book(side, bids, asks)
-
-        elif event_type == "price_change":
-            for change in msg.get("price_changes", []):
-                aid = change.get("asset_id", "")
-                s = self._token_map.get(aid)
-                if not s:
-                    continue
-                bb = change.get("best_bid")
-                ba = change.get("best_ask")
-                if bb is not None and ba is not None:
-                    self.state.update_feed_best(s, float(bb), float(ba))
-
-        elif event_type == "best_bid_ask" and side:
-            self.state.update_feed_best(
-                side,
-                float(msg.get("best_bid", 0)),
-                float(msg.get("best_ask", 1)),
-            )
-
-        elif event_type == "last_trade_price" and side:
-            self.state.record_trade(
-                side,
-                float(msg.get("price", 0)),
-                float(msg.get("size", 0)),
-                msg.get("side", ""),
-            )
+        beat = self.state.get_btc_price()
+        if beat is not None:
+            self.state.set_price_to_beat(beat, candle_start_ts=cs, estimated=(elapsed > 30))
 
 
 def _normalize_levels(levels: list) -> list[dict]:
     result = []
+    if not isinstance(levels, list):
+        return result
     for lvl in levels:
-        if isinstance(lvl, dict):
-            price = float(lvl.get("price", 0))
-            size = float(lvl.get("size", 0))
+        if not lvl:
+            continue
+        if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+            try:
+                price = float(lvl[0])
+                size = float(lvl[1])
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(lvl, dict):
+            raw_price = lvl.get("price", 0)
+            raw_size = lvl.get("size", 0)
+            if isinstance(raw_price, dict) or isinstance(raw_size, dict):
+                continue
+            try:
+                price = float(raw_price)
+                size = float(raw_size)
+            except (TypeError, ValueError):
+                continue
         else:
-            price = float(getattr(lvl, "price", 0))
-            size = float(getattr(lvl, "size", 0))
+            continue
         if size > 0:
             result.append({"price": price, "size": size})
+    return result
+
+
+def _complement_levels(levels: list[dict], decimal_precision: str = "0.01") -> list[dict]:
+    if not levels:
+        return []
+    prec = int(1 / max(0.001, float(decimal_precision))) if decimal_precision else 100
+    result = []
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        raw_price = lvl.get("price", 0)
+        if isinstance(raw_price, dict):
+            continue
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        comp = (prec - round(price * prec)) / prec
+        if comp >= 0:
+            result.append({"price": comp, "size": float(lvl.get("size", 0))})
     return result

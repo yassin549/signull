@@ -11,15 +11,19 @@ def compute_stake(
     wallet_balance: float | None = None,
     is_live: bool = False,
     min_stake: float = 0.01,
+    fixed_stake: float | None = None,
 ) -> float:
     """
-    Stake = risk_frac * initial, capped by current equity.
+    Stake = fixed_stake if provided, else risk_frac * initial, capped by current equity.
 
     Live mode additionally caps by wallet collateral when known.
     """
-    if risk_frac <= 0 or initial_capital <= 0:
-        return 0.0
-    stake = min(float(initial_capital) * float(risk_frac), float(equity))
+    if fixed_stake is not None and fixed_stake > 0:
+        stake = min(float(fixed_stake), float(equity))
+    else:
+        if risk_frac <= 0 or initial_capital <= 0:
+            return 0.0
+        stake = min(float(initial_capital) * float(risk_frac), float(equity))
     if is_live and wallet_balance is not None:
         stake = min(stake, max(0.0, float(wallet_balance)))
     if stake < min_stake:
@@ -27,11 +31,32 @@ def compute_stake(
     return stake
 
 
+def estimate_maker_fee(stake: float, entry_price: float, fee_rate: float) -> float:
+    """
+    Estimate maker fee (rebate) for a limit order resting on the book.
+
+    Polymarket CLOB: maker orders receive a rebate (negative fee).
+    Fee = -stake * |fee_rate| * price * (1 - price) for binary tokens.
+    """
+    if stake <= 0 or not 0 < entry_price < 1:
+        return 0.0
+    # Maker rebate: negative fee credited to account
+    # Binary token: shares = stake/price, fee = shares * |rate| * price * (1-price)
+    # Simplified: -stake * |rate| * (1 - price)
+    return -float(stake) * abs(float(fee_rate)) * (1.0 - float(entry_price))
+
+
 def estimate_taker_fee(stake: float, entry_price: float, fee_rate: float) -> float:
-    """Estimate a CLOB taker fee for a binary-token buy."""
+    """
+    Estimate taker fee for a market/aggressive limit order crossing the spread.
+
+    Polymarket CLOB: taker orders pay a fee.
+    Fee = stake * fee_rate * (1 - price) for binary tokens.
+    """
     if stake <= 0 or not 0 < entry_price < 1 or fee_rate <= 0:
         return 0.0
-    # shares * rate * price * (1 - price), where stake = shares * price
+    # Taker fee: shares * rate * price * (1 - price), where stake = shares * price
+    # Simplified: stake * rate * (1 - price)
     return float(stake) * float(fee_rate) * (1.0 - float(entry_price))
 
 

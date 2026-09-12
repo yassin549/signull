@@ -8,14 +8,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=35" />
+  <link rel="stylesheet" href="/static/styles.css?v=41" />
 </head>
 <body>
   <div class="app">
 
     <header class="topbar">
       <div class="topbar-left">
-        <span class="logo">◆ SIGNULL</span>
+        <span class="logo">SIGNULL</span>
         <div class="mode-toggle" id="mode-toggle" role="tablist" aria-label="Dashboard mode">
           <button type="button" class="mode-btn active" data-mode="live" role="tab" aria-selected="true">Live</button>
           <button type="button" class="mode-btn" data-mode="backtest" role="tab" aria-selected="false">Backtest</button>
@@ -26,26 +26,41 @@
       </div>
 
       <div class="topbar-status live-only" id="live-status">
-        <span class="status-item" id="feed-status" title="Feed"><i class="dot"></i> <span id="feed-rate">—</span>/s</span>
+        <span class="status-item" id="net-status" title="Network"><i class="dot"></i> NET <span id="net-text">—</span></span>
+        <span class="status-item" id="srv-status" title="Server loop lag"><i class="dot"></i> SRV <span id="srv-text">—</span></span>
+        <span class="status-item" id="feed-status" title="CLOB feed"><i class="dot"></i> <span id="feed-rate">—</span>/s</span>
+        <span class="status-item" id="spot-status" title="Spot feed"><i class="dot"></i> SPOT <span id="spot-text">—</span></span>
+        <span class="status-item" id="wallet-status-dot" title="Wallet"><i class="dot"></i> <span id="wallet-dot-text">—</span></span>
         <span class="status-item" id="sync-status" title="Last update"><i class="dot"></i> <span id="sync-text">—</span></span>
-        <span class="status-item" id="mode-status" title="Mode"><i class="dot"></i> <span id="mode-text">Paper</span></span>
+        <span class="status-item live" id="mode-status" title="Mode"><i class="dot"></i> <span id="mode-text">Live</span></span>
         <span class="status-item" id="bot-status" title="Bot"><i class="dot"></i> <span id="bot-text">—</span></span>
+        <button type="button" class="health-toggle" id="health-toggle" title="Health details">Health</button>
+        <div class="health-popover hidden" id="health-popover">
+          <div class="hp-row"><span>Uptime</span><span id="hp-uptime">—</span></div>
+          <div class="hp-row"><span>Loop lag</span><span id="hp-lag">—</span></div>
+          <div class="hp-row"><span>Bot thread</span><span id="hp-bot">—</span></div>
+          <div class="hp-row"><span>CLOB</span><span id="hp-clob">—</span></div>
+          <div class="hp-row"><span>Spot</span><span id="hp-spot">—</span></div>
+          <div class="hp-row"><span>BNB Chain RPC</span><span id="hp-rpc">—</span></div>
+          <div class="hp-row"><span>Wallet</span><span id="hp-wallet">—</span></div>
+        </div>
       </div>
 
       <div class="topbar-actions">
         <div class="live-only topbar-actions-inner">
           <button class="btn btn-start" id="btn-start" type="button">▶ Start</button>
           <button class="btn btn-stop" id="btn-stop" type="button">■ Stop</button>
-          <button class="btn btn-reset" id="btn-reset" type="button" title="Reset account balance to $100 and clear trade history">↺ Reset Account</button>
         </div>
         <div class="bt-only topbar-actions-inner hidden">
-          <button class="btn btn-run" id="run-btn" type="button">▶ Run Backtest</button>
+          <button class="btn btn-run" id="run-btn" type="button">Run Backtest</button>
         </div>
       </div>
     </header>
 
     <!-- ═══════════════ LIVE VIEW ═══════════════ -->
     <div class="view view-live active" id="view-live" data-view="live">
+
+      <div class="net-banner hidden" id="net-banner"></div>
 
       <section class="hero">
         <div class="hero-timer">
@@ -92,10 +107,133 @@
           <span class="signal-reason" id="signal-reason">Analyzing market…</span>
         </div>
         <div class="hero-strategy" id="hero-strategy">
-          <span class="strat-name" id="strat-name">Signull 1.0</span>
-          <span class="strat-eq" id="strat-equity">Equity —</span>
-          <span class="strat-ret" id="strat-return">—</span>
           <span class="strat-pending" id="strat-pending">No position</span>
+        </div>
+      </section>
+
+      <section class="trade-detail-panel" id="trade-detail-panel">
+        <div class="td-header">Open Trade</div>
+        <div class="td-grid">
+          <div class="td-group">
+            <div class="td-row">
+              <span class="td-label">Side</span>
+              <span class="td-value td-side" id="td-side">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Entry</span>
+              <span class="td-value mono" id="td-entry-price">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Risk (stake)</span>
+              <span class="td-value mono" id="td-stake">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Risk %</span>
+              <span class="td-value" id="td-risk-pct">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Entry fee</span>
+              <span class="td-value mono" id="td-entry-fee">—</span>
+            </div>
+          </div>
+          <div class="td-group">
+            <div class="td-row td-potential">
+              <span class="td-label">Potential gain</span>
+              <span class="td-value td-gain" id="td-potential-gain">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Current value</span>
+              <span class="td-value mono" id="td-current-value">—</span>
+            </div>
+            <div class="td-row td-pnl-row">
+              <span class="td-label">Unrealized PnL</span>
+              <span class="td-value td-pnl" id="td-unrealized-pnl">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Fill</span>
+              <span class="td-value" id="td-fill">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Elapsed</span>
+              <span class="td-value mono" id="td-elapsed">—</span>
+            </div>
+          </div>
+          <div class="td-group">
+            <div class="td-row">
+              <span class="td-label">Win streak</span>
+              <span class="td-value td-win" id="td-win-streak">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Loss streak</span>
+              <span class="td-value td-loss" id="td-loss-streak">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Recent wins</span>
+              <span class="td-value" id="td-wins-recent">—</span>
+            </div>
+            <div class="td-row">
+              <span class="td-label">Heartbeat</span>
+              <span class="td-value" id="td-heartbeat">—</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="wallet-strip" id="wallet-strip">
+        <div class="ws-connect">
+          <span class="wallet-pill off" id="wallet-status">—</span>
+          <button type="button" class="btn btn-verify" id="btn-verify-wallet">Verify wallet</button>
+          <span class="wallet-verify-msg" id="wallet-verify-msg"></span>
+          <span class="ws-age" id="wallet-updated">—</span>
+        </div>
+        <div class="ws-balances">
+          <div class="ws-bal">
+            <span class="wallet-label" id="wallet-balance-label">CLOB USDC</span>
+            <strong id="wallet-balance">—</strong>
+          </div>
+          <div class="ws-bal">
+            <span class="wallet-label">On-chain USDC</span>
+            <strong id="wallet-onchain-usdc">—</strong>
+          </div>
+          <div class="ws-bal">
+            <span class="wallet-label">POL gas</span>
+            <strong id="wallet-gas">—</strong>
+          </div>
+          <div class="ws-bal">
+            <span class="wallet-label">Available</span>
+            <strong id="wallet-available">—</strong>
+          </div>
+        </div>
+        <div class="ws-addr">
+          <span class="wallet-label">Funder</span>
+          <span class="mono" id="wallet-funder-short">—</span>
+          <span class="wallet-label">Signer</span>
+          <span class="mono" id="wallet-signer-short">—</span>
+        </div>
+      </section>
+
+      <section class="live-model-panel collapsed" id="live-model-panel">
+        <div class="strat-params-head" id="live-model-toggle">
+          <span>Trading Model &amp; Parameters</span>
+          <span class="strat-params-name" id="strat-params-name">-</span>
+          <button type="button" class="collapse-btn" id="live-model-collapse-btn">Show</button>
+        </div>
+        <div class="live-strat-control">
+          <div class="live-strat-select-group">
+            <label for="live-strategy-select" class="live-strat-label">Active Trading Model</label>
+            <select id="live-strategy-select" class="live-strat-select"></select>
+          </div>
+          <p class="live-strat-desc" id="live-strategy-desc">-</p>
+          <div class="live-params-wrapper">
+            <span class="live-params-title">Custom Parameters</span>
+            <div id="live-params-box" class="live-params-box">
+              <div class="placeholder">Loading parameters...</div>
+            </div>
+          </div>
+          <div class="live-strat-actions">
+            <button type="button" class="btn btn-apply-strat" id="btn-apply-live-strategy">Apply Changes</button>
+            <span class="strat-update-msg" id="live-strat-update-msg"></span>
+          </div>
         </div>
       </section>
 
@@ -141,7 +279,7 @@
             <div class="card chart-card sim-chart-card">
               <div class="card-bar">
                 <div class="card-title-group">
-                  <span class="card-title">SIM 1.0 Model Probability</span>
+                  <span class="card-title" id="sim-card-title">SIM 1.1 Model Probability</span>
                   <span class="card-subtitle">Real-time P(Up) per second · Causal TCN</span>
                 </div>
                 <div class="card-meta card-meta-split">
@@ -152,6 +290,23 @@
               </div>
               <div class="chart-area">
                 <canvas id="sim-chart"></canvas>
+              </div>
+            </div>
+
+            <div class="card chart-card equity-chart-card">
+              <div class="card-bar">
+                <div class="card-title-group">
+                  <span class="card-title">Equity curve</span>
+                  <span class="card-subtitle">Live account balance over time</span>
+                </div>
+                <div class="card-meta card-meta-split">
+                  <span id="equity-chart-meta">Waiting for balance data</span>
+                  <span class="meta-sep">·</span>
+                  <span id="equity-trades-count" class="trades-count-badge">0 trades</span>
+                </div>
+              </div>
+              <div class="chart-area">
+                <canvas id="equity-grid-chart"></canvas>
               </div>
             </div>
           </div>
@@ -189,13 +344,13 @@
             </div>
             <div class="tape-head">
               <span>Time</span>
+              <span>Result</span>
               <span>Side</span>
-              <span>Outcome</span>
-              <span>Price</span>
-              <span>Size</span>
+              <span>Entry / Stake</span>
+              <span>PnL</span>
             </div>
             <div class="tape-body" id="trade-tape">
-              <div class="placeholder">No trades yet</div>
+              <div class="placeholder">Waiting for first trade…</div>
             </div>
           </div>
 
@@ -208,31 +363,26 @@
             </div>
 
             <div class="info-body" id="info-wallet">
-              <div class="wallet-hero">
-                <div class="wallet-balance-block">
-                  <span class="wallet-label" id="wallet-balance-label">Paper equity</span>
-                  <span class="wallet-balance" id="wallet-balance">—</span>
+              <div class="wallet-identity">
+                <div class="wallet-id-row">
+                  <span class="field-label">Funder</span>
+                  <span class="field-value mono" id="wallet-funder">—</span>
+                  <button type="button" class="btn-copy" data-copy="wallet-funder">Copy</button>
+                  <a class="btn-link hidden" id="wallet-funder-link" target="_blank" rel="noopener">Scan</a>
                 </div>
-                <span class="wallet-pill" id="wallet-status">—</span>
-              </div>
-              <div class="equity-chart-section">
-                <div class="equity-chart-head">
-                  <div class="equity-title-group">
-                    <span>Equity curve</span>
-                    <span class="trades-count-badge" id="equity-trades-count">0 trades</span>
-                  </div>
-                  <div class="equity-controls">
-                    <button type="button" class="eq-btn" id="eq-zoom-in" title="Zoom in (+)">+</button>
-                    <button type="button" class="eq-btn" id="eq-zoom-out" title="Zoom out (-)">−</button>
-                    <button type="button" class="eq-btn eq-btn-reset" id="eq-zoom-reset" title="Reset view (Fit all)">⟲ Reset</button>
-                    <span id="equity-chart-meta">Waiting for balance data</span>
-                  </div>
+                <div class="wallet-id-row">
+                  <span class="field-label">Signer</span>
+                  <span class="field-value mono" id="wallet-signer">—</span>
+                  <button type="button" class="btn-copy" data-copy="wallet-signer">Copy</button>
+                  <a class="btn-link hidden" id="wallet-signer-link" target="_blank" rel="noopener">Scan</a>
                 </div>
-                <div class="equity-chart-area" id="equity-chart-container">
-                  <canvas id="live-equity-chart"></canvas>
-                  <div class="eq-tooltip hidden" id="equity-tooltip"></div>
+                <div class="wallet-id-row">
+                  <span class="field-label">Gas payer</span>
+                  <span class="field-value mono" id="wallet-gas-addr">—</span>
                 </div>
               </div>
+              <div class="wallet-issues hidden" id="wallet-issues"></div>
+              <p class="wallet-note">Uses PRIVATE_KEY + FUNDER_ADDRESS on the server. Keys never leave the host.</p>
               <div class="wallet-grid">
                 <div class="wallet-field">
                   <span class="field-label">Strategy</span>
@@ -243,48 +393,30 @@
                   <span class="field-value mono" id="wallet-threshold">—</span>
                 </div>
                 <div class="wallet-field">
-                  <span class="field-label">Funder</span>
-                  <span class="field-value mono" id="wallet-funder">—</span>
-                </div>
-                <div class="wallet-field">
-                  <span class="field-label">Signer</span>
-                  <span class="field-value mono" id="wallet-signer">—</span>
-                </div>
-                <div class="wallet-field">
                   <span class="field-label">Signature</span>
                   <span class="field-value" id="wallet-type">—</span>
                 </div>
                 <div class="wallet-field">
-                  <span class="field-label">Mode</span>
-                  <span class="field-value" id="wallet-mode">—</span>
+                  <span class="field-label">Allowance</span>
+                  <span class="field-value mono" id="wallet-allowance">—</span>
+                </div>
+                <div class="wallet-field">
+                  <span class="field-label">Reserved</span>
+                  <span class="field-value mono" id="wallet-reserved">—</span>
                 </div>
               </div>
-              <div class="wallet-actions">
-                <button type="button" class="btn btn-reset-small" id="btn-reset-info">↺ Reset Account ($100)</button>
+              <div class="inv-section">
+                <div class="strat-trades-head">Open orders</div>
+                <div id="wallet-orders" class="inv-list">
+                  <div class="placeholder">No open orders</div>
+                </div>
+                <div class="strat-trades-head">Positions</div>
+                <div id="wallet-positions" class="inv-list">
+                  <div class="placeholder">No positions</div>
+                </div>
               </div>
               <div class="wallet-tips hidden" id="wallet-tips"></div>
               <div class="strat-params-section">
-                <div class="strat-params-head">
-                  <span>Trading Model &amp; Parameters</span>
-                  <span class="strat-params-name" id="strat-params-name">—</span>
-                </div>
-                <div class="live-strat-control">
-                  <div class="live-strat-select-group">
-                    <label for="live-strategy-select" class="live-strat-label">Active Trading Model</label>
-                    <select id="live-strategy-select" class="live-strat-select"></select>
-                  </div>
-                  <p class="live-strat-desc" id="live-strategy-desc">—</p>
-                  <div class="live-params-wrapper">
-                    <span class="live-params-title">Custom Parameters</span>
-                    <div id="live-params-box" class="live-params-box">
-                      <div class="placeholder">Loading parameters…</div>
-                    </div>
-                  </div>
-                  <div class="live-strat-actions">
-                    <button type="button" class="btn btn-apply-strat" id="btn-apply-live-strategy">Apply Changes</button>
-                    <span class="strat-update-msg" id="live-strat-update-msg"></span>
-                  </div>
-                </div>
                 <div class="strat-params-grid hidden" id="strat-params-grid"></div>
               </div>
               <div class="strat-trades-head">Strategy trades</div>
@@ -308,65 +440,129 @@
     <div class="view view-backtest" id="view-backtest" data-view="backtest" hidden>
 
       <section class="controls">
-        <div class="field">
-          <label for="strategy-select">Strategy</label>
-          <select id="strategy-select"></select>
-          <p class="hint" id="strategy-desc">—</p>
-        </div>
-        <div class="field">
-          <label for="asset-select">Asset</label>
-          <select id="asset-select">
-            <option value="btc" selected>BTC</option>
-            <option value="eth">ETH</option>
-            <option value="sol">SOL</option>
-            <option value="xrp">XRP</option>
-          </select>
-        </div>
-        <div class="field date-range-field">
-          <label>Backtest period (UTC)</label>
-          <div class="date-inputs">
-            <input id="start-date" type="datetime-local" step="60" aria-label="Backtest start time in UTC" />
-            <span>to</span>
-            <input id="end-date" type="datetime-local" step="60" aria-label="Backtest end time in UTC" />
+        <div class="ctrl-card ctrl-card-model">
+          <div class="ctrl-card-head">
+            <span class="ctrl-card-title">Strategy &amp; Model</span>
           </div>
-          <div class="date-actions">
-            <button class="period-btn" type="button" data-days="1">1D</button>
-            <button class="period-btn" type="button" data-days="7">7D</button>
-            <button class="period-btn" type="button" data-days="30">30D</button>
-            <button class="period-btn" id="all-history-btn" type="button">All available</button>
+          <div class="ctrl-card-body">
+            <div class="ctrl-row">
+              <div class="field strategy-field">
+                <label for="strategy-select">Trading Model</label>
+                <select id="strategy-select"></select>
+              </div>
+              <div class="field asset-field">
+                <label for="asset-select">Asset</label>
+                <select id="asset-select">
+                  <option value="btc" selected>BTC</option>
+                  <option value="eth">ETH</option>
+                  <option value="sol">SOL</option>
+                  <option value="xrp">XRP</option>
+                </select>
+              </div>
+            </div>
+            <p class="hint strategy-hint" id="strategy-desc">-</p>
+            <div class="field params-field">
+              <label>Custom Strategy Parameters</label>
+              <div id="params-box" class="params-box"></div>
+            </div>
           </div>
-          <p class="hint" id="date-range-hint">Choose exact UTC dates and times from Polymarket's retained 5-minute history.</p>
-          <p class="candle-estimate" id="candle-estimate">Select a range to estimate candles.</p>
         </div>
-        <div class="field capital-field">
-          <label for="initial-capital">Starting capital ($)</label>
-          <input id="initial-capital" type="number" min="1" step="1" value="100" />
-          <p class="hint">Your simulated bankroll at the start of this period.</p>
+
+        <div class="ctrl-card ctrl-card-period">
+          <div class="ctrl-card-head">
+            <span class="ctrl-card-title">Time Horizon (UTC)</span>
+          </div>
+          <div class="ctrl-card-body">
+            <div class="field date-range-field">
+              <label>Backtest Period</label>
+              <div class="date-inputs">
+                <div class="date-input-group">
+                  <span class="date-input-label">From</span>
+                  <input id="start-date" type="datetime-local" step="60" aria-label="Backtest start time in UTC" />
+                </div>
+                <div class="date-input-group">
+                  <span class="date-input-label">To</span>
+                  <input id="end-date" type="datetime-local" step="60" aria-label="Backtest end time in UTC" />
+                </div>
+              </div>
+              <div class="date-actions">
+                <button class="period-btn" type="button" data-days="1">1D</button>
+                <button class="period-btn" type="button" data-days="7">7D</button>
+                <button class="period-btn" type="button" data-days="30">30D</button>
+                <button class="period-btn" id="all-history-btn" type="button">All history</button>
+              </div>
+              <p class="hint" id="date-range-hint">Choose UTC dates and times from retained market history.</p>
+              <p class="candle-estimate" id="candle-estimate">Select a range to estimate candles.</p>
+            </div>
+          </div>
         </div>
-        <div class="field params-field">
-          <label>Strategy params</label>
-          <div id="params-box" class="params-box"></div>
+
+        <div class="ctrl-card ctrl-card-risk">
+          <div class="ctrl-card-head">
+            <span class="ctrl-card-title">Capital &amp; Execution</span>
+          </div>
+          <div class="ctrl-card-body">
+            <div class="field capital-field">
+              <label for="initial-capital">Starting Capital ($)</label>
+              <input id="initial-capital" type="number" min="1" step="1" value="100" />
+              <p class="hint">Simulated initial bankroll.</p>
+            </div>
+            <p class="hint">Sizing, fees, and fills mirror the live bot (fixed USD or % of balance from <code>.env</code>, plus taker fees and real fill risk).</p>
+          </div>
         </div>
       </section>
 
       <section class="stats-grid" id="stats-grid">
-        <div class="stat"><span class="lbl">Ending balance</span><span class="val" id="stat-ending">—</span></div>
-        <div class="stat"><span class="lbl">Total return</span><span class="val" id="stat-return">—</span></div>
-        <div class="stat"><span class="lbl">Win rate</span><span class="val" id="stat-winrate">—</span></div>
-        <div class="stat"><span class="lbl">Trades</span><span class="val" id="stat-trades">—</span></div>
-        <div class="stat"><span class="lbl">W / L</span><span class="val" id="stat-wl">—</span></div>
-        <div class="stat"><span class="lbl">Max drawdown</span><span class="val" id="stat-dd">—</span></div>
-        <div class="stat"><span class="lbl">Profit factor</span><span class="val" id="stat-pf">—</span></div>
-        <div class="stat"><span class="lbl">Avg win / loss</span><span class="val" id="stat-avg">—</span></div>
+        <div class="stat">
+          <span class="lbl">Ending balance</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-ending">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Total return</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-return">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Win rate</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-winrate">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Trades</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-trades">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">W / L</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-wl">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Max drawdown</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-dd">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Profit factor</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-pf">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Avg win / loss</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-avg">-</span></div></div>
+        </div>
+        <div class="stat">
+          <span class="lbl">Fill rate</span>
+          <div class="stat-dual"><div class="stat-col"><span class="val" id="stat-fill">-</span></div></div>
+        </div>
       </section>
 
       <section class="panel bt-panel">
         <div class="panel-head">
           <span class="panel-title">Equity curve</span>
-          <span class="panel-meta" id="run-meta">—</span>
+          <span class="eq-legend" aria-hidden="true">
+            <span class="eq-leg paper">Equity (realistic fills)</span>
+          </span>
+          <span class="panel-meta" id="run-meta">-</span>
         </div>
-        <div class="chart-wrap">
+        <p class="eq-hint" id="eq-hint">Every signal places a live-style limit buy on Predict.fun. Only fills confirmed by real trade prints count; taker fees, the $0.01 tick, the 10s-to-close guard, and the minimum stake all apply.</p>
+        <div class="chart-wrap" id="bt-equity-wrap">
           <canvas id="bt-equity-chart"></canvas>
+          <div class="bt-eq-tooltip hidden" id="bt-equity-tooltip"></div>
         </div>
       </section>
 
@@ -375,11 +571,13 @@
           <span class="panel-title">Trade log</span>
           <span class="panel-meta" id="trade-count">0 trades</span>
         </div>
-        <div class="trade-head">
-          <span>Candle</span><span>Side</span><span>Entry</span><span>SIM Prob</span><span>Size</span><span>Stake</span><span>Result</span><span>PnL</span><span>Equity</span>
-        </div>
-        <div class="trade-body" id="trade-body">
-          <div class="placeholder">Run a backtest to see trades</div>
+        <div class="trade-table-wrap">
+          <div class="trade-head">
+            <span>Candle</span><span>Side</span><span>Entry</span><span>SIM Prob</span><span>Size</span><span>Stake</span><span>Result</span><span>Fill</span><span>PnL</span><span>Equity</span>
+          </div>
+          <div class="trade-body" id="trade-body">
+            <div class="placeholder">Run a backtest to see trades</div>
+          </div>
         </div>
       </section>
     </div>
@@ -390,22 +588,22 @@
   <div id="sim-tooltip-card" class="sim-tooltip-card hidden">
     <div class="sim-tooltip-header">
       <div class="sim-tooltip-title-group">
-        <span class="sim-tooltip-title" id="sim-tt-title">SIM 1.0 Probability Lifetime</span>
+        <span class="sim-tooltip-title" id="sim-tt-title">SIM Probability Lifetime</span>
         <span class="sim-tooltip-sub" id="sim-tt-sub">Second-by-second trade trajectory</span>
       </div>
-      <span class="sim-tooltip-badge" id="sim-tt-entry-prob">—</span>
+      <span class="sim-tooltip-badge" id="sim-tt-entry-prob">-</span>
     </div>
     <div class="sim-tooltip-chart-wrap">
       <canvas id="sim-tooltip-canvas"></canvas>
     </div>
     <div class="sim-tooltip-footer">
-      <span id="sim-tt-meta">—</span>
+      <span id="sim-tt-meta">-</span>
     </div>
   </div>
 
-  <script src="/static/lightweight-charts.js?v=35"></script>
-  <script src="/static/live.js?v=35"></script>
-  <script src="/static/backtest.js?v=35"></script>
-  <script src="/static/shell.js?v=35"></script>
+  <script src="/static/lightweight-charts.js?v=40"></script>
+  <script src="/static/live.js?v=42"></script>
+  <script src="/static/backtest.js?v=40"></script>
+  <script src="/static/shell.js?v=40"></script>
 </body>
 </html>

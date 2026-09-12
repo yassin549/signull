@@ -40,9 +40,14 @@
       <div class="field date-range-field">
         <label>Backtest period (UTC)</label>
         <div class="date-inputs">
-          <input id="start-date" type="datetime-local" step="60" aria-label="Backtest start time in UTC" />
-          <span>to</span>
-          <input id="end-date" type="datetime-local" step="60" aria-label="Backtest end time in UTC" />
+          <div class="date-input-group">
+            <span class="date-input-label">From</span>
+            <input id="start-date" type="datetime-local" step="60" aria-label="Backtest start time in UTC" />
+          </div>
+          <div class="date-input-group">
+            <span class="date-input-label">To</span>
+            <input id="end-date" type="datetime-local" step="60" aria-label="Backtest end time in UTC" />
+          </div>
         </div>
         <div class="date-actions">
           <button class="period-btn" type="button" data-days="1">1D</button>
@@ -57,6 +62,23 @@
         <label for="initial-capital">Starting capital ($)</label>
         <input id="initial-capital" type="number" min="1" step="1" value="100" />
         <p class="hint">Your simulated bankroll at the start of this period.</p>
+      </div>
+      <div class="field risk-type-field">
+        <label for="risk-type-select">Risk Mode</label>
+        <select id="risk-type-select">
+          <option value="fixed_dollar" selected>Fixed Dollar Amount ($)</option>
+          <option value="percent_balance">% of Account Balance</option>
+        </select>
+        <p class="hint" id="risk-type-hint">Fixed USD amount per trade.</p>
+      </div>
+      <div class="field risk-value-field">
+        <label for="risk-value" id="risk-value-label">Fixed Amount ($)</label>
+        <div class="input-with-unit has-prefix" id="risk-value-wrap">
+          <span class="unit-prefix" id="risk-unit-prefix">$</span>
+          <input id="risk-value" type="number" min="0.1" step="1" value="1" placeholder="1" />
+          <span class="unit-suffix hidden" id="risk-unit-suffix" style="display: none;">%</span>
+        </div>
+        <p class="hint" id="risk-value-hint">Fixed USD amount risked per trade.</p>
       </div>
       <div class="field params-field">
         <label>Strategy params</label>
@@ -80,8 +102,9 @@
         <span class="panel-title">Equity curve</span>
         <span class="panel-meta" id="run-meta">—</span>
       </div>
-      <div class="chart-wrap">
+      <div class="chart-wrap" id="equity-wrap">
         <canvas id="equity-chart"></canvas>
+        <div class="bt-eq-tooltip hidden" id="equity-tooltip"></div>
       </div>
     </section>
 
@@ -90,14 +113,34 @@
         <span class="panel-title">Trade log</span>
         <span class="panel-meta" id="trade-count">0 trades</span>
       </div>
-      <div class="trade-head">
-        <span>Candle</span><span>Side</span><span>Entry</span><span>Size</span><span>Stake</span><span>Result</span><span>PnL</span><span>Equity</span>
-      </div>
-      <div class="trade-body" id="trade-body">
-        <div class="placeholder">Run a backtest to see trades</div>
+      <div class="trade-table-wrap">
+        <div class="trade-head">
+          <span>Candle</span><span>Side</span><span>Entry</span><span>SIM Prob</span><span>Size</span><span>Stake</span><span>Result</span><span>PnL</span><span>Equity</span>
+        </div>
+        <div class="trade-body" id="trade-body">
+          <div class="placeholder">Run a backtest to see trades</div>
+        </div>
       </div>
     </section>
   </div>
+
+  <!-- Floating hover tooltip/card for SIM lifetime probability chart in trade log -->
+  <div id="sim-tooltip-card" class="sim-tooltip-card hidden">
+    <div class="sim-tooltip-header">
+      <div class="sim-tooltip-title-group">
+        <span class="sim-tooltip-title" id="sim-tt-title">SIM Probability Lifetime</span>
+        <span class="sim-tooltip-sub" id="sim-tt-sub">Second-by-second trade trajectory</span>
+      </div>
+      <span class="sim-tooltip-badge" id="sim-tt-entry-prob">—</span>
+    </div>
+    <div class="sim-tooltip-chart-wrap">
+      <canvas id="sim-tooltip-canvas"></canvas>
+    </div>
+    <div class="sim-tooltip-footer">
+      <span id="sim-tt-meta">—</span>
+    </div>
+  </div>
+
   <script src="/static/app.js?v=10"></script>
 </body>
 </html>

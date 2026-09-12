@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from src.backtest.data import fetch_candles, first_available_start, prefetch_progress
 from src.backtest.engine import run_backtest
 from src.backtest.registry import get_strategy, list_strategies
-from src.config import SERIES_SLUGS
+from src.config import SERIES_SLUGS, BotConfig
 
 # Unified UI lives under dashboard/; backtest_dashboard/ is legacy-only.
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
@@ -39,6 +39,25 @@ class BacktestRequest(BaseModel):
     initial_capital: float = Field(default=100.0, gt=0)
     params: dict | None = None
     use_cache: bool = True
+
+
+def _live_execution_config() -> dict:
+    """Execution parameters mirrored from the running/live bot config."""
+    try:
+        config = BotConfig.from_env()
+        return {
+            "use_fixed_stake": config.use_fixed_stake,
+            "fixed_stake_usdc": config.fixed_stake_usdc,
+            "taker_fee_rate": config.taker_fee_rate,
+            "maker_fee_rate": config.maker_fee_rate,
+        }
+    except Exception:
+        return {
+            "use_fixed_stake": False,
+            "fixed_stake_usdc": 1.0,
+            "taker_fee_rate": 0.02,
+            "maker_fee_rate": 0.0,
+        }
 
 
 def _run_backtest(
@@ -73,8 +92,14 @@ def _run_backtest(
     )
     if not candles:
         raise LookupError("No resolved candles found for backtest")
+    exec_cfg = _live_execution_config()
     result = run_backtest(
         strategy, candles, initial_capital=req.initial_capital,
+        asset=req.asset,
+        use_fixed_stake=exec_cfg["use_fixed_stake"],
+        fixed_stake_usdc=exec_cfg["fixed_stake_usdc"],
+        taker_fee_rate=exec_cfg["taker_fee_rate"],
+        maker_fee_rate=exec_cfg["maker_fee_rate"],
         progress_callback=progress_callback,
     ).to_dict()
     # A requested period can contain gaps when a historical event is unavailable,

@@ -8,6 +8,17 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+# Failed CLOB/RPC reads send nulls; keep the last good figure on the dashboard.
+_KEEP_ACCOUNT_IF_NONE = frozenset({
+    "balance_usdc",
+    "balance_usdt",
+    "gas_pol",
+    "gas_bnb",
+    "onchain_usdc",
+    "onchain_usdt",
+    "available_usdc",
+})
+
 
 @dataclass
 class ActivityEntry:
@@ -46,6 +57,7 @@ class BotSnapshot:
     # Signull 1.0 strategy status (paper + live)
     strategy: dict[str, Any] | None = None
     strategy_trades: list[dict[str, Any]] = field(default_factory=list)
+    health: dict[str, Any] = field(default_factory=dict)
 
 
 def slice_history_tail(history: list | deque, history_points: int) -> list:
@@ -91,6 +103,14 @@ class BotState:
         self._beat_candle_start: int | None = None  # beat locked to this window
         # Closed-candle beat/oracle keyed by candle start_ts (survives clear).
         self._frozen_resolution_refs: dict[int, dict[str, float | None]] = {}
+        self._candle_seq: int = 0
+
+        # Track last update time for account fields to expire stale values
+        self._account_field_timestamps: dict[str, float] = {}
+
+    def has_trade_for_slug(self, slug: str) -> bool:
+        with self._lock:
+            return any(t.get("slug") == slug for t in self._snapshot.strategy_trades)
 
     def request_bot_stop(self) -> None:
         self._bot_stop.set()
@@ -194,6 +214,41 @@ class BotState:
         with self._lock:
             current = getattr(self._snapshot, field_name, 0)
             setattr(self._snapshot, field_name, current + amount)
+            self._bump()
+
+    def get_account(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._snapshot.account) if self._snapshot.account else None
+
+    def merge_account(self, patch: dict[str, Any]) -> None:
+        """Shallow-merge wallet/paper fields without wiping the other owner."""
+        if not patch:
+            return
+        now = time.time()
+        stale_threshold = patch.pop("_stale_threshold_sec", 60.0)
+        with self._lock:
+            acc = dict(self._snapshot.account or {})
+            for key, value in patch.items():
+                # A failed verify/poll must not zero a previously good CLOB
+                # snapshot (JSON null overwrites the last live USDC figure).
+                if (
+                    value is None
+                    and key in _KEEP_ACCOUNT_IF_NONE
+                    and acc.get(key) is not None
+                ):
+                    # Check if stale (> threshold since last good update)
+                    last_update = self._account_field_timestamps.get(key, 0)
+                    if now - last_update > stale_threshold:
+                        acc[key] = None
+                        acc[f"{key}_stale"] = True
+                    else:
+                        continue
+                else:
+                    if value is not None:
+                        self._account_field_timestamps[key] = now
+                acc[key] = value
+            self._snapshot.account = acc
+            self._append_equity_from_account_locked(acc)
             self._bump()
 
     def get_live_prices(self) -> dict[str, float] | None:
@@ -453,6 +508,96 @@ class BotState:
             self._bump()
             return True
 
+    def backfill_btc_history(
+        self,
+        candle_start_ts: int,
+        price_to_beat: float,
+        history_points: list[dict[str, Any]],
+    ) -> None:
+        """Backfill historical BTC prices for a candle window starting at candle_start_ts."""
+        cs = int(candle_start_ts)
+        beat = float(price_to_beat)
+        now = time.time()
+
+        with self._lock:
+            self._price_to_beat = beat
+            self._beat_candle_start = cs
+            btc = dict(self._snapshot.btc or {})
+            btc.pop("beat_estimated", None)
+            btc["price_to_beat"] = beat
+            self._snapshot.btc = btc
+
+            existing = {
+                round(float(p["t"]), 2): dict(p)
+                for p in self._btc_history
+                if p.get("t") is not None
+            }
+
+            for pt in history_points:
+                t = float(pt.get("t", 0.0))
+                v = pt.get("v")
+                if t < cs or t > now or v is None:
+                    continue
+                v_val = float(v)
+                t_key = round(t, 2)
+                if t_key not in existing:
+                    d_val = round(v_val - beat, 2)
+                    p_dict: dict[str, Any] = {
+                        "t": t,
+                        "v": round(v_val, 2),
+                        "d": d_val,
+                        "cs": cs,
+                    }
+                    existing[t_key] = p_dict
+
+                    sim_p = self._compute_sim_prob_locked(t, v_val)
+                    if sim_p is not None:
+                        sim_pt = {
+                            "t": t,
+                            "v": round(float(sim_p), 4),
+                            "cs": cs,
+                        }
+                        self._sim_history.append(sim_pt)
+
+            sorted_pts = sorted(existing.values(), key=lambda p: float(p["t"]))
+            self._btc_history.clear()
+            for p in sorted_pts:
+                self._btc_history.append(p)
+
+            if self._sim_history:
+                sim_sorted = sorted(
+                    list(self._sim_history), key=lambda p: float(p["t"])
+                )
+                self._sim_history.clear()
+                for p in sim_sorted:
+                    self._sim_history.append(p)
+
+            self._sync_btc_locked()
+            self._bump()
+
+    def backfill_price_history(self, history_points: list[dict[str, Any]]) -> None:
+        """Backfill historical outcome token prices (Up/Down odds) into _price_history."""
+        if not history_points:
+            return
+        with self._lock:
+            existing = {
+                round(float(p["t"]), 2): dict(p)
+                for p in self._price_history
+                if p.get("t") is not None
+            }
+            for pt in history_points:
+                t = float(pt.get("t", 0.0))
+                if t <= 0:
+                    continue
+                t_key = round(t, 2)
+                if t_key not in existing:
+                    existing[t_key] = dict(pt)
+            sorted_pts = sorted(existing.values(), key=lambda p: float(p["t"]))
+            self._price_history.clear()
+            for p in sorted_pts:
+                self._price_history.append(p)
+            self._bump()
+
     def set_btc_feed_status(self, connected: bool, error: str | None = None) -> None:
         with self._lock:
             self._sync_btc_locked(connected=connected, error=error)
@@ -482,10 +627,26 @@ class BotState:
             pass
 
         import numpy as np
+        from scipy.special import erf
+
         log_ret = np.log(spot / beat)
-        rem_frac = (300 - elapsed) / 300.0
-        denom = max(1e-5, np.sqrt(rem_frac + 0.005) * 0.0025)
-        raw_prob = 1.0 / (1.0 + np.exp(-log_ret / denom))
+        vol_scale = 0.00003  # default per-second std (~0.003% / sec)
+        if hasattr(self, "_btc_history") and len(self._btc_history) >= 4:
+            pts = [p for p in self._btc_history if (now - p["t"]) <= 60.0 and p.get("v") and p["v"] > 0]
+            if len(pts) >= 4:
+                pxs = np.array([p["v"] for p in pts], dtype=np.float64)
+                dts = np.diff([p["t"] for p in pts])
+                dts = np.where(dts > 0.001, dts, 0.05)
+                log_rets = np.log(pxs[1:] / pxs[:-1])
+                per_sec_rets = log_rets / np.sqrt(dts)
+                rvol = float(np.std(per_sec_rets))
+                if np.isfinite(rvol) and rvol > 1e-6:
+                    vol_scale = max(1e-6, min(0.001, rvol))
+
+        rem_seconds = max(1.0, float(300 - elapsed))
+        rem_std = vol_scale * np.sqrt(rem_seconds)
+        z_score = float(np.clip(log_ret / rem_std, -10.0, 10.0))
+        raw_prob = float(0.5 * (1.0 + erf(z_score / np.sqrt(2.0))))
         return float(np.clip(raw_prob, 0.001, 0.999))
 
     def _append_sim_history_locked(self, now: float, prob: float) -> bool:
@@ -715,6 +876,7 @@ class BotState:
             self._last_sim_append = 0.0
             self._price_to_beat = None
             self._beat_candle_start = None
+            self._candle_seq += 1
             # Keep last Binance/Chainlink ticks so the chart can reseed the
             # moment a new beat is set (instead of waiting for the next WS tick).
             self._sync_btc_locked()
@@ -728,6 +890,17 @@ class BotState:
         if self._beat_candle_start is not None:
             return int(self._beat_candle_start)
         return None
+
+    def _price_history_for_dashboard(self, history_points: int) -> list[dict]:
+        candle_start = self._active_btc_candle_start()
+        points = list(self._price_history)
+        if candle_start is not None:
+            points = [
+                p
+                for p in points
+                if float(p.get("t", 0)) >= candle_start - 1
+            ]
+        return slice_history_tail(points, history_points)
 
     def _btc_history_for_dashboard(self, history_points: int) -> list[dict]:
         candle_start = self._active_btc_candle_start()
@@ -757,11 +930,11 @@ class BotState:
         with self._lock:
             data = asdict(self._snapshot)
             data["activity"] = [e.to_dict() for e in list(self._log)]
-            data["price_history"] = slice_history_tail(self._price_history, history_points)
+            data["price_history"] = self._price_history_for_dashboard(history_points)
             data["btc_history"] = self._btc_history_for_dashboard(history_points)
             data["sim_history"] = self._sim_history_for_dashboard(history_points)
             data["btc_candle_start_ts"] = self._active_btc_candle_start()
-            data["equity_history"] = list(self._equity_history)
+            data["candle_seq"] = self._candle_seq
+            data["equity_history"] = list(self._equity_history)[-3000:]
             data["version"] = self._version
             return data
-

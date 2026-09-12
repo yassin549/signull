@@ -1,4 +1,15 @@
-"""Fast reusable backtest engine — strategy-agnostic simulation loop."""
+"""Strategy-agnostic backtest engine that mirrors the live Predict.fun bot.
+
+There is a single equity book, and it is the *realistic* one:
+
+* Real trade prints (Predict.fun match tape) drive strategy evaluation.
+* Binance 1-second spot (with the candle-open "price to beat") drives the
+  same ±$ signal the live bot uses.
+* A signal places a live-style limit buy at the signal price.  The order only
+  becomes a trade if a later real print trades at or through the limit.
+* Taker fees, the $0.01 tick rounding, the 10s-to-close guard, the minimum
+  stake, and live stake sizing (fixed USD or % via ``src.sizing``) all apply.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +17,19 @@ import time
 from typing import Any, Callable
 
 from strategies.base import CandleContext, Strategy, TickContext, TradeSignal
-from src.sizing import cap_stake_for_taker_fee, estimate_taker_fee
+from src.sizing import (
+    cap_stake_for_taker_fee,
+    compute_stake,
+    estimate_taker_fee,
+)
 
+from .btc import BtcSeries
+from .fills import simulate_live_limit_buy
 from .metrics import compute_metrics
 from .types import BacktestResult, CandleDataset, TradeRecord
+
+LATE_CANDLE_SEC = 10.0
+MIN_STAKE = 0.01
 
 
 def _settle_trade(
@@ -32,28 +52,36 @@ def run_backtest(
     candles: list[CandleDataset],
     *,
     initial_capital: float = 100.0,
-    min_stake: float = 0.01,
+    use_fixed_stake: bool = False,
+    fixed_stake_usdc: float = 1.0,
+    taker_fee_rate: float = 0.02,
+    maker_fee_rate: float = 0.0,
+    asset: str = "btc",
+    btc_series: BtcSeries | None = None,
+    load_btc: bool = True,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> BacktestResult:
-    """
-    Simulate *strategy* across resolved candles.
-    """
+    """Simulate *strategy* across resolved candles with live execution."""
     if hasattr(strategy, "prepare_backtest"):
         try:
             strategy.prepare_backtest(candles, progress_callback=progress_callback)  # type: ignore[attr-defined]
         except TypeError:
             strategy.prepare_backtest(candles)  # type: ignore[attr-defined]
 
+    if btc_series is None and load_btc and candles and candles[0].start_ts > 1_500_000_000:
+        btc_series = _load_btc_series(candles, progress_callback)
+
     t0 = time.perf_counter()
     capital = float(initial_capital)
     peak = capital
     max_drawdown = 0.0
     trades: list[TradeRecord] = []
-    equity_curve: list[dict[str, float]] = [{"idx": 0, "equity": capital}]
+    equity_curve: list[dict[str, Any]] = [{"idx": 0, "equity": capital}]
     recent_outcomes: list[bool] = []
     wins_streak = 0
     losses_streak = 0
     equity_hist: list[float] = [capital]
+    fetch_failures = 0
 
     sim_store = getattr(strategy, "prob_store", None) or getattr(strategy, "sim_store", None)
     if sim_store is None:
@@ -66,7 +94,7 @@ def run_backtest(
     def report(candle_idx: int, trade: TradeRecord | None = None) -> None:
         if progress_callback is None:
             return
-        payload = {
+        payload: dict[str, Any] = {
             "type": "progress",
             "phase": "backtesting",
             "candles_completed": candle_idx,
@@ -79,7 +107,7 @@ def run_backtest(
         progress_callback(payload)
 
     for candle_idx, candle in enumerate(candles, start=1):
-        if capital < min_stake:
+        if capital < MIN_STAKE:
             break
 
         wins_recent = sum(recent_outcomes)
@@ -101,6 +129,7 @@ def run_backtest(
             end_ts=candle.end_ts,
             winner=candle.winner,
         )
+        beat = btc_series.open_at(candle.start_ts) if btc_series is not None else None
 
         entered = False
         signal: TradeSignal | None = None
@@ -114,6 +143,8 @@ def run_backtest(
                 down=down_p,
                 seconds_into_candle=max(0.0, tick_t - candle.start_ts),
                 seconds_to_close=max(0.0, candle.end_ts - tick_t),
+                btc_price=btc_series.price_at(tick_t) if btc_series is not None else None,
+                btc_price_to_beat=beat,
             )
             signal = strategy.evaluate(tick, ctx, entered=entered)
             if signal is not None:
@@ -127,38 +158,89 @@ def run_backtest(
             report(candle_idx)
             continue
 
-        risk_frac = strategy.position_risk_fraction(signal, entry_tick, ctx)
-        entry_price = max(0.01, min(0.99, signal.price))
-        fee_rate = max(0.0, float(signal.taker_fee_rate))
-        desired_stake = min(initial_capital * risk_frac, capital)
-        stake = cap_stake_for_taker_fee(
-            desired_stake, entry_price, fee_rate, capital
-        )
-        if stake < min_stake:
+        entry_price = round(max(0.01, min(0.99, float(signal.price))), 2)
+        signal.price = entry_price
+        fee_rate = float(taker_fee_rate)
+
+        # --- live entry guards -------------------------------------------------
+        fill = None
+        reason_label = ""
+        risk_frac = 0.0
+        size_label = ""
+        if entry_tick.seconds_to_close < LATE_CANDLE_SEC:
+            reason_label = "late_candle"
+        else:
+            if use_fixed_stake:
+                risk_frac = 0.0
+                size_label = f"${fixed_stake_usdc:.2f} fixed"
+                stake = compute_stake(
+                    0.0, initial_capital, capital, fixed_stake=fixed_stake_usdc,
+                )
+            else:
+                risk_frac = strategy.position_risk_fraction(signal, entry_tick, ctx)
+                size_label = strategy.size_label(risk_frac) if hasattr(strategy, "size_label") else ""
+                stake = compute_stake(risk_frac, initial_capital, capital)
+
+            stake = cap_stake_for_taker_fee(stake, entry_price, fee_rate, capital)
+            if stake < MIN_STAKE:
+                reason_label = "stake_too_small"
+            else:
+                fill = simulate_live_limit_buy(
+                    side=signal.side,
+                    limit_price=entry_price,
+                    entry_ts=entry_ts,
+                    seconds_to_close=entry_tick.seconds_to_close,
+                    ticks=candle.ticks,
+                    end_ts=candle.end_ts,
+                )
+                reason_label = fill.reason
+
+        filled = fill is not None and fill.filled
+        if not filled:
+            entry_fee = 0.0
+            shares = 0.0
+            pnl = 0.0
+            won = False
+            trade = TradeRecord(
+                candle_slug=candle.slug,
+                candle_title=candle.title,
+                side=signal.side,
+                entry_price=round(entry_price, 4),
+                stake=0.0,
+                shares=0.0,
+                winner=candle.winner,
+                won=False,
+                pnl=0.0,
+                equity_after=round(capital, 4),
+                entry_ts=entry_ts,
+                reason=(
+                    f"{signal.reason} · limit @ {entry_price:.2f} unfilled ({reason_label})"
+                ),
+                risk_pct=0.0,
+                size_label=size_label,
+                entry_fee=0.0,
+                filled=False,
+                fill_reason=reason_label,
+                limit_price=round(entry_price, 4),
+                synthetic=candle.synthetic,
+            )
+            _attach_sim_probs(trade, candle, entry_ts, entry_tick, sim_store)
+            trades.append(trade)
             strategy.on_signal_resolved(signal.side == candle.winner, traded=False)
-            equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
-            report(candle_idx)
+            equity_curve.append({"idx": candle_idx, "equity": round(capital, 4), "unfilled": True})
+            report(candle_idx, trade)
             continue
 
-        size_label = ""
-        if hasattr(strategy, "size_label"):
-            size_label = strategy.size_label(risk_frac)  # type: ignore[attr-defined]
-
+        entry_fee = estimate_taker_fee(stake, entry_price, fee_rate)
         shares = stake / entry_price
         won = signal.side == candle.winner
-        entry_fee = estimate_taker_fee(stake, entry_price, fee_rate)
         pnl = _settle_trade(stake, entry_price, won, entry_fee)
         capital += pnl
         equity_hist.append(capital)
 
         peak = max(peak, capital)
         if peak > 0:
-            dd = (peak - capital) / peak
-            max_drawdown = max(max_drawdown, dd)
-
-        reason = signal.reason
-        if size_label:
-            reason = f"{reason} · {size_label} ({risk_frac:.0%} of initial)"
+            max_drawdown = max(max_drawdown, (peak - capital) / peak)
 
         if won:
             wins_streak += 1
@@ -172,39 +254,9 @@ def run_backtest(
         if len(recent_outcomes) > 10:
             recent_outcomes.pop(0)
 
-        sim_entry_prob: float | None = None
-        sim_lifetime_probs: list[dict[str, Any]] = []
-
-        has_tcn = sim_store and sim_store.has_candle(candle.start_ts)
-        probs_series = sim_store.prob_up_series(candle.start_ts) if has_tcn else None
-
-        if probs_series is not None:
-            s_entry = max(0, min(299, int(entry_ts - candle.start_ts)))
-            sim_entry_prob = round(float(probs_series[s_entry]), 4)
-            sim_lifetime_probs = [
-                {
-                    "t": candle.start_ts + s,
-                    "s": s,
-                    "prob": round(float(probs_series[s]), 4),
-                }
-                for s in range(s_entry, 300)
-            ]
-        else:
-            s_entry = max(0, int(entry_ts - candle.start_ts))
-            sim_entry_prob = round(float(entry_tick.up), 4) if entry_tick else 0.5
-            for tick_t, up_p, _down_p in candle.ticks:
-                if tick_t >= entry_ts:
-                    s = max(0, int(tick_t - candle.start_ts))
-                    sim_lifetime_probs.append(
-                        {
-                            "t": tick_t,
-                            "s": s,
-                            "prob": round(float(up_p), 4),
-                        }
-                    )
-            if not sim_lifetime_probs:
-                sim_lifetime_probs = [{"t": entry_ts, "s": s_entry, "prob": sim_entry_prob}]
-
+        reason = f"{signal.reason} · limit @ {entry_price:.2f} filled ({reason_label})"
+        if size_label:
+            reason = f"{reason} · {size_label}"
         trade = TradeRecord(
             candle_slug=candle.slug,
             candle_title=candle.title,
@@ -218,12 +270,15 @@ def run_backtest(
             equity_after=round(capital, 4),
             entry_ts=entry_ts,
             reason=reason,
-            risk_pct=round(risk_frac * 100, 2),
+            risk_pct=round(risk_frac * 100, 2) if not use_fixed_stake else 0.0,
             size_label=size_label,
             entry_fee=round(entry_fee, 4),
-            sim_entry_prob=sim_entry_prob,
-            sim_lifetime_probs=sim_lifetime_probs,
+            filled=True,
+            fill_reason=reason_label,
+            limit_price=round(entry_price, 4),
+            synthetic=candle.synthetic,
         )
+        _attach_sim_probs(trade, candle, entry_ts, entry_tick, sim_store)
         trades.append(trade)
         equity_curve.append({"idx": candle_idx, "equity": round(capital, 4)})
         report(candle_idx, trade)
@@ -240,4 +295,49 @@ def run_backtest(
         equity_curve=equity_curve,
         max_drawdown_pct=max_drawdown * 100,
         elapsed_ms=elapsed_ms,
+        fetch_failures=fetch_failures,
+        synthetic_candles=sum(1 for c in candles if c.synthetic),
     )
+
+
+def _load_btc_series(
+    candles: list[CandleDataset],
+    progress_callback: Callable[[dict], None] | None,
+) -> BtcSeries | None:
+    if not candles:
+        return None
+    return BtcSeries.load(candles[0].start_ts, candles[-1].end_ts, progress_callback=progress_callback)
+
+
+def _attach_sim_probs(
+    trade: TradeRecord,
+    candle: CandleDataset,
+    entry_ts: int,
+    entry_tick: TickContext,
+    sim_store,
+) -> None:
+    sim_entry_prob: float | None = None
+    sim_lifetime_probs: list[dict[str, Any]] = []
+    has_tcn = sim_store is not None and sim_store.has_candle(candle.start_ts)
+    probs_series = sim_store.prob_up_series(candle.start_ts) if has_tcn else None
+    if probs_series is not None:
+        s_entry = max(0, min(299, int(entry_ts - candle.start_ts)))
+        sim_entry_prob = round(float(probs_series[s_entry]), 4)
+        sim_lifetime_probs = [
+            {"t": candle.start_ts + s, "s": s, "prob": round(float(probs_series[s]), 4)}
+            for s in range(s_entry, 300)
+        ]
+    else:
+        s_entry = max(0, int(entry_ts - candle.start_ts))
+        sim_entry_prob = round(float(entry_tick.up), 4)
+        for tick_t, up_p, _down_p in candle.ticks:
+            if tick_t >= entry_ts:
+                sim_lifetime_probs.append({
+                    "t": tick_t,
+                    "s": max(0, int(tick_t - candle.start_ts)),
+                    "prob": round(float(up_p), 4),
+                })
+        if not sim_lifetime_probs:
+            sim_lifetime_probs = [{"t": entry_ts, "s": s_entry, "prob": sim_entry_prob}]
+    trade.sim_entry_prob = sim_entry_prob
+    trade.sim_lifetime_probs = sim_lifetime_probs

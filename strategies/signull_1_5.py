@@ -1,4 +1,4 @@
-"""Signull 1.5 — buys whichever side reaches + or - $30 on the Bitcoin chart."""
+"""Signull 1.5 — buys whichever side reaches + or - $10 on the Bitcoin chart."""
 
 from __future__ import annotations
 
@@ -15,18 +15,18 @@ STRATEGY_CLASS = "Signull15Strategy"
 
 
 class Signull15Strategy(Strategy):
-    """Enters whichever option (UP or DOWN) first reaches +$30 or -$30 change on the BTC chart."""
+    """Enters whichever option (UP or DOWN) first reaches +$10 or -$10 change on the BTC chart."""
 
     meta = StrategyMeta(
         id="signull_1_5",
-        name="Signull 1.5 (BTC ±$30 Target)",
+        name="Signull 1.5 (BTC ±$10 Target)",
         description=(
-            "Buys whichever side (UP or DOWN) reaches +$30 or -$30 change "
+            "Buys whichever side (UP or DOWN) reaches +$10 or -$10 change "
             "on the Bitcoin chart relative to the candle start price. "
             "Risks a fixed fraction of capital (default 10%)."
         ),
         default_params={
-            "target_delta": 30.0,
+            "target_delta": 10.0,
             "risk_pct": 0.10,
             "asset": "btc",
         },
@@ -81,11 +81,14 @@ class Signull15Strategy(Strategy):
             return None
 
         if candle.slug not in self._candle_start_btc:
-            self._candle_start_btc[candle.slug] = current_btc
+            beat = tick.btc_price_to_beat
+            self._candle_start_btc[candle.slug] = (
+                float(beat) if beat is not None and beat > 0 else current_btc
+            )
 
         start_btc = self._candle_start_btc[candle.slug]
         delta = current_btc - start_btc
-        target_delta = float(self.params.get("target_delta", 30.0))
+        target_delta = float(self.params.get("target_delta", 10.0))
 
         up_hit = delta >= target_delta
         down_hit = delta <= -target_delta

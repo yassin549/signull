@@ -132,6 +132,44 @@ class BtcChartPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(last["v"], 50_040.0, places=0)
         self.assertAlmostEqual(last["d"], 40.0, places=1)
 
+    def test_backfill_btc_history(self):
+        state = BotState()
+        cs = 1_700_000_000
+        beat = 95_000.0
+        now = time.time()
+        history_points = [
+            {"t": float(cs), "v": 95_000.0},
+            {"t": float(cs + 60), "v": 95_050.0},
+            {"t": float(cs + 120), "v": 95_020.0},
+        ]
+        state.backfill_btc_history(cs, beat, history_points)
+        state.update(market={"candle_start_ts": cs})
+        snap = state.get_snapshot(history_points=50)
+        self.assertEqual(snap["btc"]["price_to_beat"], 95_000.0)
+        self.assertEqual(len(snap["btc_history"]), 3)
+        self.assertEqual(snap["btc_history"][0]["v"], 95_000.0)
+        self.assertEqual(snap["btc_history"][0]["d"], 0.0)
+        self.assertEqual(snap["btc_history"][1]["d"], 50.0)
+        self.assertEqual(snap["btc_history"][2]["d"], 20.0)
+
+    def test_backfill_price_history(self):
+        state = BotState()
+        cs = 1_700_000_000
+        state.set_price_to_beat(95_000.0, candle_start_ts=cs)
+        state.update(market={"candle_start_ts": cs})
+        outcome_points = [
+            {"t": float(cs), "up": 0.5, "down": 0.5},
+            {"t": float(cs + 60), "up": 0.6, "down": 0.4},
+        ]
+        state.backfill_price_history(outcome_points)
+        snap = state.get_snapshot(history_points=50)
+        ph = snap["price_history"]
+        self.assertEqual(len(ph), 2)
+        self.assertEqual(ph[0]["up"], 0.5)
+        self.assertEqual(ph[1]["up"], 0.6)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

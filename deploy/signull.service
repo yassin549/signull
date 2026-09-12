@@ -1,0 +1,23 @@
+[Unit]
+Description=Signull trading bot + dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signull
+Group=signull
+WorkingDirectory=/opt/signull
+ExecStart=/opt/signull/.venv/bin/python main.py server
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=signull
+
+[Install]
+WantedBy=multi-user.target

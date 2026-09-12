@@ -38,9 +38,10 @@ def _as_unit_interval(value: float, name: str) -> float:
 class ModelProbThresholdStrategy(Strategy):
     meta = StrategyMeta(
         id="model_prob_threshold",
-        name="Model Prob Threshold (TCN)",
+        name="Model Prob Threshold (TCN SIM 1.1)",
         description=(
-            "Direction TCN estimates P(candle closes Up) every second from BTC 1s "
+            "Direction TCN SIM 1.1 estimates P(candle closes Up) every second from BTC 1s "
+            "data (causal TCN with dynamic regime Z-scores and Brownian probabilities). "
             "data (not Polymarket crowd prices). Buys the first side whose model "
             "probability crosses `threshold`. Fill uses the market mid at the "
             "signal tick. "

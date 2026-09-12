@@ -12,3 +12,10 @@ data/backtest_cache/
 data/btc_klines/
 models/*.pt
 models/*.json
+
+# Private keys / deploy secrets — never commit
+*.pem
+*.key
+*.ppk
+bureau
+bureau.pub

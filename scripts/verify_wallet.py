@@ -11,7 +11,7 @@ from src.config import BotConfig
 
 def main() -> None:
     print("=" * 60)
-    print("  Signull — Polymarket Wallet Verification")
+    print("  Signull - Polymarket Wallet Verification")
     print("=" * 60)
     print()
 
@@ -24,30 +24,34 @@ def main() -> None:
     result = verify_wallet(config)
 
     print(f"  Signature type : {result.signature_type} ({result.signature_label})")
-    print(f"  Signer address : {result.signer_address or '—'}")
-    print(f"  Funder address : {result.funder_address or '—'}")
+    print(f"  Signer address : {result.signer_address or '-'}")
+    print(f"  Funder address : {result.funder_address or '-'}")
     print(f"  API connected  : {'YES' if result.api_connected else 'NO'}")
-    if result.balance_usdc is not None:
-        print(f"  USDC balance   : ${result.balance_usdc:.2f}")
+    if result.balance_usdt is not None:
+        print(f"  Trading cash   : ${result.balance_usdt:.2f}  (source: {result.balance_source})")
+    if result.gas_bnb is not None:
+        print(f"  BNB gas        : {result.gas_bnb:.4f}")
+    print(f"  BNB RPC        : {'OK' if result.rpc_ok else 'FAIL'}"
+          + (f"  ({result.rpc_error})" if result.rpc_error else ""))
     print()
 
     if result.issues:
         print("  ISSUES:")
         for issue in result.issues:
-            print(f"    ✗ {issue}")
+            print(f"    - {issue}")
         print()
 
     if result.tips:
         print("  NEXT STEPS:")
         for tip in result.tips:
-            print(f"    → {tip}")
+            print(f"    - {tip}")
         print()
 
     if result.ok:
-        print("  ✓ Wallet is connected and ready for live trading!")
+        print("  OK: Wallet is connected and ready for live trading!")
         print("    Set TRADING_MODE=live in .env when you're ready.")
     else:
-        print("  ✗ Wallet not ready yet. Fix the issues above.")
+        print("  ERROR: Wallet not ready yet. Fix the issues above.")
         sys.exit(1)
 
 

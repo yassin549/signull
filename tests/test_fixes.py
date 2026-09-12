@@ -85,6 +85,12 @@ class SliceHistoryTests(unittest.TestCase):
         self.assertIsInstance(snap2["price_history"], list)
 
 
+def _clob_error(message: str) -> RuntimeError:
+    exc = RuntimeError(message)
+    exc.error_msg = {"error": message}  # type: ignore[attr-defined]
+    return exc
+
+
 class ClientStartupTests(unittest.TestCase):
     def test_paper_mode_never_derives_wallet_credentials(self):
         """Paper dashboard startup must not depend on the CLOB auth endpoint."""
@@ -105,13 +111,205 @@ class ClientStartupTests(unittest.TestCase):
             private_key="0x" + "1" * 64,
             funder_address="0x" + "2" * 40,
         )
-        with mock.patch("src.polymarket.ClobClient") as client_cls:
+        with mock.patch("src.account.signature_type_candidates", return_value=[1]), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            client_cls.return_value.derive_api_key.side_effect = RuntimeError("timeout")
+            client_cls.return_value.create_api_key.side_effect = RuntimeError("timeout")
             client_cls.return_value.create_or_derive_api_key.side_effect = RuntimeError("timeout")
             client = PolymarketClient(config)
 
         self.assertFalse(client.is_authenticated)
         self.assertEqual(client.auth_error, "timeout")
         self.assertEqual(client_cls.call_count, 2)
+
+    def test_clob_rejects_deposit_wallet_then_uses_safe(self):
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "2" * 40,
+            signature_type=3,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        missing = _clob_error("no deposit wallet found for owner")
+        with mock.patch("src.account.signature_type_candidates", return_value=[3, 2]), \
+             mock.patch("src.polymarket._create_official_secure_client", side_effect=RuntimeError("skip official")), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.side_effect = [
+                missing,
+                {"balance": "25000000", "allowance": "0"},
+            ]
+            client = PolymarketClient(config)
+
+        self.assertTrue(client.is_authenticated)
+        self.assertEqual(config.signature_type, 2)
+
+    def test_deposit_wallet_error_retries_next_type(self):
+        from src.polymarket import is_deposit_wallet_error
+
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "3" * 40,
+            signature_type=1,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        fail = _clob_error("maker address not allowed, please use the deposit wallet flow")
+        self.assertTrue(is_deposit_wallet_error(fail))
+
+        with mock.patch("src.account.signature_type_candidates", return_value=[1, 2]), \
+             mock.patch("src.polymarket._create_official_secure_client", side_effect=RuntimeError("skip official")), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.return_value = {"balance": "1", "allowance": "0"}
+            inst.create_and_post_order.side_effect = [
+                fail,
+                {"orderID": "ord-1"},
+            ]
+            client = PolymarketClient(config)
+            resp = client.place_limit_buy("tok", 0.50, 10.0, "0.01")
+
+        self.assertEqual(resp["orderID"], "ord-1")
+        self.assertEqual(config.signature_type, 2)
+        self.assertEqual(inst.create_and_post_order.call_count, 2)
+
+    def test_order_signer_address_error_does_not_retry_other_types(self):
+        from src.polymarket import is_deposit_wallet_error, is_signer_api_key_mismatch
+
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "4" * 40,
+            signature_type=3,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        fail = _clob_error("the order signer address has to be the address of the API KEY")
+        self.assertTrue(is_signer_api_key_mismatch(fail))
+        self.assertFalse(is_deposit_wallet_error(fail))
+
+        with mock.patch("src.account.signature_type_candidates", return_value=[3, 1]), \
+             mock.patch("src.polymarket._create_official_secure_client", side_effect=RuntimeError("skip official")), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.return_value = {"balance": "1", "allowance": "0"}
+            inst.create_and_post_order.side_effect = fail
+            client = PolymarketClient(config)
+            with self.assertRaises(type(fail)):
+                client.place_limit_buy("tok", 0.50, 10.0, "0.01")
+
+        self.assertEqual(config.signature_type, 3)
+        self.assertEqual(inst.create_and_post_order.call_count, 1)
+
+    def test_live_limit_buy_uses_official_secure_client(self):
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "5" * 40,
+            signature_type=3,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        official = mock.Mock()
+        official.wallet_type = "DEPOSIT_WALLET"
+        official.wallet = "0x" + "5" * 40
+        accepted = mock.Mock()
+        accepted.ok = True
+        accepted.order_id = "ord-official"
+        accepted.status = "live"
+        official.place_limit_order.return_value = accepted
+
+        with mock.patch("src.account.signature_type_candidates", return_value=[3]), \
+             mock.patch("src.polymarket._create_official_secure_client", return_value=official), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.return_value = {"balance": "1", "allowance": "0"}
+            client = PolymarketClient(config)
+            resp = client.place_limit_buy("tok", 0.81, 10.0, "0.01")
+
+        self.assertEqual(resp["orderID"], "ord-official")
+        official.place_limit_order.assert_called_once()
+        kwargs = official.place_limit_order.call_args.kwargs
+        self.assertEqual(kwargs["token_id"], "tok")
+        self.assertEqual(kwargs["side"], "BUY")
+        self.assertEqual(kwargs["price"], 0.81)
+        inst.create_and_post_order.assert_not_called()
+        self.assertEqual(config.signature_type, 3)
+
+    def test_official_rejected_order_raises(self):
+        from polymarket.models.clob.order_response import RejectedOrder
+
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "6" * 40,
+            signature_type=3,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        official = mock.Mock()
+        official.wallet_type = "DEPOSIT_WALLET"
+        official.place_limit_order.return_value = RejectedOrder(
+            code="not_enough_balance",
+            message="not enough balance / allowance",
+        )
+
+        with mock.patch("src.account.signature_type_candidates", return_value=[3]), \
+             mock.patch("src.polymarket._create_official_secure_client", return_value=official), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.return_value = {"balance": "1", "allowance": "0"}
+            client = PolymarketClient(config)
+            with self.assertRaisesRegex(RuntimeError, "not enough balance"):
+                client.place_limit_buy("tok", 0.50, 10.0, "0.01")
+
+    def test_official_get_and_cancel_order(self):
+        config = _paper_config(
+            trading_mode="live",
+            private_key="0x" + "1" * 64,
+            funder_address="0x" + "7" * 40,
+            signature_type=3,
+        )
+        creds = mock.Mock()
+        creds.api_key = "k"
+        official = mock.Mock()
+        official.wallet_type = "DEPOSIT_WALLET"
+        open_order = mock.Mock()
+        open_order.id = "ord-7"
+        open_order.status = "live"
+        open_order.size_matched = 4.0
+        open_order.original_size = 12.42
+        open_order.price = 0.81
+        open_order.side = "BUY"
+        open_order.maker_address = "0x" + "7" * 40
+        official.get_order.return_value = open_order
+        cancel_resp = mock.Mock()
+        cancel_resp.canceled = ("ord-7",)
+        cancel_resp.not_canceled = {}
+        official.cancel_order.return_value = cancel_resp
+
+        with mock.patch("src.account.signature_type_candidates", return_value=[3]), \
+             mock.patch("src.polymarket._create_official_secure_client", return_value=official), \
+             mock.patch("src.polymarket.ClobClient") as client_cls:
+            inst = client_cls.return_value
+            inst.derive_api_key.return_value = creds
+            inst.get_balance_allowance.return_value = {"balance": "1", "allowance": "0"}
+            client = PolymarketClient(config)
+            fetched = client.get_order("ord-7")
+            canceled = client.cancel_order("ord-7")
+
+        self.assertEqual(fetched["orderID"], "ord-7")
+        self.assertEqual(fetched["size_matched"], 4.0)
+        self.assertEqual(canceled["canceled"], ["ord-7"])
+        inst.get_order.assert_not_called()
+        inst.cancel_order.assert_not_called()
 
 
 class MarketFeedResilienceTests(unittest.IsolatedAsyncioTestCase):
@@ -575,7 +773,8 @@ class ConsecutiveWinStreakTests(unittest.TestCase):
             CandleDataset(
                 slug=f"c{i}", title=f"c{i}", start_ts=i * 300,
                 end_ts=(i + 1) * 300, winner="up", up_token_id="u",
-                down_token_id="d", ticks=[(i * 300, 0.5, 0.5)],
+                down_token_id="d",
+                ticks=[(i * 300, 0.5, 0.5), (i * 300 + 1, 0.5, 0.5)],
             )
             for i in range(6)
         ]
@@ -634,8 +833,8 @@ class Signull10ExecutionTests(unittest.TestCase):
             strategy.evaluate(TickContext(2, 0.80, 0.20, 2, 298), candle, entered=False)
         )
 
-    def test_backtest_debits_signull_taker_fee(self):
-        from strategies.base import CandleContext, Strategy, StrategyMeta, TickContext, TradeSignal
+    def test_backtest_debits_configured_taker_fee(self):
+        from strategies.base import Strategy, StrategyMeta, TradeSignal
         from src.backtest.engine import run_backtest
         from src.backtest.types import CandleDataset
 
@@ -645,21 +844,20 @@ class Signull10ExecutionTests(unittest.TestCase):
             def evaluate(self, _tick, _candle, *, entered):
                 if entered:
                     return None
-                return TradeSignal("up", 0.70, "fee", taker_fee_rate=0.07)
+                return TradeSignal("up", 0.70, "fee")
 
             def position_risk_fraction(self, *_args):
                 return 0.10
 
         candle = CandleDataset(
-            "c", "c", 0, 300, "up", "u", "d", [(0, 0.50, 0.50)]
+            "c", "c", 0, 300, "up", "u", "d", [(0, 0.50, 0.50), (1, 0.70, 0.30)]
         )
-        result = run_backtest(FeeStrategy(), [candle])
+        result = run_backtest(FeeStrategy(), [candle], taker_fee_rate=0.02)
 
+        # Live execution charges the configured taker fee: stake * rate * (1 - price).
         self.assertAlmostEqual(result.trades[0].stake, 10.0)
-        self.assertAlmostEqual(result.trades[0].entry_fee, 0.21)
-        # Backtest summary rounds ending capital to cents; the trade record
-        # retains the exact fee amount used to reach it.
-        self.assertAlmostEqual(result.ending_capital, 104.08, places=2)
+        self.assertAlmostEqual(result.trades[0].entry_fee, 0.06)
+        self.assertAlmostEqual(result.ending_capital, 104.23, places=2)
 
 
 class Signull12RegimeKellyTests(unittest.TestCase):

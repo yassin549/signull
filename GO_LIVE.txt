@@ -1,0 +1,296 @@
+SIGNULL — HOW TO GO LIVE
+========================
+
+This is a real-money switch. Live mode posts real GTC limit buys on
+Polymarket's CLOB for 5-minute crypto Up/Down markets.
+
+Paper mode uses the same live market data but never places orders.
+Keys in .env are ignored for trading until TRADING_MODE=live AND the
+process is restarted.
+
+Do these steps in order. Do not skip verification.
+
+
+------------------------------------------------------------------------------
+0. BEFORE YOU START
+------------------------------------------------------------------------------
+
+- You are in the project folder:  C:\Users\khoua\Desktop\signull
+- Python deps are installed:      pip install -r requirements.txt
+- You can already run paper:      python main.py server
+- Dashboard opens at:             http://127.0.0.1:8080
+- .env is NEVER committed. Keep PRIVATE_KEY off git, screenshots, and chat.
+
+
+------------------------------------------------------------------------------
+1. CONFIRM YOU ARE STILL IN PAPER
+------------------------------------------------------------------------------
+
+Open .env and check:
+
+    TRADING_MODE=paper
+
+If it already says live, set it back to paper and restart the server
+before doing anything else.
+
+
+------------------------------------------------------------------------------
+2. FILL THE WALLET FIELDS IN .env
+------------------------------------------------------------------------------
+
+These three must be correct. Wrong type/address = auth failure or
+orders signed against the wrong wallet.
+
+    PRIVATE_KEY=0x...
+    FUNDER_ADDRESS=0x...
+    SIGNATURE_TYPE=...
+
+What each one is
+----------------
+PRIVATE_KEY
+    The key that SIGNS CLOB orders.
+
+FUNDER_ADDRESS
+    Where Polymarket holds your trading USDC.
+    Copy "Profile Address" from https://polymarket.com/settings
+    This is NOT always the same as the signer address.
+
+SIGNATURE_TYPE  (must match the wallet that holds your USDC)
+    0 = MetaMask / hardware wallet (EOA)
+        You must set token allowances on Polygon yourself.
+    1 = Legacy email/Google Magic proxy (accounts created before May 2026)
+        Export the Magic wallet private key.
+        FUNDER_ADDRESS = profile address, NOT the signer EOA.
+    2 = Gnosis Safe
+    3 = Deposit Wallet (accounts created on or after May 4, 2026)
+        This is the current polymarket.com default.
+        FUNDER_ADDRESS = profile address from Settings, NOT the signer EOA.
+        See docs.polymarket.com/trading/wallets-auth
+
+If you created the account in 2026, SIGNATURE_TYPE=3 is the usual setting.
+Using type 1 against a deposit wallet is rejected:
+    "maker address not allowed, please use the deposit wallet flow"
+
+The bot probes the Relayer and will switch 1 → 3 when the funder is a
+deployed Deposit Wallet. Set 3 in .env so you do not depend on that probe.
+
+
+------------------------------------------------------------------------------
+3. DEPOSIT USDC ON POLYMARKET
+------------------------------------------------------------------------------
+
+The bot spends CLOB collateral, which is bridged USDC.e on Polygon,
+credited to your Profile Address (FUNDER_ADDRESS).
+
+    1. Log into https://polymarket.com with the SAME account as SIGNATURE_TYPE.
+    2. Deposit USDC through Polymarket's deposit flow.
+    3. Confirm the balance shows on that profile, not some other wallet.
+
+Also keep a little POL on the gas-payer address so approvals and
+withdrawals can pay gas:
+
+    Type 0 (EOA):     POL on the signer / MetaMask address
+    Type 1 (email):   POL on the funder / profile address
+
+The dashboard warns if POL is below GAS_WARN_POL (default 0.05).
+Low POL does not always block CLOB trades, but it can block
+approvals and withdrawals.
+
+
+------------------------------------------------------------------------------
+4. SET SIZE BEFORE YOU ARM LIVE
+------------------------------------------------------------------------------
+
+Live stake is NOT "use the whole deposit."
+
+    stake = SIGNULL_RISK_PCT  x  PAPER_INITIAL_CAPITAL
+    then capped by actual CLOB USDC (and estimated taker fee)
+
+Example with defaults:
+    PAPER_INITIAL_CAPITAL=100
+    SIGNULL_RISK_PCT=0.10
+    -> about $10 per trade, even if the wallet holds $1,000
+
+Also in .env (set these while still on paper):
+
+    ASSET=btc                 # btc, eth, sol, or xrp
+    BOT_STRATEGY=signull_1_5  # or signull_1_1, 1_4, 1_6, etc.
+    SIGNULL_TARGET_DELTA=10.0 # used by signull_1_5 (±$10 BTC move)
+    SIGNULL_THRESHOLD=0.75    # used by threshold strategies
+    SIGNULL_RISK_PCT=0.10
+
+First live session: keep PAPER_INITIAL_CAPITAL small so tickets stay
+small. Raise it later if you want larger size.
+
+ORDER_SIZE_USDC is legacy and is NOT what Signull uses for sizing.
+
+
+------------------------------------------------------------------------------
+5. VERIFY THE WALLET  (do this before flipping live)
+------------------------------------------------------------------------------
+
+Stop is not required. From the project folder:
+
+    python scripts/verify_wallet.py
+
+You want ALL of:
+    API connected     = YES
+    USDC balance      > 0
+    No blocking ISSUES
+    "Wallet is connected and ready for live trading!"
+
+If it fails, read ISSUES / NEXT STEPS. Typical causes:
+    - PRIVATE_KEY missing or invalid
+    - FUNDER_ADDRESS missing or not the Profile Address
+    - SIGNATURE_TYPE does not match the account
+    - $0 CLOB USDC (deposit did not land on the funder)
+    - Type 0 without token allowances set
+
+Do not continue until this script is green.
+
+
+------------------------------------------------------------------------------
+6. SANITY-CHECK ON PAPER ONE LAST TIME
+------------------------------------------------------------------------------
+
+    python main.py server
+
+Open http://127.0.0.1:8080  (Live tab)
+
+Confirm:
+    - mode shows PAPER
+    - feeds are connected (market + BTC)
+    - strategy name matches BOT_STRATEGY
+    - signals look like you expect
+    - wallet desk can see the funder if keys are set
+      (paper still will not place real orders)
+
+The server auto-starts the bot. You can also start/stop from the UI.
+
+Ctrl+C in the terminal stops the server and the bot.
+
+
+------------------------------------------------------------------------------
+7. ARM LIVE
+------------------------------------------------------------------------------
+
+    1. Stop the server (Ctrl+C). .env is only read at process start.
+    2. In .env change exactly:
+
+           TRADING_MODE=live
+
+    3. Save the file.
+    4. Start again:
+
+           python main.py server
+
+    5. Open http://127.0.0.1:8080
+
+You should see:
+    - mode LIVE
+    - wallet status "Live trading"
+    - CLOB USDC balance
+    - bot running
+
+The bot places a GTC limit buy when the strategy fires, at the
+signal price (not a market order). Unfilled size sits on the book
+until candle close, then leftover is cancelled. Only matched
+shares are a real trade.
+
+Heartbeats keep the CLOB session alive. If the process dies,
+Polymarket should auto-cancel resting orders — still check the
+open-orders panel and polymarket.com if you crash.
+
+
+------------------------------------------------------------------------------
+8. WHAT TO WATCH WHILE LIVE
+------------------------------------------------------------------------------
+
+Dashboard wallet desk:
+    - CLOB USDC balance going down when a limit fills
+    - open orders (cancel is live-only)
+    - positions after a fill
+    - logs: [LIVE] LIMIT BUY ... then later [LIVE] WIN/LOSS ...
+
+Each 5-minute candle, at most one entry.
+
+Paper equity on the dashboard is NOT your live PnL. Live settlement
+is in the Polymarket wallet. The "reset account" button is disabled
+in live mode on purpose.
+
+
+------------------------------------------------------------------------------
+9. HOW TO STOP / DISARM
+------------------------------------------------------------------------------
+
+Stop trading immediately:
+    - Click stop in the dashboard, or
+    - Ctrl+C the server
+
+Then check:
+    - dashboard open orders = empty
+    - polymarket.com has no resting orders on the current 5m market
+
+To go back to paper:
+    1. Stop the server
+    2. Set TRADING_MODE=paper
+    3. Restart: python main.py server
+
+Paper and live keep separate session files under data/sessions/.
+Switching modes does not reset the Polymarket wallet.
+
+
+------------------------------------------------------------------------------
+10. IF SOMETHING GOES WRONG
+------------------------------------------------------------------------------
+
+"Live mode but wallet not authenticated"
+    Keys / SIGNATURE_TYPE / FUNDER_ADDRESS are wrong, or CLOB
+    derive-api-key failed. Re-run verify_wallet.py.
+
+"Stake too small — skipping"
+    PAPER_INITIAL_CAPITAL * SIGNULL_RISK_PCT (capped by wallet) is
+    under $0.01. Raise capital or risk, or deposit more USDC.
+
+"Order failed"
+    Read the log. Common: no allowance (type 0), insufficient
+    balance, market not accepting orders near candle close.
+
+"maker address not allowed" / "no deposit wallet found for owner"
+    Wrong SIGNATURE_TYPE for this funder. MetaMask/Rabby accounts
+    are usually Gnosis Safe (type 2). Newer site wallets are
+    Deposit Wallets (type 3). The bot probes CLOB balance-allowance
+    and keeps the type that returns 200. Set that type in .env.
+
+CLOB USDC shows "—" or $0 while live
+    Auth failed at startup (DNS/timeout) or the type-3 probe 404'd.
+    Restart once the network is up. Do not treat paper bankroll as
+    the live CLOB balance.
+
+No fill / no settlement
+    Live is a limit, not a market order. If the book never trades
+    at your price, the order is cancelled at candle close and
+    nothing is settled. That is expected.
+
+Server was already running when you edited .env
+    The old mode is still in memory. Ctrl+C and start it again.
+
+
+------------------------------------------------------------------------------
+QUICK CHECKLIST (print this)
+------------------------------------------------------------------------------
+
+[ ] TRADING_MODE is paper while you set everything up
+[ ] PRIVATE_KEY, FUNDER_ADDRESS, SIGNATURE_TYPE filled and matched
+[ ] USDC deposited to Polymarket Profile Address
+[ ] A little POL on the gas-payer address
+[ ] PAPER_INITIAL_CAPITAL and SIGNULL_RISK_PCT set for small tickets
+[ ] ASSET and BOT_STRATEGY set
+[ ] python scripts/verify_wallet.py  -> green, USDC > 0
+[ ] Paper server run looked healthy
+[ ] Stop server
+[ ] TRADING_MODE=live
+[ ] python main.py server
+[ ] Dashboard shows LIVE, wallet connected, bot running
+[ ] After first signal: confirm a real CLOB order, then fill or cancel
+[ ] Know how to stop (UI stop or Ctrl+C) and check open orders
