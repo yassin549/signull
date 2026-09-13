@@ -188,6 +188,17 @@ class BotConfig:
                 in ("true", "1", "yes"),
                 "asset": self.asset,
             }
+        if self.strategy_id == "signull_1_11":
+            return {
+                "min_risk_pct": float(os.getenv("SIGNULL_AI_MIN_RISK_PCT", "0.02")),
+                "max_risk_pct": float(os.getenv("SIGNULL_AI_MAX_RISK_PCT", "0.10")),
+                "decision_delay_sec": float(os.getenv("SIGNULL_AI_DECISION_DELAY_SEC", "3.0")),
+                "entry_window_sec": float(os.getenv("SIGNULL_AI_ENTRY_WINDOW_SEC", "120.0")),
+                "btc_lookback_minutes": int(os.getenv("SIGNULL_AI_LOOKBACK_MIN", "90")),
+                "temperature": float(os.getenv("SIGNULL_AI_TEMPERATURE", "0.2")),
+                "max_tokens": int(os.getenv("SIGNULL_AI_MAX_TOKENS", "700")),
+                "asset": self.asset,
+            }
         return {
             "threshold": self.strategy_threshold,
             "min_risk_pct": self.strategy_min_risk_pct,

@@ -10,6 +10,8 @@ mcps/
 agent-tools/
 data/backtest_cache/
 data/btc_klines/
+data/openrouter.json
+data/ai_conversation.json
 models/*.pt
 models/*.json
 

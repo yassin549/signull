@@ -47,10 +47,11 @@ def list_strategies() -> list[dict]:
         "signull_1_8": 8,
         "signull_1_9": 9,
         "signull_1_10": 10,
-        "smart_sizer": 11,
-        "model_prob_threshold": 12,
-        "prob_70": 13,
-        "tcn_sizer": 14,
+        "signull_1_11": 11,
+        "smart_sizer": 12,
+        "model_prob_threshold": 13,
+        "prob_70": 14,
+        "tcn_sizer": 15,
     }
     for sid, cls in sorted(
         _discover().items(),
@@ -61,6 +62,7 @@ def list_strategies() -> list[dict]:
             "name": cls.meta.name,
             "description": cls.meta.description,
             "default_params": cls.meta.default_params,
+            "live_only": bool(getattr(cls.meta, "live_only", False)),
         })
     return out
 

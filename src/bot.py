@@ -124,6 +124,7 @@ class TradingBot:
         self._pending: PendingTrade | None = None
         self._eval_fidelity_bucket: int | None = None
         self._last_account_refresh = 0.0
+        self._last_ai_version = -1
         self._cached_account: dict[str, Any] | None = None
         self._cached_open_orders: list[dict] = []
         self._cached_wallet_balance: float | None = None
@@ -395,6 +396,7 @@ class TradingBot:
         self.config.custom_strategy_params = dict(strat.params)
         self.strategy = strat
         self._eval_fidelity_bucket = None
+        self._last_ai_version = -2
         self._sync_account_to_strategy()
         msg = f"Trading model changed to {strat.meta.name}"
         logger.info("%s with params: %s", msg, strat.params)
@@ -441,6 +443,7 @@ class TradingBot:
             seconds_to_close=max(0.0, market.seconds_to_close),
             btc_price=self.state.get_btc_price(),
             btc_price_to_beat=refs.get("beat"),
+            sim_prob=self.state.get_sim_prob(),
         )
 
         self._sync_account_to_strategy()
@@ -516,6 +519,8 @@ class TradingBot:
                 self._cleanup_stale_orders()
 
     def _waiting_message(self) -> str:
+        if self.config.strategy_id == "signull_1_11":
+            return "AI model is reading the BTC chart…"
         if self.config.strategy_id == "signull_1_5":
             target = float(self.strategy.params.get("target_delta", 10.0))
             return f"Waiting for BTC to move ±${target:.0f} on the chart…"
@@ -969,7 +974,24 @@ class TradingBot:
             except Exception:
                 logger.debug("wallet balance read failed", exc_info=True)
 
-        if self.config.use_fixed_stake:
+        override_fn = getattr(self.strategy, "stake_override", None)
+        override = None
+        if callable(override_fn):
+            try:
+                override = override_fn(
+                    signal, tick, ctx,
+                    equity=equity, initial=initial, wallet_balance=wallet_balance,
+                )
+            except TypeError:
+                override = None
+            except Exception:
+                logger.exception("stake_override failed")
+                override = None
+
+        if override is not None:
+            stake, size_label, risk_frac = override
+            risk_frac = float(risk_frac)
+        elif self.config.use_fixed_stake:
             fixed_val = self.config.fixed_stake_usdc
             risk_frac = 0.0
             size_label = f"${fixed_val:.2f} fixed"
@@ -1184,6 +1206,26 @@ class TradingBot:
             "signal_side": signal_side, "signal_reason": signal_reason,
             "losses_streak": losses, "wins_streak": wins_streak, "wins_recent": wins,
         })
+        self._push_ai_state()
+
+    def _push_ai_state(self) -> None:
+        """Publish the AI model monitor state only when the strategy changes it."""
+        snapshot_fn = getattr(self.strategy, "ai_snapshot", None)
+        if not callable(snapshot_fn):
+            if self._last_ai_version != -1:
+                self._last_ai_version = -1
+                self.state.update(ai=None)
+            return
+        version = int(getattr(self.strategy, "_ai_version", 0))
+        if version == self._last_ai_version:
+            return
+        self._last_ai_version = version
+        try:
+            payload = snapshot_fn()
+        except Exception:
+            logger.exception("ai_snapshot failed")
+            return
+        self.state.update(ai=payload)
 
     def _read_prices(self, market: CandleMarket) -> tuple[float, float]:
         live = self.state.get_live_prices()

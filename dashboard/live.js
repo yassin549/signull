@@ -93,6 +93,8 @@ function init() {
 
   initLiveStrategyControl();
 
+  initAiPanel();
+
   fetch("/api/config")
     .then(r => r.json())
     .then(c => {
@@ -465,6 +467,7 @@ const onUpdate = safe(function onUpdate(d) {
   updateTopbar(d);
   updateHero(d);
   updateStrategy(d);
+  if (d.ai !== undefined) renderAi(d.ai);
   if (d.account) updateWallet(d);
   if (d.orderbooks) updateOrderbooks(d.orderbooks);
   updateStrategyTrades(d.strategy_trades || []);
@@ -1227,6 +1230,221 @@ async function applyLiveStrategy() {
       applyBtn.disabled = false;
       applyBtn.textContent = "Apply Changes";
     }
+  }
+}
+
+/* ── AI Model Monitor (Signull 1.11 / OpenRouter) ── */
+let aiSettings = null;
+let aiUserEditingModel = false;
+let _aiRenderedVersion = -1;
+
+function initAiPanel() {
+  const panel = document.getElementById("ai-panel");
+  const toggle = document.getElementById("ai-panel-toggle");
+  if (panel && toggle) {
+    toggle.addEventListener("click", () => {
+      panel.classList.toggle("collapsed");
+      const btn = document.getElementById("ai-collapse-btn");
+      if (btn) btn.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
+    });
+  }
+  const saveBtn = document.getElementById("btn-ai-save");
+  if (saveBtn) saveBtn.addEventListener("click", saveAiSettings);
+  const resetBtn = document.getElementById("btn-ai-reset");
+  if (resetBtn) resetBtn.addEventListener("click", resetAiMemory);
+  const modelInput = document.getElementById("ai-model-input");
+  if (modelInput) modelInput.addEventListener("input", () => { aiUserEditingModel = true; });
+  fetchAiSettings();
+}
+
+async function fetchAiSettings() {
+  try {
+    const res = await fetch("/api/ai/settings");
+    if (!res.ok) return;
+    const data = await res.json();
+    aiSettings = data;
+    const modelInput = document.getElementById("ai-model-input");
+    if (modelInput && !aiUserEditingModel && data.model) modelInput.value = data.model;
+    const list = document.getElementById("ai-model-list");
+    if (list) {
+      list.innerHTML = (data.default_models || [])
+        .map(m => `<option value="${esc(m)}"></option>`).join("");
+    }
+    const hint = document.getElementById("ai-key-hint");
+    if (hint) {
+      hint.textContent = data.api_key_set
+        ? `Key configured (${data.api_key_masked}). Leave blank to keep it, or paste a new one.`
+        : "No API key configured. Paste an OpenRouter key — free models end with :free.";
+    }
+  } catch (_) {}
+}
+
+async function saveAiSettings() {
+  const btn = document.getElementById("btn-ai-save");
+  const msg = document.getElementById("ai-save-msg");
+  const modelInput = document.getElementById("ai-model-input");
+  const keyInput = document.getElementById("ai-key-input");
+  const payload = {};
+  const model = modelInput ? modelInput.value.trim() : "";
+  const key = keyInput ? keyInput.value.trim() : "";
+  if (model) payload.model = model;
+  if (key) payload.api_key = key;
+  if (!payload.model && !payload.api_key) {
+    if (msg) { msg.textContent = "Nothing to save"; msg.className = "strat-update-msg err"; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  if (msg) { msg.textContent = ""; msg.className = "strat-update-msg"; }
+  try {
+    const res = await fetch("/api/ai/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Save failed");
+    }
+    aiSettings = await res.json();
+    aiUserEditingModel = false;
+    if (keyInput) keyInput.value = "";
+    if (msg) { msg.textContent = "Saved"; msg.className = "strat-update-msg ok"; }
+    fetchAiSettings();
+    setTimeout(() => { if (msg && msg.textContent === "Saved") msg.textContent = ""; }, 3000);
+  } catch (e) {
+    if (msg) { msg.textContent = e.message || "Save failed"; msg.className = "strat-update-msg err"; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Save"; }
+  }
+}
+
+async function resetAiMemory() {
+  const btn = document.getElementById("btn-ai-reset");
+  const msg = document.getElementById("ai-save-msg");
+  if (btn) { btn.disabled = true; btn.textContent = "Resetting…"; }
+  try {
+    const res = await fetch("/api/ai/reset", { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Reset failed");
+    }
+    _aiRenderedVersion = -1;
+    if (msg) { msg.textContent = "Memory reset"; msg.className = "strat-update-msg ok"; }
+  } catch (e) {
+    if (msg) { msg.textContent = e.message || "Reset failed"; msg.className = "strat-update-msg err"; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Reset Memory"; }
+  }
+}
+
+function renderAi(ai) {
+  if (!ai) return;
+  const badge = document.getElementById("ai-status-badge");
+  if (badge) {
+    const status = ai.status || "idle";
+    badge.textContent = status;
+    badge.className = "ai-status-badge " + status;
+  }
+  renderAiDecision(ai);
+  renderAiUsage(ai);
+  renderAiChain(ai);
+  renderAiHistory(ai.history || []);
+}
+
+function renderAiDecision(ai) {
+  const el = document.getElementById("ai-decision");
+  if (!el) return;
+  const history = ai.history || [];
+  const last = history.length ? history[history.length - 1] : null;
+  if (!last) {
+    el.innerHTML = '<div class="placeholder">Waiting for the next candle…</div>';
+    return;
+  }
+  const side = String(last.side || "").toLowerCase();
+  const conf = Number(last.confidence);
+  const result = last.won === true ? "WIN" : last.won === false ? "LOSS" : "PENDING";
+  const resultCls = last.won === true ? "win" : last.won === false ? "loss" : "pending";
+  const factors = (last.key_factors || []).map(f => `<li>${esc(f)}</li>`).join("");
+  el.innerHTML = `
+    <div>
+      <span class="ai-side ${esc(side)}">${esc(side.toUpperCase())}</span>
+      <span class="ai-conf">${Number.isFinite(conf) ? Math.round(conf * 100) + "% conf" : ""}</span>
+      <span class="ai-row-result ${resultCls}">${result}</span>
+    </div>
+    <span class="ai-reason">${esc(last.reasoning || "—")}</span>
+    ${factors ? `<ul class="ai-factors">${factors}</ul>` : ""}
+  `;
+}
+
+function renderAiUsage(ai) {
+  const el = document.getElementById("ai-usage");
+  if (!el) return;
+  const usage = ai.usage || {};
+  const parts = [];
+  if (usage.calls != null) parts.push(`${usage.calls} calls`);
+  if (usage.total_tokens != null) parts.push(`${usage.total_tokens} tokens`);
+  if (ai.model) parts.push(esc(ai.model));
+  const html = parts.length ? parts.join(" · ") : "—";
+  const errorHtml = ai.last_error ? `<span class="ai-error">${esc(ai.last_error)}</span>` : "";
+  if (el.dataset.sig !== html + errorHtml) {
+    el.dataset.sig = html + errorHtml;
+    el.innerHTML = errorHtml || html;
+  }
+}
+
+function renderAiChain(ai) {
+  const el = document.getElementById("ai-chain");
+  if (!el) return;
+  const version = Number(ai.version);
+  if (Number.isFinite(version) && version === _aiRenderedVersion) return;
+  _aiRenderedVersion = Number.isFinite(version) ? version : -1;
+  const messages = ai.messages || [];
+  const meta = document.getElementById("ai-chain-meta");
+  if (meta) {
+    const usage = ai.usage || {};
+    meta.textContent = `${messages.length} msgs${usage.calls ? ` · ${usage.calls} calls` : ""}`;
+  }
+  if (!messages.length) {
+    el.innerHTML = '<div class="placeholder">No AI reasoning yet</div>';
+    return;
+  }
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.innerHTML = messages.map(m => {
+    const role = String(m.role || "?").toLowerCase();
+    let body = String(m.content || "");
+    if (body.length > 4000) body = body.slice(0, 4000) + "…";
+    return `<div class="ai-msg ${esc(role)}">
+      <span class="ai-role">${esc(role)}</span>
+      <span class="ai-msg-body">${esc(body)}</span>
+    </div>`;
+  }).join("");
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
+function renderAiHistory(history) {
+  const el = document.getElementById("ai-history");
+  if (!el) return;
+  if (!history.length) {
+    el.innerHTML = '<div class="placeholder">No decisions yet</div>';
+    return;
+  }
+  const rows = history.slice().reverse().map(h => {
+    const side = String(h.side || "").toLowerCase();
+    const conf = Number(h.confidence);
+    const won = h.won;
+    const result = won === true ? "win" : won === false ? "loss" : "pending";
+    const label = won === true ? "WIN" : won === false ? "LOSS" : "…";
+    const time = h.time ? String(h.time).replace(" UTC", "") : "";
+    return `<div class="ai-row">
+      <span class="ai-row-time">${esc(time)}</span>
+      <span class="ai-row-side ${esc(side)}">${esc(side.toUpperCase())}</span>
+      <span class="ai-row-conf">${Number.isFinite(conf) ? Math.round(conf * 100) + "%" : ""}</span>
+      <span class="ai-row-result ${result}">${label}</span>
+    </div>`;
+  }).join("");
+  if (el.dataset.sig !== rows) {
+    el.dataset.sig = rows;
+    el.innerHTML = rows;
   }
 }
 

@@ -113,7 +113,9 @@ async function loadStrategies(sel) {
       throw new Error(detail);
     }
     const data = await res.json();
-    strategies = data.strategies || [];
+    // Live-only models (e.g. the OpenRouter AI strategy) make paid network
+    // calls per candle and are not backtestable.
+    strategies = (data.strategies || []).filter(s => !s.live_only);
     if (!strategies.length) {
       sel.innerHTML = "";
       if (desc) desc.textContent = "No strategies found in strategies/ folder.";

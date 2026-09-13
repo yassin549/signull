@@ -13,6 +13,9 @@ class StrategyMeta:
     name: str
     description: str
     default_params: dict[str, Any] = field(default_factory=dict)
+    # Live-only strategies (e.g. LLM models that call a paid API) are hidden
+    # from the backtest runner.
+    live_only: bool = False
 
 
 @dataclass
@@ -26,6 +29,7 @@ class TickContext:
     seconds_to_close: float
     btc_price: float | None = 0.0
     btc_price_to_beat: float | None = None
+    sim_prob: float | None = None
 
 
 

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=41" />
+  <link rel="stylesheet" href="/static/styles.css?v=42" />
 </head>
 <body>
   <div class="app">
@@ -233,6 +233,54 @@
           <div class="live-strat-actions">
             <button type="button" class="btn btn-apply-strat" id="btn-apply-live-strategy">Apply Changes</button>
             <span class="strat-update-msg" id="live-strat-update-msg"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="ai-panel collapsed" id="ai-panel">
+        <div class="strat-params-head" id="ai-panel-toggle">
+          <span>AI Model Monitor &amp; OpenRouter</span>
+          <span class="ai-status-badge idle" id="ai-status-badge">idle</span>
+          <button type="button" class="collapse-btn" id="ai-collapse-btn">Show</button>
+        </div>
+        <div class="ai-body">
+          <div class="ai-config">
+            <div class="ai-field">
+              <label for="ai-model-input">AI Model</label>
+              <input id="ai-model-input" type="text" list="ai-model-list" placeholder="openrouter model id" spellcheck="false" />
+              <datalist id="ai-model-list"></datalist>
+            </div>
+            <div class="ai-field">
+              <label for="ai-key-input">OpenRouter API Key</label>
+              <input id="ai-key-input" type="password" placeholder="sk-or-v1-… (leave blank to keep current)" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="ai-config-actions">
+              <button type="button" class="btn btn-apply-strat" id="btn-ai-save">Save</button>
+              <button type="button" class="btn" id="btn-ai-reset">Reset Memory</button>
+              <span class="strat-update-msg" id="ai-save-msg"></span>
+            </div>
+            <p class="ai-hint" id="ai-key-hint">Loading OpenRouter settings…</p>
+          </div>
+          <div class="ai-grid">
+            <div class="ai-card">
+              <div class="ai-card-title">Last Decision</div>
+              <div class="ai-decision" id="ai-decision">
+                <div class="placeholder">Waiting for the next candle…</div>
+              </div>
+              <div class="ai-usage" id="ai-usage">—</div>
+            </div>
+            <div class="ai-card ai-chain-card">
+              <div class="ai-card-title">Chain of Thought <span class="ai-chain-meta" id="ai-chain-meta">—</span></div>
+              <div class="ai-chain" id="ai-chain">
+                <div class="placeholder">No AI reasoning yet</div>
+              </div>
+            </div>
+            <div class="ai-card">
+              <div class="ai-card-title">Decision History</div>
+              <div class="ai-history" id="ai-history">
+                <div class="placeholder">No decisions yet</div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -607,7 +655,7 @@
   </div>
 
   <script src="/static/lightweight-charts.js?v=40"></script>
-  <script src="/static/live.js?v=42"></script>
+  <script src="/static/live.js?v=43"></script>
   <script src="/static/backtest.js?v=40"></script>
   <script src="/static/shell.js?v=40"></script>
 </body>

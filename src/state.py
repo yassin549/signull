@@ -57,6 +57,8 @@ class BotSnapshot:
     # Signull 1.0 strategy status (paper + live)
     strategy: dict[str, Any] | None = None
     strategy_trades: list[dict[str, Any]] = field(default_factory=list)
+    # Signull 1.11 AI model monitor (chain of thought, usage, decisions).
+    ai: dict[str, Any] | None = None
     health: dict[str, Any] = field(default_factory=dict)
 
 
@@ -417,6 +419,18 @@ class BotState:
                 if val is not None:
                     return float(val)
             return None
+
+    def get_sim_prob(self) -> float | None:
+        """Latest SIM model P(Up), when available."""
+        with self._lock:
+            btc = self._snapshot.btc or {}
+            val = btc.get("sim_prob")
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
 
     def get_resolution_refs(self) -> dict[str, float | None]:
         """Beat / chainlink / spot only — never copies price history."""

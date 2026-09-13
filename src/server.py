@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .account import verify_wallet
+from .ai_settings import public_ai_settings, save_ai_settings
 from .backtest_server import register_backtest_routes
 from .bot import TradingBot
 from .config import BotConfig
@@ -38,6 +39,13 @@ class StrategyUpdateRequest(BaseModel):
 
 class CancelOrderRequest(BaseModel):
     order_id: str
+
+
+class AISettingsRequest(BaseModel):
+    api_key: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    clear_key: bool = False
 
 
 class BroadcastHub:
@@ -92,6 +100,12 @@ class BroadcastHub:
         prev_strat = self._prev_snapshot.get("strategy")
         if strat != prev_strat:
             delta["strategy"] = strat
+
+        # AI model monitor (chain of thought, decisions, usage)
+        ai = full.get("ai")
+        prev_ai = self._prev_snapshot.get("ai")
+        if ai != prev_ai:
+            delta["ai"] = ai
 
         # Account — include when changed
         acc = full.get("account")
@@ -412,6 +426,33 @@ def create_app(config: BotConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(err))
         except Exception as err:
             raise HTTPException(status_code=422, detail=str(err))
+
+    @app.get("/api/ai/settings")
+    async def ai_settings_get():
+        return public_ai_settings()
+
+    @app.post("/api/ai/settings")
+    async def ai_settings_post(req: AISettingsRequest):
+        api_key = "" if req.clear_key else req.api_key
+        try:
+            await asyncio.to_thread(
+                save_ai_settings, api_key=api_key, model=req.model, base_url=req.base_url
+            )
+        except OSError as err:
+            raise HTTPException(status_code=500, detail=f"Could not save settings: {err}") from err
+        service.state.log("info", "AI settings updated (OpenRouter)")
+        return public_ai_settings()
+
+    @app.post("/api/ai/reset")
+    async def ai_reset():
+        bot = service._bot
+        strat = getattr(bot, "strategy", None) if bot is not None else None
+        reset_fn = getattr(strat, "reset_ai", None)
+        if not callable(reset_fn):
+            raise HTTPException(status_code=409, detail="AI strategy is not active")
+        reset_fn()
+        service.state.log("info", "AI conversation memory reset")
+        return {"ok": True}
 
     @app.get("/api/health")
     async def health():
