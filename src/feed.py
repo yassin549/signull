@@ -80,11 +80,12 @@ class MarketFeed:
                 no_bids = _complement_levels(asks, market.tick_size)
                 no_asks = _complement_levels(bids, market.tick_size)
                 self.state.update_feed_book("down", no_bids, no_asks)
+                self.state.set_feed_status(True)
         except Exception as exc:
             logger.debug("Orderbook poll failed: %s", exc)
 
-    def _seed_prices_from_category(self, market: CandleMarket) -> None:
-        cat_raw = self._client.get_category(market.slug) if self._client else None
+    async def _seed_prices_from_category(self, market: CandleMarket) -> None:
+        cat_raw = await asyncio.to_thread(self._client.get_category, market.slug) if self._client else None
         if not cat_raw:
             return
         markets = cat_raw.get("markets", [])
@@ -213,7 +214,7 @@ class MarketFeed:
         )
         self.state.log("info", f"New candle: {market.title}")
         await self._bootstrap_book(market)
-        self._seed_prices_from_category(market)
+        await self._seed_prices_from_category(market)
 
     async def _bootstrap_book(self, market: CandleMarket) -> None:
         if market.market_id <= 0:
