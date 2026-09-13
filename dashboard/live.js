@@ -93,6 +93,8 @@ function init() {
 
   initLiveStrategyControl();
 
+  initTopbarModel();
+
   initAiPanel();
 
   fetch("/api/config")
@@ -1233,6 +1235,71 @@ async function applyLiveStrategy() {
   }
 }
 
+/* ── Topbar trading-model selector ── */
+let topbarStrategies = [];
+
+function initTopbarModel() {
+  const sel = document.getElementById("topbar-model-select");
+  if (!sel) return;
+  sel.addEventListener("change", () => applyTopbarModel(sel.value));
+  fetch("/api/strategies")
+    .then(r => r.json())
+    .then(data => {
+      topbarStrategies = data.strategies || [];
+      sel.innerHTML = topbarStrategies
+        .map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+      syncTopbarModel();
+    })
+    .catch(() => {});
+}
+
+function syncTopbarModel() {
+  const sel = document.getElementById("topbar-model-select");
+  if (!sel || !sel.options.length) return;
+  const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy;
+  if (activeId && sel.value !== activeId
+      && Array.from(sel.options).some(o => o.value === activeId)) {
+    sel.value = activeId;
+  }
+}
+
+async function applyTopbarModel(strategyId) {
+  const msg = document.getElementById("topbar-model-msg");
+  if (!strategyId) return;
+  const strat = topbarStrategies.find(s => s.id === strategyId);
+  const params = strat?.default_params ? { ...strat.default_params } : {};
+  if (msg) { msg.textContent = "Applying…"; msg.className = "topbar-model-msg"; }
+  try {
+    const res = await fetch("/api/strategy/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ strategy_id: strategyId, params }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Failed");
+    }
+    const data = await res.json();
+    if (cachedConfig) {
+      cachedConfig.strategy = data.strategy_id;
+      cachedConfig.strategy_name = data.strategy_name;
+      cachedConfig.strategy_params = data.params;
+    }
+    if (latestSnapshotStrategy) {
+      latestSnapshotStrategy.id = data.strategy_id;
+      latestSnapshotStrategy.name = data.strategy_name;
+      latestSnapshotStrategy.params = data.params;
+    }
+    if (msg) { msg.textContent = "Applied"; msg.className = "topbar-model-msg"; }
+    setTimeout(() => { if (msg && msg.textContent === "Applied") msg.textContent = ""; }, 2500);
+    pollStatus();
+    fetch("/api/config").then(r => r.json()).then(c => { cachedConfig = c; syncTopbarModel(); }).catch(() => {});
+  } catch (e) {
+    if (msg) { msg.textContent = e.message || "Failed"; msg.className = "topbar-model-msg err"; }
+    syncTopbarModel();
+  }
+}
+
 /* ── AI Model Monitor (Signull 1.11 / OpenRouter) ── */
 let aiSettings = null;
 let aiUserEditingModel = false;
@@ -1348,7 +1415,7 @@ function renderAi(ai) {
   renderAiDecision(ai);
   renderAiUsage(ai);
   renderAiChain(ai);
-  renderAiHistory(ai.history || []);
+  renderAiHistory(ai);
 }
 
 function renderAiDecision(ai) {
@@ -1365,13 +1432,19 @@ function renderAiDecision(ai) {
   const result = last.won === true ? "WIN" : last.won === false ? "LOSS" : "PENDING";
   const resultCls = last.won === true ? "win" : last.won === false ? "loss" : "pending";
   const factors = (last.key_factors || []).map(f => `<li>${esc(f)}</li>`).join("");
+  const stake = Number(last.stake);
+  const pnl = Number(last.pnl);
+  const pnlCls = Number.isFinite(pnl) ? (pnl >= 0 ? "win" : "loss") : "pending";
+  const pnlTxt = Number.isFinite(pnl) ? `${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}` : "";
   el.innerHTML = `
     <div>
       <span class="ai-side ${esc(side)}">${esc(side.toUpperCase())}</span>
       <span class="ai-conf">${Number.isFinite(conf) ? Math.round(conf * 100) + "% conf" : ""}</span>
       <span class="ai-row-result ${resultCls}">${result}</span>
+      ${pnlTxt ? `<span class="ai-row-result ${pnlCls}">${pnlTxt}</span>` : ""}
     </div>
     <span class="ai-reason">${esc(last.reasoning || "—")}</span>
+    ${Number.isFinite(stake) ? `<span class="ai-sub">Stake $${stake.toFixed(2)} · Entry ${Number(last.entry_price) || 0}</span>` : ""}
     ${factors ? `<ul class="ai-factors">${factors}</ul>` : ""}
   `;
 }
@@ -1383,6 +1456,11 @@ function renderAiUsage(ai) {
   const parts = [];
   if (usage.calls != null) parts.push(`${usage.calls} calls`);
   if (usage.total_tokens != null) parts.push(`${usage.total_tokens} tokens`);
+  if (ai.trades) parts.push(`${ai.wins || 0}W/${ai.losses || 0}L`);
+  if (ai.pnl_total != null) {
+    const total = Number(ai.pnl_total);
+    parts.push(`P/L ${total >= 0 ? "+" : "−"}$${Math.abs(total).toFixed(2)}`);
+  }
   if (ai.model) parts.push(esc(ai.model));
   const html = parts.length ? parts.join(" · ") : "—";
   const errorHtml = ai.last_error ? `<span class="ai-error">${esc(ai.last_error)}</span>` : "";
@@ -1421,9 +1499,18 @@ function renderAiChain(ai) {
   if (nearBottom) el.scrollTop = el.scrollHeight;
 }
 
-function renderAiHistory(history) {
+function renderAiHistory(ai) {
   const el = document.getElementById("ai-history");
   if (!el) return;
+  const history = ai.history || [];
+  const meta = document.getElementById("ai-history-meta");
+  if (meta) {
+    const total = ai.pnl_total != null ? Number(ai.pnl_total) : null;
+    const trades = ai.trades || 0;
+    meta.textContent = total == null
+      ? `${trades} settled`
+      : `${trades} settled · P/L ${total >= 0 ? "+" : "−"}$${Math.abs(total).toFixed(2)}`;
+  }
   if (!history.length) {
     el.innerHTML = '<div class="placeholder">No decisions yet</div>';
     return;
@@ -1435,11 +1522,15 @@ function renderAiHistory(history) {
     const result = won === true ? "win" : won === false ? "loss" : "pending";
     const label = won === true ? "WIN" : won === false ? "LOSS" : "…";
     const time = h.time ? String(h.time).replace(" UTC", "") : "";
+    const pnl = Number(h.pnl);
+    const pnlCls = Number.isFinite(pnl) ? (pnl >= 0 ? "win" : "loss") : "pending";
+    const pnlTxt = Number.isFinite(pnl) ? `${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}` : "";
     return `<div class="ai-row">
       <span class="ai-row-time">${esc(time)}</span>
       <span class="ai-row-side ${esc(side)}">${esc(side.toUpperCase())}</span>
       <span class="ai-row-conf">${Number.isFinite(conf) ? Math.round(conf * 100) + "%" : ""}</span>
       <span class="ai-row-result ${result}">${label}</span>
+      <span class="ai-row-pnl ${pnlCls}">${pnlTxt}</span>
     </div>`;
   }).join("");
   if (el.dataset.sig !== rows) {
@@ -1479,6 +1570,7 @@ function updateStrategyParams(s) {
     latestSnapshotStrategy = s;
   }
   updateSimCardHeader();
+  syncTopbarModel();
   needsRedraw = true;
   const grid = document.getElementById("strat-params-grid");
   const nameEl = document.getElementById("strat-params-name");

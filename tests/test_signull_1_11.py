@@ -48,25 +48,47 @@ class TestStrategyRegistration:
 
 
 class TestConfidenceSizing:
-    def test_confidence_scales_between_bounds(self):
+    def test_confidence_scales_between_dollar_bounds(self):
         from strategies.signull_1_11 import Signull11Strategy
 
         strategy = Signull11Strategy(
-            {"min_risk_pct": 0.02, "max_risk_pct": 0.10, "asset": "btc"}
+            {"min_stake_usd": 1.0, "max_stake_usd": 2.0, "asset": "btc"}
         )
-        # Low confidence -> minimum risk
         strategy._last_confidence = 0.5
-        low_stake, _, low_frac = strategy.stake_override(
+        low_stake, _, _ = strategy.stake_override(
             None, None, None, equity=100.0, initial=100.0
         )
-        # Full confidence -> maximum risk
         strategy._last_confidence = 1.0
-        high_stake, _, high_frac = strategy.stake_override(
+        high_stake, _, _ = strategy.stake_override(
             None, None, None, equity=100.0, initial=100.0
         )
-        assert low_stake == pytest.approx(2.0)
-        assert high_stake == pytest.approx(10.0)
-        assert low_frac < high_frac
+        assert low_stake == pytest.approx(1.0)
+        assert high_stake == pytest.approx(2.0)
+
+    def test_theoretical_pnl_recorded_on_close(self):
+        from strategies.signull_1_11 import Signull11Strategy
+
+        strategy = Signull11Strategy({"asset": "btc", "min_stake_usd": 1.0, "max_stake_usd": 2.0})
+        strategy._ai_history.append({
+            "slug": "c9",
+            "side": "up",
+            "confidence": 1.0,
+            "entry_price": 0.5,
+            "stake": None,
+            "winner": None,
+            "won": None,
+            "pnl": None,
+        })
+        strategy._stake_by_slug["c9"] = 2.0
+        strategy.register_closed_candle("c9", [(1, 0.6, 0.4), (2, 0.6, 0.4), (3, 0.6, 0.4)])
+        entry = strategy._ai_history[-1]
+        assert entry["won"] is True
+        assert entry["winner"] == "up"
+        assert entry["pnl"] == pytest.approx(1.98)
+        snapshot = strategy.ai_snapshot()
+        assert snapshot["pnl_total"] == pytest.approx(1.98)
+        assert snapshot["trades"] == 1
+        assert snapshot["wins"] == 1
 
     def test_outcome_feedback_text(self):
         from strategies.signull_1_11 import Signull11Strategy
@@ -94,6 +116,29 @@ class TestConfidenceSizing:
         strategy.register_closed_candle("c2", [(1, 0.4, 0.6), (2, 0.3, 0.7)])
         strategy.on_trade_settled(True)  # must not raise
         assert strategy._ai_history[-1]["won"] is True
+
+
+class TestPureReasoningContext:
+    def test_ohlcv_block_contains_only_candles(self):
+        from strategies.signull_1_11 import Signull11Strategy
+        from strategies.base import CandleContext, TickContext
+
+        strategy = Signull11Strategy({"asset": "btc"})
+        bars = [
+            {"start": 1000 + i * 300, "open": 100.0 + i, "high": 101.0 + i,
+             "low": 99.0 + i, "close": 100.5 + i, "vol": 10.0}
+            for i in range(6)
+        ]
+        strategy._fetch_bars = lambda now: bars  # type: ignore[assignment]
+        tick = TickContext(t=2000, up=0.5, down=0.5, seconds_into_candle=3.0, seconds_to_close=297.0)
+        candle = CandleContext(slug="btc-updown-5m-1000", title="x", start_ts=1000, end_ts=1300, winner="")
+        block = strategy._ohlcv_block(tick, candle)
+        assert "OHLCV" in block
+        assert "SIM" not in block.upper()
+        assert "ODDS" not in block.upper()
+        assert "ACCOUNT" not in block.upper()
+        # Exactly five completed candles are shown.
+        assert block.count("\n- ") == 5
 
 
 class TestAISettings:

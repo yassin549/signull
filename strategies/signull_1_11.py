@@ -63,16 +63,18 @@ class Signull11Strategy(Strategy):
         id="signull_1_11",
         name="Signull 1.11 (AI OpenRouter)",
         description=(
-            "Sends the BTC 5-minute chart context to an OpenRouter LLM at candle "
-            "open and buys the side the model picks (always Up or Down). Stake is "
-            "scaled by the model's confidence. Live only — never backtested."
+            "Sends ONLY the last 5 BTC 5-minute candles (OHLCV) to an OpenRouter "
+            "LLM at candle open and buys the side the model picks (always Up or "
+            "Down). Pure price-action reasoning — no SIM model, odds or account "
+            "input. Stake is scaled by confidence between $1 and $2. Live only."
         ),
         default_params={
-            "min_risk_pct": 0.02,
-            "max_risk_pct": 0.10,
+            "min_stake_usd": 1.0,
+            "max_stake_usd": 2.0,
+            "taker_fee_rate": 0.02,
             "decision_delay_sec": 3.0,
             "entry_window_sec": 120.0,
-            "btc_lookback_minutes": 90,
+            "btc_lookback_minutes": 30,
             "temperature": 0.2,
             "max_tokens": 700,
             "asset": "btc",
@@ -89,6 +91,7 @@ class Signull11Strategy(Strategy):
         self._outcomes: dict[str, dict] = {}
         self._reported_outcomes: set[str] = set()
         self._ai_history: list[dict] = []
+        self._stake_by_slug: dict[str, float] = {}
         self._last_confidence: float | None = None
         self._last_context: str = ""
         self._ai_version = 0
@@ -133,25 +136,65 @@ class Signull11Strategy(Strategy):
         )
         return TradeSignal(side=side, price=price, reason=reason)
 
-    def register_closed_candle(self, slug: str, ticks: list[tuple[int, float, float]]) -> bool:
-        winner: str | None = None
-        up_open = up_close = None
+    def _actual_winner(
+        self, slug: str, ticks: list[tuple[int, float, float]]
+    ) -> tuple[str | None, dict | None]:
+        """Resolve the candle's true direction from its OHLCV (close vs open)."""
+        start = None
+        try:
+            start = int(str(slug).rsplit("-", 1)[-1])
+        except (ValueError, IndexError):
+            start = None
+        if start is not None:
+            try:
+                rows = fetch_klines(start, start + 300, asset=self._asset)
+                for bar in _group_5m(rows):
+                    if int(bar["start"]) == start:
+                        return ("up" if bar["close"] >= bar["open"] else "down"), bar
+            except Exception as exc:
+                logger.debug("actual winner fetch failed: %s", exc)
         if ticks:
+            winner = None
             try:
                 winner = winner_from_ticks(ticks, at_close=True)
             except Exception:
                 winner = None
-            up_open = float(ticks[0][1])
-            up_close = float(ticks[-1][1])
             if winner is None:
-                winner = "up" if up_close >= 0.5 else "down"
+                winner = "up" if float(ticks[-1][1]) >= 0.5 else "down"
+            return winner, None
+        return None, None
+
+    def _theoretical_pnl(self, stake: float, entry_price: float, won: bool) -> float:
+        from src.sizing import estimate_taker_fee
+
+        if entry_price <= 0 or stake <= 0:
+            return 0.0
+        fee = estimate_taker_fee(stake, entry_price, float(self.params.get("taker_fee_rate", 0.02)))
+        if won:
+            return stake / entry_price - stake - fee
+        return -stake - fee
+
+    def register_closed_candle(self, slug: str, ticks: list[tuple[int, float, float]]) -> bool:
+        winner, _bar = self._actual_winner(slug, ticks)
         with self._state_lock:
+            entry = next((e for e in reversed(self._ai_history) if e.get("slug") == slug), None)
+            stake = self._stake_by_slug.get(slug)
+            entry_price = entry.get("entry_price") if entry else None
+            won: bool | None = None
+            pnl: float | None = None
+            if entry is not None and winner and stake and entry_price:
+                won = entry.get("side") == winner
+                pnl = self._theoretical_pnl(float(stake), float(entry_price), won)
+                entry["won"] = bool(won)
+                entry["winner"] = winner
+                entry["stake"] = round(float(stake), 2)
+                entry["pnl"] = round(float(pnl), 4)
             self._outcomes[slug] = {
                 "slug": slug,
                 "winner": winner,
-                "up_open": up_open,
-                "up_close": up_close,
-                "ticks": len(ticks),
+                "won": won,
+                "pnl": round(float(pnl), 4) if pnl is not None else None,
+                "stake": round(float(stake), 2) if stake else None,
             }
             if len(self._outcomes) > 40:
                 for old in sorted(self._outcomes)[:-30]:
@@ -160,25 +203,38 @@ class Signull11Strategy(Strategy):
             self._ai_version += 1
         return False
 
-    def on_trade_settled(self, won: bool) -> None:
+    def on_trade_settled(self, won: bool, info: dict | None = None) -> None:
         with self._state_lock:
-            if self._ai_history:
+            slug = (info or {}).get("slug")
+            entry = None
+            if slug:
+                entry = next((e for e in reversed(self._ai_history) if e.get("slug") == slug), None)
+            if entry is None and self._ai_history:
                 entry = self._ai_history[-1]
+            if entry is not None:
                 chosen = entry.get("side")
                 entry["won"] = bool(won)
-                if not entry.get("winner") and chosen:
+                if not entry.get("winner"):
                     entry["winner"] = chosen if won else ("down" if chosen == "up" else "up")
+                if info:
+                    if info.get("winner"):
+                        entry["winner"] = info["winner"]
+                    if info.get("stake") is not None:
+                        entry["stake"] = round(float(info["stake"]), 2)
+                    if info.get("pnl") is not None:
+                        entry["pnl"] = round(float(info["pnl"]), 4)
                 outcome = self._outcomes.get(entry.get("slug"))
                 if outcome is not None:
                     outcome["won"] = bool(won)
-                    if not outcome.get("winner") and chosen:
-                        outcome["winner"] = chosen if won else ("down" if chosen == "up" else "up")
+                    if entry.get("winner"):
+                        outcome["winner"] = entry["winner"]
+                    if entry.get("pnl") is not None:
+                        outcome["pnl"] = entry["pnl"]
             self._ai_version += 1
 
     # ── decision plumbing ───────────────────────────────────────────────────
     def _decide(self, tick: TickContext, candle: CandleContext):
         with self._state_lock:
-            is_first = not self._ai_history
             prev_slug = self._ai_history[-1]["slug"] if self._ai_history else None
             prev_side = self._ai_history[-1]["side"] if self._ai_history else None
             outcome = None
@@ -191,17 +247,9 @@ class Signull11Strategy(Strategy):
                 outcome["side"] = prev_side
 
         parts: list[str] = []
-        if is_first:
-            parts.append(
-                "INITIAL BRIEFING: This is your first decision. Study the chart "
-                "context below carefully; later candles will only send you the "
-                "previous candle's result plus the fresh state."
-            )
-        elif outcome is not None:
+        if outcome is not None:
             parts.append(self._outcome_text(outcome))
-        else:
-            parts.append("PREVIOUS CANDLE RESULT: awaiting settlement / no prior trade.")
-        parts.append(self._market_block(tick, candle, detailed=is_first))
+        parts.append(self._ohlcv_block(tick, candle))
         context_text = "\n\n".join(parts)
 
         decision = self._engine.decide(
@@ -209,6 +257,11 @@ class Signull11Strategy(Strategy):
             temperature=float(self.params.get("temperature", 0.2)),
             max_tokens=int(self.params.get("max_tokens", 700)),
         )
+
+        side = decision.side
+        entry_price = float(tick.up) if side == "up" else float(tick.down)
+        if not (0.0 < entry_price < 1.0):
+            entry_price = 0.5
 
         with self._state_lock:
             if outcome is not None and prev_slug:
@@ -225,8 +278,11 @@ class Signull11Strategy(Strategy):
                 "key_factors": list(decision.key_factors),
                 "model": decision.model,
                 "latency_ms": round(decision.latency_ms, 1),
+                "entry_price": round(entry_price, 4),
+                "stake": None,
                 "winner": None,
                 "won": None,
+                "pnl": None,
             })
             if len(self._ai_history) > 200:
                 self._ai_history = self._ai_history[-200:]
@@ -238,20 +294,16 @@ class Signull11Strategy(Strategy):
         side = pending.get("side")
         winner = pending.get("winner")
         won = pending.get("won")
-        lines = [f"PREVIOUS CANDLE ({pending.get('slug')}) RESULT:"]
-        lines.append(f"- Actual outcome: {str(winner).upper() if winner else 'unknown'}")
+        lines = ["PREVIOUS CANDLE RESULT:"]
+        lines.append(f"- Actual: {str(winner).upper() if winner else 'unknown'}")
         if side:
             lines.append(f"- You predicted: {str(side).upper()}")
         if won is not None:
             lines.append(f"- Result: {'WIN' if won else 'LOSS'}")
-        if pending.get("up_open") is not None and pending.get("up_close") is not None:
-            lines.append(
-                f"- Up token odds moved {pending['up_open']:.2f} -> {pending['up_close']:.2f}"
-            )
         return "\n".join(lines)
 
     def _fetch_bars(self, now_ts: float) -> list[dict[str, float]]:
-        lookback = max(10, int(self.params.get("btc_lookback_minutes", 90))) * 60
+        lookback = max(10, int(self.params.get("btc_lookback_minutes", 30))) * 60
         try:
             rows = fetch_klines(int(now_ts) - lookback, int(now_ts) + 60, asset=self._asset)
         except Exception as exc:
@@ -259,82 +311,42 @@ class Signull11Strategy(Strategy):
             return []
         return _group_5m(rows)
 
-    def _market_block(self, tick: TickContext, candle: CandleContext, *, detailed: bool = False) -> str:
-        spot = tick.btc_price
-        beat = tick.btc_price_to_beat
-        up = float(tick.up)
-        down = float(tick.down)
-        implied = up / (up + down) if (up + down) > 0 else 0.5
-
-        lines: list[str] = []
-        lines.append(f"NOW: {_utc(tick.t)}")
-        lines.append(
-            f"CURRENT 5M CANDLE: {candle.slug} — started {_utc(candle.start_ts)}, "
-            f"{tick.seconds_into_candle:.0f}s elapsed, {tick.seconds_to_close:.0f}s to close"
-        )
-        if spot is not None and beat is not None:
-            delta = float(spot) - float(beat)
-            pct = (delta / float(beat) * 100.0) if beat else 0.0
-            lines.append(
-                f"BTC PRICE: spot {float(spot):.2f}, candle open (beat) {float(beat):.2f}, "
-                f"delta {'+' if delta >= 0 else ''}{delta:.2f} ({pct:+.3f}%)"
-            )
-        elif spot is not None:
-            lines.append(f"BTC PRICE: spot {float(spot):.2f} (open beat unavailable)")
-        lines.append(
-            f"MARKET ODDS: Up {up:.3f} / Down {down:.3f} — implied P(Up) = {implied:.3f}"
-        )
-        if tick.sim_prob is not None:
-            lines.append(f"SIM MODEL P(Up): {float(tick.sim_prob):.3f}")
-
-        account = (
-            f"ACCOUNT: equity {self._equity:.2f}, initial {self._initial_capital:.2f}, "
-            f"return {((self._equity / self._initial_capital - 1) * 100) if self._initial_capital else 0:+.2f}%, "
-            f"wins streak {self._wins_streak}, losses streak {self._losses_streak}, "
-            f"recent wins {self._wins_recent}/10"
-        )
-        lines.append(account)
-
+    def _ohlcv_block(self, tick: TickContext, candle: CandleContext) -> str:
+        """Only the last five completed 5-minute candles — nothing else."""
         bars = self._fetch_bars(tick.t)
-        if bars:
-            lines.append("RECENT 5M BARS (oldest -> newest):")
-            for bar in bars[(-18 if detailed else -12):]:
-                direction = "UP" if bar["close"] >= bar["open"] else "DOWN"
-                change = (bar["close"] - bar["open"]) / bar["open"] * 100 if bar["open"] else 0.0
+        completed = [b for b in bars if int(b["start"]) != int(candle.start_ts)]
+        last5 = completed[-5:]
+        lines = ["LAST 5 BTC 5-MINUTE CANDLES (OHLCV, oldest -> newest):"]
+        if last5:
+            for bar in last5:
                 lines.append(
                     f"- {_utc(bar['start'])} O {bar['open']:.2f} H {bar['high']:.2f} "
-                    f"L {bar['low']:.2f} C {bar['close']:.2f} ({change:+.2f}%) {direction}"
+                    f"L {bar['low']:.2f} C {bar['close']:.2f} V {bar['vol']:.2f}"
                 )
         else:
-            lines.append("RECENT 5M BARS: unavailable this candle")
-
-        if self._ai_history:
-            lines.append("YOUR RECENT DECISIONS (newest last):")
-            for entry in self._ai_history[-5:]:
-                won = entry.get("won")
-                result = "pending" if won is None else ("WIN" if won else "LOSS")
-                lines.append(
-                    f"- {entry['time']} {entry['side'].upper()} @ {entry['confidence']:.0%} "
-                    f"-> {str(entry.get('winner') or '?').upper()} ({result})"
-                )
-
+            lines.append("- (candle data unavailable)")
+        lines.append(
+            "Predict whether the NEXT 5-minute candle closes UP (above its open) or DOWN (below its open)."
+        )
         return "\n".join(lines)
 
     # ── sizing ──────────────────────────────────────────────────────────────
-    def _risk_fraction(self) -> float:
-        confidence = self._last_confidence if self._last_confidence is not None else 0.6
-        min_pct = float(self.params.get("min_risk_pct", 0.02))
-        max_pct = float(self.params.get("max_risk_pct", 0.10))
-        if max_pct < min_pct:
-            min_pct, max_pct = max_pct, min_pct
+    def _stake_for_confidence(self) -> float:
+        confidence = self._last_confidence if self._last_confidence is not None else 0.5
+        min_stake = float(self.params.get("min_stake_usd", 1.0))
+        max_stake = float(self.params.get("max_stake_usd", 2.0))
+        if max_stake < min_stake:
+            min_stake, max_stake = max_stake, min_stake
         scaled = max(0.0, min(1.0, (confidence - 0.5) / 0.5))
-        return min_pct + (max_pct - min_pct) * scaled
+        return min_stake + (max_stake - min_stake) * scaled
 
     def position_risk_fraction(
         self, signal: TradeSignal, tick: TickContext, candle: CandleContext
     ) -> float:
         del signal, tick, candle
-        return self._risk_fraction()
+        stake = self._stake_for_confidence()
+        base = self._initial_capital or 100.0
+        return stake / base if base else 0.0
 
     def stake_override(
         self,
@@ -346,17 +358,24 @@ class Signull11Strategy(Strategy):
         initial: float = 0.0,
         wallet_balance: float | None = None,
     ) -> tuple[float, str, float]:
-        """Confidence-scaled stake that works even when USE_FIXED_STAKE=true."""
-        del signal, tick, candle, wallet_balance
-        risk_frac = self._risk_fraction()
-        base = float(equity or initial or 0.0)
-        stake = max(0.0, base * risk_frac)
-        confidence = self._last_confidence if self._last_confidence is not None else 0.6
-        return stake, f"AI {int(round(confidence * 100))}% conf", round(risk_frac, 4)
+        """Fixed $1-$2 stake scaled by confidence (works with USE_FIXED_STAKE)."""
+        del signal, tick, wallet_balance
+        stake = self._stake_for_confidence()
+        confidence = self._last_confidence if self._last_confidence is not None else 0.5
+        slug = getattr(candle, "slug", None)
+        if slug:
+            with self._state_lock:
+                self._stake_by_slug[slug] = stake
+                if len(self._stake_by_slug) > 100:
+                    for old in sorted(self._stake_by_slug)[:-60]:
+                        self._stake_by_slug.pop(old, None)
+        base = float(initial or equity or 0.0)
+        risk_frac = (stake / base) if base else 0.0
+        return stake, f"AI {int(round(confidence * 100))}% conf · ${stake:.2f}", round(risk_frac, 4)
 
     def size_label(self, risk_frac: float) -> str:
         del risk_frac
-        confidence = self._last_confidence if self._last_confidence is not None else 0.6
+        confidence = self._last_confidence if self._last_confidence is not None else 0.5
         return f"AI {int(round(confidence * 100))}% conf"
 
     # ── dashboard monitor ───────────────────────────────────────────────────
@@ -366,6 +385,7 @@ class Signull11Strategy(Strategy):
             self._ai_history = []
             self._outcomes = {}
             self._reported_outcomes = set()
+            self._stake_by_slug = {}
             self._decided_slug = None
             self._last_confidence = None
             self._last_context = ""
@@ -376,6 +396,10 @@ class Signull11Strategy(Strategy):
         with self._state_lock:
             history = list(self._ai_history[-30:])
             outcomes = list(self._outcomes.values())[-5:]
+            settled = [e for e in self._ai_history if e.get("pnl") is not None]
+            pnl_total = sum(float(e["pnl"]) for e in settled)
+            wins = sum(1 for e in self._ai_history if e.get("won") is True)
+            losses = sum(1 for e in self._ai_history if e.get("won") is False)
         return {
             "status": engine["status"],
             "last_error": engine["last_error"],
@@ -386,5 +410,9 @@ class Signull11Strategy(Strategy):
             "history": history,
             "last_context": self._last_context[-1500:],
             "pending_outcome": outcomes[-1] if outcomes else None,
+            "pnl_total": round(pnl_total, 4),
+            "trades": len(settled),
+            "wins": wins,
+            "losses": losses,
             "version": self._ai_version,
         }

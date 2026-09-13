@@ -92,12 +92,14 @@ class Strategy(ABC):
         self._losses_streak = losses_streak
         self._equity_momentum = equity_momentum
 
-    def on_trade_settled(self, won: bool) -> None:
+    def on_trade_settled(self, won: bool, info: dict[str, Any] | None = None) -> None:
         """Receive the outcome of a trade placed by this strategy.
 
         The default is intentionally a no-op. Adaptive strategies can use this
         hook to update online calibration without the engine knowing their
-        model details.
+        model details. ``info`` carries optional settle details (``slug``,
+        ``winner``, ``stake``, ``entry_price``, ``pnl``) for strategies whose
+        overrides accept it.
         """
 
     def on_signal_resolved(self, won: bool, *, traded: bool) -> None:

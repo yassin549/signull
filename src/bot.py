@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+import inspect
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -767,7 +768,14 @@ class TradingBot:
 
         won = pending.side == result.winner
         pnl = _settle_pnl(stake, pending.entry_price, won, pending.entry_fee)
-        self.strategy.on_trade_settled(won)
+        self._notify_trade_settled(won, {
+            "slug": result.slug,
+            "winner": result.winner,
+            "side": pending.side,
+            "entry_price": pending.entry_price,
+            "stake": round(stake, 4),
+            "pnl": round(pnl, 4),
+        })
 
         with self._bankroll_lock:
             self._equity += pnl
@@ -1226,6 +1234,23 @@ class TradingBot:
             logger.exception("ai_snapshot failed")
             return
         self.state.update(ai=payload)
+
+    def _notify_trade_settled(self, won: bool, info: dict) -> None:
+        """Call on_trade_settled, passing settle info only if the strategy accepts it."""
+        handler = getattr(self.strategy, "on_trade_settled", None)
+        if not callable(handler):
+            return
+        try:
+            accepts_info = "info" in inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            accepts_info = False
+        try:
+            if accepts_info:
+                handler(won, info=info)
+            else:
+                handler(won)
+        except Exception:
+            logger.exception("on_trade_settled failed")
 
     def _read_prices(self, market: CandleMarket) -> tuple[float, float]:
         live = self.state.get_live_prices()

@@ -190,11 +190,12 @@ class BotConfig:
             }
         if self.strategy_id == "signull_1_11":
             return {
-                "min_risk_pct": float(os.getenv("SIGNULL_AI_MIN_RISK_PCT", "0.02")),
-                "max_risk_pct": float(os.getenv("SIGNULL_AI_MAX_RISK_PCT", "0.10")),
+                "min_stake_usd": float(os.getenv("SIGNULL_AI_MIN_STAKE_USD", "1.0")),
+                "max_stake_usd": float(os.getenv("SIGNULL_AI_MAX_STAKE_USD", "2.0")),
+                "taker_fee_rate": self.taker_fee_rate,
                 "decision_delay_sec": float(os.getenv("SIGNULL_AI_DECISION_DELAY_SEC", "3.0")),
                 "entry_window_sec": float(os.getenv("SIGNULL_AI_ENTRY_WINDOW_SEC", "120.0")),
-                "btc_lookback_minutes": int(os.getenv("SIGNULL_AI_LOOKBACK_MIN", "90")),
+                "btc_lookback_minutes": int(os.getenv("SIGNULL_AI_LOOKBACK_MIN", "30")),
                 "temperature": float(os.getenv("SIGNULL_AI_TEMPERATURE", "0.2")),
                 "max_tokens": int(os.getenv("SIGNULL_AI_MAX_TOKENS", "700")),
                 "asset": self.asset,

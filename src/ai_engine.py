@@ -27,17 +27,20 @@ logger = logging.getLogger(__name__)
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "ai_conversation.json"
 
+# Bump when SYSTEM_PROMPT changes so an old transcript is discarded.
+PROMPT_VERSION = 2
+
 SYSTEM_PROMPT = """You are Signull AI, a disciplined 5-minute Bitcoin up/down trading model.
-Each round you receive the live state of a 5-minute BTC up/down market and must predict
-whether the candle will close UP (BTC above the opening "beat" price) or DOWN.
+Each round you receive ONLY the last 5 completed BTC 5-minute candles as OHLCV and must
+predict whether the NEXT 5-minute candle will close UP (above its open) or DOWN (below
+its open).
 
 Rules:
 - Always choose exactly one side: "up" or "down". Never hold.
-- Ground the decision in the supplied BTC chart context: recent candle direction,
-  momentum, distance from the current candle's open (beat), the order-book implied
-  probability, and the SIM model probability when present.
-- Calibrate confidence honestly: it is your probability (0.50-1.00) that the candle
-  closes on the side you chose. High conviction should be earned by converging signals.
+- Reason purely from the raw price action in the 5 candles: candle bodies, wicks,
+  sequences, momentum, range and volume. Do not invent indicators or outside data.
+- Calibrate confidence honestly: it is your probability (0.50-1.00) that the next
+  candle closes on the side you chose. Low-conviction setups should stay near 0.50.
 
 Reply with a single JSON object and nothing else:
 {"decision": "up" | "down", "confidence": 0.0-1.0, "reasoning": "2-4 sentences", "key_factors": ["...", "..."]}
@@ -200,7 +203,7 @@ class AIDecisionEngine:
             payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             payload = None
-        if isinstance(payload, dict) and isinstance(payload.get("messages"), list) and payload["messages"]:
+        if isinstance(payload, dict) and payload.get("prompt_version") == PROMPT_VERSION and isinstance(payload.get("messages"), list) and payload["messages"]:
             with self._lock:
                 self._messages = [
                     m for m in payload["messages"] if isinstance(m, dict) and m.get("role") and "content" in m
@@ -226,6 +229,7 @@ class AIDecisionEngine:
             with self._lock:
                 payload = {
                     "saved_at": time.time(),
+                    "prompt_version": PROMPT_VERSION,
                     "messages": list(self._messages[-self._max_transcript :]),
                     "usage": dict(self._usage),
                     "last_model": self._last_model,

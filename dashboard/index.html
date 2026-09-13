@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=42" />
+  <link rel="stylesheet" href="/static/styles.css?v=43" />
 </head>
 <body>
   <div class="app">
@@ -48,6 +48,11 @@
 
       <div class="topbar-actions">
         <div class="live-only topbar-actions-inner">
+          <div class="topbar-model">
+            <label for="topbar-model-select">Trading model</label>
+            <select id="topbar-model-select" title="Choose which model trades the account"></select>
+            <span class="topbar-model-msg" id="topbar-model-msg"></span>
+          </div>
           <button class="btn btn-start" id="btn-start" type="button">▶ Start</button>
           <button class="btn btn-stop" id="btn-stop" type="button">■ Stop</button>
         </div>
@@ -276,7 +281,7 @@
               </div>
             </div>
             <div class="ai-card">
-              <div class="ai-card-title">Decision History</div>
+              <div class="ai-card-title">Decision History <span class="ai-chain-meta" id="ai-history-meta">—</span></div>
               <div class="ai-history" id="ai-history">
                 <div class="placeholder">No decisions yet</div>
               </div>
@@ -655,7 +660,7 @@
   </div>
 
   <script src="/static/lightweight-charts.js?v=40"></script>
-  <script src="/static/live.js?v=43"></script>
+  <script src="/static/live.js?v=44"></script>
   <script src="/static/backtest.js?v=40"></script>
   <script src="/static/shell.js?v=40"></script>
 </body>
