@@ -230,7 +230,7 @@ class TradingBot:
             self.state.log("info", "Restored strategy trade history from session")
 
     def persist_session(self) -> None:
-        snap = self.state.get_snapshot(history_points=MAX_EQUITY_HISTORY)
+        snap = self.state.get_snapshot(history_points=0, equity_points=MAX_EQUITY_HISTORY)
         with self._bankroll_lock:
             payload = {
                 "initial_capital": round(self._initial, 4),
@@ -736,7 +736,8 @@ class TradingBot:
             use_refs = frozen if frozen is not None else (refs or {})
 
             winner, source = self._resolve_winner_reliable(start_ts=start_ts, ticks=ticks, refs=use_refs)
-            self._apply_settle_result(
+            # Hand off to the bot thread; bot state must not be mutated here.
+            self._settle_results.put(
                 _SettleResult(slug=slug, title=title, pending=pending, winner=winner, source=source, filled_shares=filled)
             )
         finally:

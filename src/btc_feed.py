@@ -41,7 +41,9 @@ class BtcPriceFeed:
                 )
                 if resp.status_code == 200:
                     price = float(resp.json()["price"])
-                    self.state.update_btc_price(price, int(time.time() * 1000))
+                    await asyncio.to_thread(
+                        self.state.update_btc_price, price, int(time.time() * 1000)
+                    )
                     self.state.set_btc_feed_status(True)
             except Exception as exc:
                 self.state.set_btc_feed_status(False, str(exc))

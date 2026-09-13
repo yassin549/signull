@@ -46,6 +46,16 @@ let candleTransitionTimer = null;
 let cachedConfig = null;
 let latestSnapshotStrategy = null;
 let latestSnapshot = null;
+/** Persistent merge of the last seen snapshot fields (deltas are partial). */
+let clientState = {};
+const CLIENT_HISTORY_KEYS = new Set(["price_history", "btc_history", "sim_history", "equity_history"]);
+function mergeClientState(d) {
+  for (const key in d) {
+    if (!Object.prototype.hasOwnProperty.call(d, key)) continue;
+    if (CLIENT_HISTORY_KEYS.has(key)) continue;
+    clientState[key] = d[key];
+  }
+}
 let lwEquityChart = null;
 let lwEquitySeries = null;
 /** Cache to avoid re-rendering unchanged innerHTML content (fixes blinking) */
@@ -90,6 +100,7 @@ function init() {
   initHealthPopover();
   initNetWatch();
   initCopyButtons();
+  initDelegatedHandlers();
 
   initLiveStrategyControl();
 
@@ -201,6 +212,9 @@ function applySnapshot(d, isFull) {
     return;
   }
 
+  // Keep a persistent copy so partial deltas never blank out fields.
+  mergeClientState(d);
+
   // Always update fast-changing fields
   if (d.btc != null) {
     lastBtcSnapshot = d.btc;
@@ -222,10 +236,10 @@ function applySnapshot(d, isFull) {
     if (d.prices.down != null) smooth.down = lerp(smooth.down, d.prices.down, 0.35);
   }
 
-  // Candle detection
+  // Candle detection — only ever move forward (ignore stale/out-of-order frames)
   const incomingStart = d.btc_candle_start_ts != null && Number.isFinite(Number(d.btc_candle_start_ts))
     ? Number(d.btc_candle_start_ts) : null;
-  if (incomingStart != null && incomingStart !== activeCandleStartTs) {
+  if (incomingStart != null && (activeCandleStartTs == null || incomingStart > activeCandleStartTs)) {
     const isRollover = activeCandleStartTs != null;
     activeCandleStartTs = incomingStart;
     if (d.market?.slug) activeCandleSlug = d.market.slug;
@@ -278,7 +292,7 @@ function applySnapshot(d, isFull) {
   );
   needsRedraw = true;
 
-  onUpdate(d);
+  onUpdate(clientState);
 }
 
 function mergeEquityHistory(incoming) {
@@ -293,7 +307,7 @@ function mergeEquityHistory(incoming) {
     }
   });
   equityHistory = [...byT.values()].sort((a, b) => a.t - b.t).slice(-50000);
-  updateLightweightEquityChart();
+  needsRedraw = true;
 }
 
 function mergeHistory(incoming) {
@@ -407,31 +421,32 @@ function recomputeBtcDeltas() {
 
 /** Pick the freshest usable spot source for the BTC panel and chart. */
 function currentBtcSpot(btc, now = Date.now() / 1000) {
-  if (!btc) return { value: null, source: null, binanceAge: Infinity };
+  if (!btc) return { value: null, source: null, binanceAge: Infinity, chainlinkAge: Infinity };
   const binance = btc.price != null ? Number(btc.price) : NaN;
   const chainlink = btc.chainlink != null ? Number(btc.chainlink) : NaN;
   const binanceAge = btc.updated_at != null ? now - Number(btc.updated_at) : Infinity;
+  const chainlinkAge = btc.chainlink_at != null ? now - Number(btc.chainlink_at) : Infinity;
 
   if (Number.isFinite(binance) && binanceAge <= 2) {
-    return { value: binance, source: "binance", binanceAge };
+    return { value: binance, source: "binance", binanceAge, chainlinkAge };
   }
-  // State switches the server history to Chainlink after a two-second Binance
-  // gap. Mirror that choice here so a stale opening price cannot pin Δ at $0.
-  if (Number.isFinite(chainlink)) {
-    return { value: chainlink, source: "chainlink", binanceAge };
+  // Only trust Chainlink while it is reasonably fresh; otherwise a frozen
+  // oracle value would be re-seeded as a fake flat line during an outage.
+  if (Number.isFinite(chainlink) && chainlinkAge <= 5) {
+    return { value: chainlink, source: "chainlink", binanceAge, chainlinkAge };
   }
   return Number.isFinite(binance)
-    ? { value: binance, source: "stale-binance", binanceAge }
-    : { value: null, source: null, binanceAge };
+    ? { value: binance, source: "stale-binance", binanceAge, chainlinkAge }
+    : { value: null, source: null, binanceAge, chainlinkAge };
 }
 
 /**
  * Push a live sample from the latest BTC panel tick.
  * Always uses wall clock so a frozen server updated_at cannot pin the series.
- * Only seeds when the snapshot is fresh (Binance < 2s or Chainlink) to avoid
- * injecting fake flat-line points during disconnection.
+ * Only seeds when the snapshot is fresh to avoid injecting fake flat points.
  */
 function seedBtcLivePoint(btc) {
+  if (Date.now() - lastUpdateAt > 5000) return false;
   const spot = currentBtcSpot(btc);
   if (spot.source === "stale-binance" || spot.source == null) return false;
   const v = spot.value;
@@ -500,6 +515,10 @@ function detectCandleChange(market) {
   if (activeCandleStartTs === nextStart) {
     activeCandleSlug = market.slug || activeCandleSlug;
     countdownBase = { market };
+    return;
+  }
+  if (activeCandleStartTs != null && nextStart < activeCandleStartTs) {
+    // Stale/out-of-order market metadata — never roll backwards.
     return;
   }
   const isRollover = activeCandleStartTs != null;
@@ -690,6 +709,7 @@ function tickSyncAge() {
   }
   const sec = Math.floor((Date.now() - lastUpdateAt) / 1000);
   setText("sync-text", sec < 2 ? "live" : sec + "s");
+  updateNetBanner();
 }
 
 function shortenMarket(title) {
@@ -786,6 +806,17 @@ function updateStrategy(d) {
     setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
   } else {
     setText("strat-pending", s.entered_this_candle ? "Entered · waiting resolve" : "No position");
+    setText("td-side", "—");
+    _setEl("td-side", "—", "td-value td-side");
+    setText("td-entry-price", "—");
+    setText("td-stake", "—");
+    setText("td-risk-pct", "—");
+    setText("td-entry-fee", "—");
+    setText("td-potential-gain", "—");
+    setText("td-current-value", "—");
+    setText("td-unrealized-pnl", "—");
+    setText("td-fill", "—");
+    setText("td-elapsed", "—");
     const hbOk = s.heartbeat_last_ok;
     setText("td-heartbeat", hbOk ? `OK (${Math.round((Date.now()/1000 - hbOk) / 60)}m ago)` : (s.heartbeat_failures > 0 ? `${s.heartbeat_failures} failures` : "—"));
   }
@@ -1053,6 +1084,21 @@ function updateWallet(d) {
 
 let liveStrategies = [];
 let userEditingLiveParams = false;
+let _strategiesPromise = null;
+
+function fetchStrategies() {
+  if (!_strategiesPromise) {
+    _strategiesPromise = fetch("/api/strategies")
+      .then(r => r.json())
+      .then(data => data.strategies || [])
+      .catch(err => {
+        console.error("Failed to load strategies", err);
+        _strategiesPromise = null;
+        return [];
+      });
+  }
+  return _strategiesPromise;
+}
 
 function initLiveStrategyControl() {
   const sel = document.getElementById("live-strategy-select");
@@ -1068,24 +1114,19 @@ function initLiveStrategyControl() {
     onLiveStrategyChange();
   });
 
-  fetch("/api/strategies")
-    .then(r => r.json())
-    .then(data => {
-      liveStrategies = data.strategies || [];
-      if (!liveStrategies.length) {
-        renderLiveParamsBox({});
-        const desc = document.getElementById("live-strategy-desc");
-        if (desc) desc.textContent = "No strategies found.";
-        return;
-      }
-      sel.innerHTML = liveStrategies.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
-      const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy || liveStrategies[0].id;
-      sel.value = activeId;
-      onLiveStrategyChange();
-    })
-    .catch(err => {
-      console.error("Failed to load live strategies", err);
-    });
+  fetchStrategies().then(list => {
+    liveStrategies = list;
+    if (!liveStrategies.length) {
+      renderLiveParamsBox({});
+      const desc = document.getElementById("live-strategy-desc");
+      if (desc) desc.textContent = "No strategies found.";
+      return;
+    }
+    sel.innerHTML = liveStrategies.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+    const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy || liveStrategies[0].id;
+    sel.value = activeId;
+    onLiveStrategyChange();
+  });
 }
 
 function onLiveStrategyChange() {
@@ -1242,15 +1283,12 @@ function initTopbarModel() {
   const sel = document.getElementById("topbar-model-select");
   if (!sel) return;
   sel.addEventListener("change", () => applyTopbarModel(sel.value));
-  fetch("/api/strategies")
-    .then(r => r.json())
-    .then(data => {
-      topbarStrategies = data.strategies || [];
-      sel.innerHTML = topbarStrategies
-        .map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
-      syncTopbarModel();
-    })
-    .catch(() => {});
+  fetchStrategies().then(list => {
+    topbarStrategies = list;
+    sel.innerHTML = topbarStrategies
+      .map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+    syncTopbarModel();
+  });
 }
 
 function syncTopbarModel() {
@@ -1263,11 +1301,23 @@ function syncTopbarModel() {
   }
 }
 
+let topbarApplying = false;
+
 async function applyTopbarModel(strategyId) {
+  const sel = document.getElementById("topbar-model-select");
   const msg = document.getElementById("topbar-model-msg");
-  if (!strategyId) return;
+  if (!strategyId || topbarApplying) return;
   const strat = topbarStrategies.find(s => s.id === strategyId);
-  const params = strat?.default_params ? { ...strat.default_params } : {};
+  // Keep the active model's live params when re-selecting it; otherwise defaults.
+  const activeId = latestSnapshotStrategy?.id || cachedConfig?.strategy;
+  let params;
+  if (strategyId === activeId) {
+    params = { ...(strat?.default_params || {}), ...(latestSnapshotStrategy?.params || cachedConfig?.strategy_params || {}) };
+  } else {
+    params = strat?.default_params ? { ...strat.default_params } : {};
+  }
+  topbarApplying = true;
+  if (sel) sel.disabled = true;
   if (msg) { msg.textContent = "Applying…"; msg.className = "topbar-model-msg"; }
   try {
     const res = await fetch("/api/strategy/update", {
@@ -1290,6 +1340,9 @@ async function applyTopbarModel(strategyId) {
       latestSnapshotStrategy.name = data.strategy_name;
       latestSnapshotStrategy.params = data.params;
     }
+    // Let the params panel follow the topbar selection again.
+    userEditingLiveParams = false;
+    onLiveStrategyChange();
     if (msg) { msg.textContent = "Applied"; msg.className = "topbar-model-msg"; }
     setTimeout(() => { if (msg && msg.textContent === "Applied") msg.textContent = ""; }, 2500);
     pollStatus();
@@ -1297,6 +1350,9 @@ async function applyTopbarModel(strategyId) {
   } catch (e) {
     if (msg) { msg.textContent = e.message || "Failed"; msg.className = "topbar-model-msg err"; }
     syncTopbarModel();
+  } finally {
+    topbarApplying = false;
+    if (sel) sel.disabled = false;
   }
 }
 
@@ -1307,15 +1363,9 @@ let aiKeyConfigured = false;
 let _aiRenderedVersion = -1;
 
 function initAiPanel() {
-  const panel = document.getElementById("ai-panel");
-  const toggle = document.getElementById("ai-panel-toggle");
-  if (panel && toggle) {
-    toggle.addEventListener("click", () => {
-      panel.classList.toggle("collapsed");
-      const btn = document.getElementById("ai-collapse-btn");
-      if (btn) btn.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
-    });
-  }
+  bindCollapse("ai-panel", "ai-panel-toggle", "ai-collapse-btn", () => {
+    if (latestSnapshot && latestSnapshot.ai) renderAi(latestSnapshot.ai);
+  });
   const saveBtn = document.getElementById("btn-ai-save");
   if (saveBtn) saveBtn.addEventListener("click", saveAiSettings);
   const resetBtn = document.getElementById("btn-ai-reset");
@@ -1463,6 +1513,9 @@ function renderAi(ai) {
     badge.textContent = status;
     badge.className = "ai-status-badge " + status;
   }
+  // The panel is hidden while collapsed; skip the DOM work until it is opened.
+  const panel = document.getElementById("ai-panel");
+  if (panel && panel.classList.contains("collapsed")) return;
   renderAiDecision(ai);
   renderAiUsage(ai);
   renderAiChain(ai);
@@ -1475,7 +1528,8 @@ function renderAiDecision(ai) {
   const history = ai.history || [];
   const last = history.length ? history[history.length - 1] : null;
   if (!last) {
-    el.innerHTML = '<div class="placeholder">Waiting for the next candle…</div>';
+    const html = '<div class="placeholder">Waiting for the next candle…</div>';
+    if (el.dataset.sig !== html) { el.dataset.sig = html; el.innerHTML = html; }
     return;
   }
   const side = String(last.side || "").toLowerCase();
@@ -1487,7 +1541,7 @@ function renderAiDecision(ai) {
   const pnl = Number(last.pnl);
   const pnlCls = Number.isFinite(pnl) ? (pnl >= 0 ? "win" : "loss") : "pending";
   const pnlTxt = Number.isFinite(pnl) ? `${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}` : "";
-  el.innerHTML = `
+  const html = `
     <div>
       <span class="ai-side ${esc(side)}">${esc(side.toUpperCase())}</span>
       <span class="ai-conf">${Number.isFinite(conf) ? Math.round(conf * 100) + "% conf" : ""}</span>
@@ -1498,6 +1552,7 @@ function renderAiDecision(ai) {
     ${Number.isFinite(stake) ? `<span class="ai-sub">Stake $${stake.toFixed(2)} · Entry ${Number(last.entry_price) || 0}</span>` : ""}
     ${factors ? `<ul class="ai-factors">${factors}</ul>` : ""}
   `;
+  if (el.dataset.sig !== html) { el.dataset.sig = html; el.innerHTML = html; }
 }
 
 function renderAiUsage(ai) {
@@ -1524,10 +1579,11 @@ function renderAiUsage(ai) {
 function renderAiChain(ai) {
   const el = document.getElementById("ai-chain");
   if (!el) return;
-  const version = Number(ai.version);
-  if (Number.isFinite(version) && version === _aiRenderedVersion) return;
-  _aiRenderedVersion = Number.isFinite(version) ? version : -1;
   const messages = ai.messages || [];
+  const lastMsg = messages.length ? messages[messages.length - 1] : null;
+  const sig = `${ai.version}|${messages.length}|${lastMsg ? String(lastMsg.content || "").length : 0}`;
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
   const meta = document.getElementById("ai-chain-meta");
   if (meta) {
     const usage = ai.usage || {};
@@ -3110,20 +3166,18 @@ function drawEquityGridChart() {
 }
 
 function renderLoop() {
-  if (viewActive) {
-    const needsAnim = isLive || smooth.up != null || smooth.btcDelta != null || smooth.down != null;
-    if (needsRedraw || needsAnim) {
-      if (lastBtcSnapshot) {
-        if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
-      }
-      drawPriceChart();
-      drawBtcChart();
-      drawSimChart();
-      drawEquityGridChart();
-      needsRedraw = false;
+  if (viewActive && needsRedraw) {
+    if (lastBtcSnapshot) {
+      if (seedBtcLivePoint(lastBtcSnapshot)) needsRedraw = true;
     }
+    drawPriceChart();
+    drawBtcChart();
+    drawSimChart();
+    drawEquityGridChart();
+    needsRedraw = false;
   }
-  if (viewActive) requestAnimationFrame(renderLoop);
+  // Always reschedule: a single skipped frame must never kill the loop.
+  requestAnimationFrame(renderLoop);
 }
 
 // Pause rendering when tab is hidden to save CPU/battery
@@ -3189,28 +3243,46 @@ let _lastBannerText = "";
 function updateNetBanner() {
   const banner = document.getElementById("net-banner");
   if (!banner) return;
-  const down = !netOnline || (lastUpdateAt > 0 && !isLive);
+  // Polling can keep data fresh even when the WebSocket is down, so base the
+  // banner on data staleness rather than the socket alone.
+  const stale = lastUpdateAt > 0 && (Date.now() - lastUpdateAt > 3 * POLL_MS);
+  const down = !netOnline || stale;
   banner.classList.toggle("hidden", !down);
   if (down) {
     const t = !netOnline
       ? "No internet — live prices are frozen. The bot thread is still running on this machine."
-      : "Dashboard disconnected — live prices are frozen. The bot thread is still running on the server.";
+      : "Dashboard data is stale — the bot thread is still running on the server.";
     if (_lastBannerText !== t) { banner.textContent = t; _lastBannerText = t; }
   } else {
     _lastBannerText = "";
   }
 }
 
-function initStrategyCollapse() {
-  const panel = document.getElementById("live-model-panel");
-  const toggle = document.getElementById("live-model-toggle");
+function bindCollapse(panelId, toggleId, btnId, onExpand) {
+  const panel = document.getElementById(panelId);
+  const toggle = document.getElementById(toggleId);
   if (!panel || !toggle) return;
   panel.classList.add("collapsed");
-  toggle.addEventListener("click", () => {
+  const sync = () => {
+    const collapsed = panel.classList.contains("collapsed");
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const btn = document.getElementById(btnId);
+    if (btn) btn.textContent = collapsed ? "Show" : "Hide";
+  };
+  const flip = () => {
     panel.classList.toggle("collapsed");
-    const btn = document.getElementById("live-model-collapse-btn");
-    if (btn) btn.textContent = panel.classList.contains("collapsed") ? "Show" : "Hide";
+    sync();
+    if (!panel.classList.contains("collapsed") && typeof onExpand === "function") onExpand();
+  };
+  toggle.addEventListener("click", flip);
+  toggle.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); }
   });
+  sync();
+}
+
+function initStrategyCollapse() {
+  bindCollapse("live-model-panel", "live-model-toggle", "live-model-collapse-btn");
 }
 
 function initHealthPopover() {
@@ -3319,9 +3391,17 @@ function renderOpenOrders(orders) {
     el.innerHTML = html;
     _renderedOpenOrders = html;
   }
-  el.querySelectorAll("[data-order-id]").forEach(btn => {
-    btn.addEventListener("click", () => cancelOrder(btn.getAttribute("data-order-id")));
-  });
+}
+
+function initDelegatedHandlers() {
+  const orders = document.getElementById("wallet-orders");
+  if (orders) {
+    orders.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-order-id]");
+      if (!btn) return;
+      cancelOrder(btn.getAttribute("data-order-id"));
+    });
+  }
 }
 
 function renderPositions(positions) {
@@ -3383,10 +3463,26 @@ async function cancelOrder(orderId) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || res.statusText);
     }
+    showToast("Order cancelled");
     pollStatus();
   } catch (e) {
     console.error("cancel failed", e);
+    showToast("Cancel failed: " + (e.message || e), "error");
   }
+}
+
+let _toastTimer = null;
+function showToast(message, kind) {
+  let el = document.getElementById("app-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "app-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = message || "";
+  el.className = "app-toast show" + (kind ? " " + kind : "");
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.className = "app-toast"; }, 3500);
 }
 
 function setClass(id, cls) {
@@ -3430,14 +3526,34 @@ let botBusy = false;
 async function startBot() {
   if (botBusy) return;
   botBusy = true;
-  try { await fetch("/api/bot/start", { method: "POST" }); pollStatus(); }
-  finally { botBusy = false; }
+  try {
+    const res = await fetch("/api/bot/start", { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Start failed");
+    }
+    pollStatus();
+  } catch (e) {
+    showToast("Start failed: " + (e.message || e), "error");
+  } finally {
+    botBusy = false;
+  }
 }
 async function stopBot() {
   if (botBusy) return;
   botBusy = true;
-  try { await fetch("/api/bot/stop", { method: "POST" }); pollStatus(); }
-  finally { botBusy = false; }
+  try {
+    const res = await fetch("/api/bot/stop", { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Stop failed");
+    }
+    pollStatus();
+  } catch (e) {
+    showToast("Stop failed: " + (e.message || e), "error");
+  } finally {
+    botBusy = false;
+  }
 }
 
 window.addEventListener("resize", () => {

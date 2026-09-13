@@ -617,7 +617,60 @@ class BotState:
             self._sync_btc_locked(connected=connected, error=error)
             self._bump()
 
+    def _ensure_sim_store_locked(self):
+        if not hasattr(self, "_cached_sim_store"):
+            try:
+                from src.ml.direction_probs import DirectionProbStore
+
+                self._cached_sim_store = DirectionProbStore.load_auto()
+            except Exception:
+                self._cached_sim_store = None
+        return self._cached_sim_store
+
+    @staticmethod
+    def _sim_prob_from(
+        beat: float | None,
+        cs: int,
+        elapsed: int,
+        pts: list[dict],
+        store,
+        spot: float,
+    ) -> float:
+        if beat is None or beat <= 0:
+            return 0.5
+
+        if store is not None:
+            try:
+                if store.has_candle(cs):
+                    val = store.prob_up_at(cs, elapsed)
+                    if val is not None:
+                        return float(val)
+            except Exception:
+                pass
+
+        import numpy as np
+        from scipy.special import erf
+
+        log_ret = np.log(spot / beat)
+        vol_scale = 0.00003  # default per-second std (~0.003% / sec)
+        if len(pts) >= 4:
+            pxs = np.array([p["v"] for p in pts], dtype=np.float64)
+            dts = np.diff([p["t"] for p in pts])
+            dts = np.where(dts > 0.001, dts, 0.05)
+            log_rets = np.log(pxs[1:] / pxs[:-1])
+            per_sec_rets = log_rets / np.sqrt(dts)
+            rvol = float(np.std(per_sec_rets))
+            if np.isfinite(rvol) and rvol > 1e-6:
+                vol_scale = max(1e-6, min(0.001, rvol))
+
+        rem_seconds = max(1.0, float(300 - elapsed))
+        rem_std = vol_scale * np.sqrt(rem_seconds)
+        z_score = float(np.clip(log_ret / rem_std, -10.0, 10.0))
+        raw_prob = float(0.5 * (1.0 + erf(z_score / np.sqrt(2.0))))
+        return float(np.clip(raw_prob, 0.001, 0.999))
+
     def _compute_sim_prob_locked(self, now: float, spot: float) -> float | None:
+        """Caller MUST hold ``self._lock``."""
         beat = self._price_to_beat
         if beat is None or beat <= 0:
             return 0.5
@@ -625,43 +678,26 @@ class BotState:
         if cs is None:
             cs = int(now // 300) * 300
         elapsed = max(0, min(299, int(now - cs)))
+        store = self._ensure_sim_store_locked()
+        pts = [p for p in self._btc_history if (now - p["t"]) <= 60.0 and p.get("v") and p["v"] > 0]
+        return self._sim_prob_from(beat, cs, elapsed, pts, store, spot)
 
-        try:
-            from src.ml.direction_probs import DirectionProbStore
-            if not hasattr(self, "_cached_sim_store"):
-                try:
-                    self._cached_sim_store = DirectionProbStore.load_auto()
-                except Exception:
-                    self._cached_sim_store = None
-            if self._cached_sim_store and self._cached_sim_store.has_candle(cs):
-                val = self._cached_sim_store.prob_up_at(cs, elapsed)
-                if val is not None:
-                    return float(val)
-        except Exception:
-            pass
-
-        import numpy as np
-        from scipy.special import erf
-
-        log_ret = np.log(spot / beat)
-        vol_scale = 0.00003  # default per-second std (~0.003% / sec)
-        if hasattr(self, "_btc_history") and len(self._btc_history) >= 4:
+    def compute_sim_prob(self, now: float, spot: float) -> float | None:
+        """Compute P(Up) without holding the state lock (safe for slow numpy work)."""
+        with self._lock:
+            beat = self._price_to_beat
+            cs = self._active_btc_candle_start()
             pts = [p for p in self._btc_history if (now - p["t"]) <= 60.0 and p.get("v") and p["v"] > 0]
-            if len(pts) >= 4:
-                pxs = np.array([p["v"] for p in pts], dtype=np.float64)
-                dts = np.diff([p["t"] for p in pts])
-                dts = np.where(dts > 0.001, dts, 0.05)
-                log_rets = np.log(pxs[1:] / pxs[:-1])
-                per_sec_rets = log_rets / np.sqrt(dts)
-                rvol = float(np.std(per_sec_rets))
-                if np.isfinite(rvol) and rvol > 1e-6:
-                    vol_scale = max(1e-6, min(0.001, rvol))
-
-        rem_seconds = max(1.0, float(300 - elapsed))
-        rem_std = vol_scale * np.sqrt(rem_seconds)
-        z_score = float(np.clip(log_ret / rem_std, -10.0, 10.0))
-        raw_prob = float(0.5 * (1.0 + erf(z_score / np.sqrt(2.0))))
-        return float(np.clip(raw_prob, 0.001, 0.999))
+            store = getattr(self, "_cached_sim_store", None)
+            loaded = hasattr(self, "_cached_sim_store")
+        if not loaded:
+            store = self._ensure_sim_store_locked()
+        if beat is None or beat <= 0:
+            return 0.5
+        if cs is None:
+            cs = int(now // 300) * 300
+        elapsed = max(0, min(299, int(now - cs)))
+        return self._sim_prob_from(beat, cs, elapsed, pts, store, spot)
 
     def _append_sim_history_locked(self, now: float, prob: float) -> bool:
         if now - self._last_sim_append < self._sim_history_interval:
@@ -680,12 +716,12 @@ class BotState:
         two charts stay time-aligned. Exchange ``ts_ms`` is stored for lag UI.
         """
         wall = time.time()
+        sim_p = self.compute_sim_prob(wall, float(value))
         with self._lock:
             changed = self._last_btc_display != value
             self._last_btc_display = float(value)
             self._binance_wall_ts = wall
             appended = self._append_btc_history_locked(wall, spot=float(value))
-            sim_p = self._compute_sim_prob_locked(wall, spot=float(value))
             if sim_p is not None:
                 self._append_sim_history_locked(wall, prob=sim_p)
             self._sync_btc_locked(
@@ -700,6 +736,7 @@ class BotState:
     def update_btc_chainlink(self, value: float, ts_ms: int) -> None:
         """Resolution oracle — also backfills the chart if Binance goes silent."""
         wall = time.time()
+        sim_p = self.compute_sim_prob(wall, float(value))
         with self._lock:
             if self._price_to_beat is None:
                 self._maybe_set_initial_beat_locked(float(value), wall)
@@ -710,7 +747,6 @@ class BotState:
                 or (wall - self._binance_wall_ts) > 2.0
             )
             appended = False
-            sim_p = self._compute_sim_prob_locked(wall, spot=float(value))
             if binance_stale:
                 appended = self._append_btc_history_locked(wall, spot=float(value))
                 if sim_p is not None:
@@ -940,15 +976,20 @@ class BotState:
             ]
         return slice_history_tail(points, history_points)
 
-    def get_snapshot(self, history_points: int = 600) -> dict[str, Any]:
+    def get_snapshot(self, history_points: int = 600, *, equity_points: int = 3000) -> dict[str, Any]:
         with self._lock:
             data = asdict(self._snapshot)
-            data["activity"] = [e.to_dict() for e in list(self._log)]
+            if history_points > 0:
+                data["activity"] = [e.to_dict() for e in list(self._log)]
+                data["equity_history"] = list(self._equity_history)[-equity_points:] if equity_points > 0 else []
+            else:
+                # Delta-only pushes need just enough log tail to detect changes.
+                data["activity"] = [e.to_dict() for e in list(self._log)[:8]]
+                data["equity_history"] = []
             data["price_history"] = self._price_history_for_dashboard(history_points)
             data["btc_history"] = self._btc_history_for_dashboard(history_points)
             data["sim_history"] = self._sim_history_for_dashboard(history_points)
             data["btc_candle_start_ts"] = self._active_btc_candle_start()
             data["candle_seq"] = self._candle_seq
-            data["equity_history"] = list(self._equity_history)[-3000:]
             data["version"] = self._version
             return data

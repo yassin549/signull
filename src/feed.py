@@ -124,8 +124,10 @@ class MarketFeed:
                     except (TypeError, ValueError):
                         pass
         if up_px is not None and down_px is not None:
-            self.state.update_feed_best("up", up_px, round(1.0 - up_px, 2))
-            self.state.update_feed_best("down", down_px, round(1.0 - down_px, 2))
+            # Seed a single reference price per side. Passing a synthetic
+            # complement as the ask would force mid=(px+(1-px))/2=0.5.
+            self.state.update_feed_best("up", up_px, up_px)
+            self.state.update_feed_best("down", down_px, down_px)
 
     def _push_provisional_now(self) -> None:
         start = expected_candle_start_ts()

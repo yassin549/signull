@@ -102,10 +102,11 @@ class BroadcastHub:
         if strat != prev_strat:
             delta["strategy"] = strat
 
-        # AI model monitor (chain of thought, decisions, usage)
+        # AI model monitor — compare by version only (cheap; payload can be large).
         ai = full.get("ai")
         prev_ai = self._prev_snapshot.get("ai")
-        if ai != prev_ai:
+        ai_missing = (ai is None) != (prev_ai is None)
+        if ai_missing or (ai or {}).get("version") != (prev_ai or {}).get("version"):
             delta["ai"] = ai
 
         # Account — include when changed
@@ -185,10 +186,10 @@ class BroadcastHub:
                 now = time.time()
                 send_full = (now - self._last_full_broadcast >= self._full_broadcast_interval)
 
-                # Only serialise histories on the periodic full snapshot. Delta
-                # pushes don't need them, and slicing 900 points per push is the
-                # main CPU cost on small boxes.
-                full = self.state.get_snapshot(history_points=900 if send_full else 0)
+                # Serialising history is the main CPU cost; keep it off the loop.
+                full = await asyncio.to_thread(
+                    self.state.get_snapshot, 900 if send_full else 0
+                )
 
                 if send_full:
                     payload = full
@@ -202,14 +203,14 @@ class BroadcastHub:
                     await asyncio.sleep(self.push_interval)
                     continue
 
-                dead: list[WebSocket] = []
-                for ws in list(self.clients):
-                    try:
-                        await ws.send_json(payload)
-                    except Exception:
-                        dead.append(ws)
-                for ws in dead:
-                    self.remove(ws)
+                clients = list(self.clients)
+                results = await asyncio.gather(
+                    *(ws.send_json(payload) for ws in clients),
+                    return_exceptions=True,
+                )
+                for ws, result in zip(clients, results):
+                    if isinstance(result, Exception):
+                        self.remove(ws)
             await asyncio.sleep(self.push_interval)
 
 
@@ -400,7 +401,7 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.get("/api/status")
     async def status():
-        snap = service.state.get_snapshot(history_points=900)
+        snap = await asyncio.to_thread(service.state.get_snapshot, 900)
         snap["bot_thread_alive"] = service.is_running
         snap["stop_requested"] = service.state.should_bot_stop()
         return snap
@@ -432,7 +433,7 @@ def create_app(config: BotConfig) -> FastAPI:
     @app.post("/api/strategy/update")
     async def strategy_update(req: StrategyUpdateRequest):
         try:
-            return service.update_strategy(req.strategy_id, req.params)
+            return await asyncio.to_thread(service.update_strategy, req.strategy_id, req.params)
         except KeyError as err:
             raise HTTPException(status_code=404, detail=str(err))
         except Exception as err:
@@ -479,7 +480,7 @@ def create_app(config: BotConfig) -> FastAPI:
     @app.get("/api/health")
     async def health():
         service.health.set_bot_alive(service.is_running)
-        return service.health.snapshot()
+        return await asyncio.to_thread(service.health.snapshot)
 
     @app.get("/api/wallet/verify")
     async def wallet_verify():
@@ -521,7 +522,7 @@ def create_app(config: BotConfig) -> FastAPI:
 
     @app.post("/api/bot/start")
     async def bot_start():
-        service.start_bot()
+        await asyncio.to_thread(service.start_bot)
         return {"ok": True, "running": service.is_running}
 
     @app.post("/api/bot/stop")
@@ -536,7 +537,7 @@ def create_app(config: BotConfig) -> FastAPI:
                 status_code=403,
                 detail="Cannot reset a live wallet. Paper reset is disabled in TRADING_MODE=live.",
             )
-        service.reset_account(100.0)
+        await asyncio.to_thread(service.reset_account, 100.0)
         return {"ok": True, "balance": 100.0, "message": "Account reset to $100"}
 
     @app.websocket("/ws")
@@ -545,7 +546,8 @@ def create_app(config: BotConfig) -> FastAPI:
         service.hub.add(ws)
         try:
             # Send immediate full snapshot on connect
-            await ws.send_json(service.state.get_snapshot(history_points=900))
+            snap = await asyncio.to_thread(service.state.get_snapshot, 900)
+            await ws.send_json(snap)
             while True:
                 try:
                     raw = await asyncio.wait_for(ws.receive_text(), timeout=60)

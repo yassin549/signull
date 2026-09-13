@@ -24,9 +24,10 @@ class HealthMonitor:
     def set_bot_alive(self, alive: bool) -> None:
         self._bot_alive = bool(alive)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, snap: dict[str, Any] | None = None) -> dict[str, Any]:
         now = time.time()
-        snap = self.state.get_snapshot(history_points=0)
+        if snap is None:
+            snap = self.state.get_snapshot(history_points=0)
         feed = snap.get("feed") or {}
         btc = snap.get("btc") or {}
         account = snap.get("account") or {}
@@ -80,8 +81,9 @@ class HealthMonitor:
         }
 
     def publish(self) -> None:
-        health = dict(self.state.get_snapshot(history_points=0).get("health") or {})
-        health.update(self.snapshot())
+        snap = self.state.get_snapshot(history_points=0)
+        health = dict(snap.get("health") or {})
+        health.update(self.snapshot(snap))
         self.state.update(health=health)
         self._last_publish = time.time()
 

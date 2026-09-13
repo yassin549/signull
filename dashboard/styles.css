@@ -1178,6 +1178,28 @@ html.reduce-motion .view.active { animation: none; }
   color: var(--muted);
 }
 
+/* ── Transient toast ── */
+.app-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%) translateY(12px);
+  z-index: 200;
+  max-width: min(90vw, 520px);
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: #0c1220;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s, transform 0.18s;
+}
+.app-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.app-toast.error { border-color: rgba(246, 70, 93, 0.5); color: #fda4af; }
+
 @media (max-width: 1100px) {
   .ai-grid { grid-template-columns: 1fr; }
   .ai-chain, .ai-history { max-height: 200px; }

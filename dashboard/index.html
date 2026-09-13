@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=44" />
+  <link rel="stylesheet" href="/static/styles.css?v=45" />
 </head>
 <body>
   <div class="app">
@@ -218,12 +218,12 @@
       </section>
 
       <section class="live-model-panel collapsed" id="live-model-panel">
-        <div class="strat-params-head" id="live-model-toggle">
+        <div class="strat-params-head" id="live-model-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="live-model-body">
           <span>Trading Model &amp; Parameters</span>
           <span class="strat-params-name" id="strat-params-name">-</span>
           <button type="button" class="collapse-btn" id="live-model-collapse-btn">Show</button>
         </div>
-        <div class="live-strat-control">
+        <div class="live-strat-control" id="live-model-body">
           <div class="live-strat-select-group">
             <label for="live-strategy-select" class="live-strat-label">Active Trading Model</label>
             <select id="live-strategy-select" class="live-strat-select"></select>
@@ -243,12 +243,12 @@
       </section>
 
       <section class="ai-panel collapsed" id="ai-panel">
-        <div class="strat-params-head" id="ai-panel-toggle">
+        <div class="strat-params-head" id="ai-panel-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="ai-panel-body">
           <span>AI Model Monitor &amp; OpenRouter</span>
           <span class="ai-status-badge idle" id="ai-status-badge">idle</span>
           <button type="button" class="collapse-btn" id="ai-collapse-btn">Show</button>
         </div>
-        <div class="ai-body">
+        <div class="ai-body" id="ai-panel-body">
           <div class="ai-config">
             <div class="ai-field">
               <label for="ai-model-select">AI Model</label>
@@ -664,7 +664,7 @@
   </div>
 
   <script src="/static/lightweight-charts.js?v=40"></script>
-  <script src="/static/live.js?v=45"></script>
+  <script src="/static/live.js?v=46"></script>
   <script src="/static/backtest.js?v=40"></script>
   <script src="/static/shell.js?v=40"></script>
 </body>
