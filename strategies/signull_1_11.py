@@ -233,18 +233,64 @@ class Signull11Strategy(Strategy):
             self._ai_version += 1
 
     # ── decision plumbing ───────────────────────────────────────────────────
+    def _resolve_entry_outcome(self, entry: dict) -> dict | None:
+        """Score a prior decision from the closed candle's OHLCV (fill-independent)."""
+        slug = entry.get("slug")
+        if not slug:
+            return None
+        winner, _bar = self._actual_winner(str(slug), [])
+        if winner is None:
+            return None
+        side = entry.get("side")
+        stake = entry.get("stake")
+        if stake is None:
+            stake = self._stake_by_slug.get(str(slug))
+        entry_price = entry.get("entry_price")
+        won = side == winner
+        pnl = None
+        if stake and entry_price:
+            pnl = self._theoretical_pnl(float(stake), float(entry_price), won)
+        return {
+            "slug": slug,
+            "winner": winner,
+            "won": bool(won),
+            "stake": round(float(stake), 2) if stake else None,
+            "pnl": round(float(pnl), 4) if pnl is not None else None,
+        }
+
     def _decide(self, tick: TickContext, candle: CandleContext):
         with self._state_lock:
-            prev_slug = self._ai_history[-1]["slug"] if self._ai_history else None
-            prev_side = self._ai_history[-1]["side"] if self._ai_history else None
-            outcome = None
-            if (
-                prev_slug
-                and prev_slug not in self._reported_outcomes
-                and prev_slug in self._outcomes
-            ):
-                outcome = dict(self._outcomes[prev_slug])
-                outcome["side"] = prev_side
+            prev = dict(self._ai_history[-1]) if self._ai_history else None
+            outcome_reported = bool(prev and prev.get("slug") in self._reported_outcomes)
+        prev_slug = prev.get("slug") if prev else None
+
+        resolved = None
+        if prev is not None and prev.get("won") is None:
+            resolved = self._resolve_entry_outcome(prev)
+            if resolved:
+                with self._state_lock:
+                    target = next(
+                        (e for e in reversed(self._ai_history) if e.get("slug") == prev_slug),
+                        None,
+                    )
+                    if target is not None:
+                        for key in ("winner", "won", "pnl", "stake"):
+                            if resolved.get(key) is not None:
+                                target[key] = resolved[key]
+                    self._outcomes[prev_slug] = dict(resolved)
+                    self._ai_version += 1
+
+        outcome = None
+        if prev is not None and not outcome_reported:
+            src = resolved or prev
+            outcome = {
+                "slug": prev_slug,
+                "side": prev.get("side"),
+                "winner": src.get("winner"),
+                "won": src.get("won"),
+                "pnl": src.get("pnl"),
+                "stake": src.get("stake"),
+            }
 
         parts: list[str] = []
         if outcome is not None:
@@ -255,7 +301,7 @@ class Signull11Strategy(Strategy):
         decision = self._engine.decide(
             context_text,
             temperature=float(self.params.get("temperature", 0.2)),
-            max_tokens=int(self.params.get("max_tokens", 700)),
+            max_tokens=int(self.params.get("max_tokens", 1500)),
         )
 
         side = decision.side

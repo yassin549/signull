@@ -90,6 +90,43 @@ class TestConfidenceSizing:
         assert snapshot["trades"] == 1
         assert snapshot["wins"] == 1
 
+    def test_prior_outcome_resolved_without_fills(self):
+        from strategies.signull_1_11 import Signull11Strategy
+
+        strategy = Signull11Strategy({"asset": "btc"})
+        strategy._ai_history.append({
+            "slug": "btc-updown-5m-1",
+            "side": "up",
+            "entry_price": 0.5,
+            "stake": 1.0,
+            "winner": None,
+            "won": None,
+            "pnl": None,
+        })
+        strategy._actual_winner = lambda slug, ticks: (  # type: ignore[assignment]
+            "up", {"start": 1, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "vol": 1.0}
+        )
+        resolved = strategy._resolve_entry_outcome(strategy._ai_history[-1])
+        assert resolved["won"] is True
+        assert resolved["winner"] == "up"
+        assert resolved["pnl"] == pytest.approx(0.99)
+
+        strategy._ai_history.append({
+            "slug": "btc-updown-5m-2",
+            "side": "up",
+            "entry_price": 0.5,
+            "stake": 2.0,
+            "winner": None,
+            "won": None,
+            "pnl": None,
+        })
+        strategy._actual_winner = lambda slug, ticks: (  # type: ignore[assignment]
+            "down", None
+        )
+        resolved = strategy._resolve_entry_outcome(strategy._ai_history[-1])
+        assert resolved["won"] is False
+        assert resolved["pnl"] < 0
+
     def test_outcome_feedback_text(self):
         from strategies.signull_1_11 import Signull11Strategy
 
