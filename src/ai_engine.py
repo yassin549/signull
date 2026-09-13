@@ -139,10 +139,14 @@ def parse_decision(content: str) -> tuple[str, float, str, list[str]]:
         if match:
             side = match.group(1).lower()
     if side not in ("up", "down"):
-        # Last resort: the final standalone up/down word in the reply.
-        words = re.findall(r"\b(up|down)\b", text, re.IGNORECASE)
-        if words:
-            side = words[-1].lower()
+        # Conservative prose fallback: only trust an up/down word in the closing
+        # lines when it sits next to an explicit decision cue.  A truncated
+        # reasoning model must not have its side guessed from arbitrary words.
+        tail = text[-400:]
+        if re.search(r"(decision|choose|predict|final|call|go|close)", tail, re.IGNORECASE):
+            words = re.findall(r"\b(up|down)\b", tail, re.IGNORECASE)
+            if words:
+                side = words[-1].lower()
     if side not in ("up", "down"):
         raise ValueError(f"Could not parse up/down decision from: {text[:200]}")
 

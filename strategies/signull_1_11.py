@@ -76,7 +76,7 @@ class Signull11Strategy(Strategy):
             "entry_window_sec": 120.0,
             "btc_lookback_minutes": 30,
             "temperature": 0.2,
-            "max_tokens": 700,
+            "max_tokens": 1500,
             "asset": "btc",
         },
         live_only=True,
@@ -366,9 +366,13 @@ class Signull11Strategy(Strategy):
         if slug:
             with self._state_lock:
                 self._stake_by_slug[slug] = stake
+                entry = next((e for e in reversed(self._ai_history) if e.get("slug") == slug), None)
+                if entry is not None:
+                    entry["stake"] = round(stake, 2)
                 if len(self._stake_by_slug) > 100:
                     for old in sorted(self._stake_by_slug)[:-60]:
                         self._stake_by_slug.pop(old, None)
+                self._ai_version += 1
         base = float(initial or equity or 0.0)
         risk_frac = (stake / base) if base else 0.0
         return stake, f"AI {int(round(confidence * 100))}% conf · ${stake:.2f}", round(risk_frac, 4)

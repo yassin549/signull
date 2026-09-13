@@ -197,7 +197,7 @@ class BotConfig:
                 "entry_window_sec": float(os.getenv("SIGNULL_AI_ENTRY_WINDOW_SEC", "120.0")),
                 "btc_lookback_minutes": int(os.getenv("SIGNULL_AI_LOOKBACK_MIN", "30")),
                 "temperature": float(os.getenv("SIGNULL_AI_TEMPERATURE", "0.2")),
-                "max_tokens": int(os.getenv("SIGNULL_AI_MAX_TOKENS", "700")),
+                "max_tokens": int(os.getenv("SIGNULL_AI_MAX_TOKENS", "1500")),
                 "asset": self.asset,
             }
         return {
