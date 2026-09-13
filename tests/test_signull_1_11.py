@@ -178,6 +178,30 @@ class TestPureReasoningContext:
         assert block.count("\n- ") == 5
 
 
+class TestModelList:
+    def test_normalize_marks_free_and_paid(self):
+        from src.openrouter import _normalize_model
+
+        free = _normalize_model(
+            {"id": "x:free", "name": "X", "pricing": {"prompt": "0", "completion": "0"}}
+        )
+        assert free["free"] is True
+        assert free["id"] == "x:free"
+
+        paid = _normalize_model(
+            {"id": "y", "name": "Y", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+        )
+        assert paid["free"] is False
+
+    def test_normalize_handles_missing_pricing(self):
+        from src.openrouter import _normalize_model
+
+        model = _normalize_model({"id": "z"})
+        assert model["id"] == "z"
+        assert model["name"] == "z"
+        assert model["free"] is False
+
+
 class TestAISettings:
     def test_round_trip_and_masking(self, tmp_path, monkeypatch):
         import src.ai_settings as settings

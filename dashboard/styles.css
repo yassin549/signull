@@ -234,6 +234,32 @@ body {
 }
 .topbar-model-msg.err { color: var(--red); }
 
+/* Keep Start/Stop and the model picker reachable as the header gets tight. */
+@media (max-width: 1440px) {
+  .market-short { display: none; }
+  .topbar-model select { max-width: 170px; }
+}
+@media (max-width: 1200px) {
+  .topbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: var(--topbar-h);
+    padding: 6px var(--page-pad);
+    row-gap: 6px;
+  }
+  .topbar-left { flex: 1 1 auto; }
+  .topbar-actions { order: 2; }
+  .topbar-status {
+    order: 3;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-start;
+  }
+  .topbar-model label { display: none; }
+  .topbar-model select { max-width: 150px; }
+}
+
 /* ── Mode toggle (Live ↔ Backtest) ── */
 .mode-toggle {
   display: inline-flex;
@@ -1005,6 +1031,22 @@ html.reduce-motion .view.active { animation: none; }
   color: var(--text);
 }
 .ai-field input:focus { outline: none; border-color: var(--purple); }
+.ai-model-row { display: flex; align-items: center; gap: 8px; }
+.ai-model-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+.ai-model-row select:focus { outline: none; border-color: var(--purple); }
+.ai-model-row .btn { white-space: nowrap; }
 .ai-config-actions {
   display: flex;
   align-items: center;

@@ -476,7 +476,7 @@ const onUpdate = safe(function onUpdate(d) {
   updateTape();
   if (d.activity) updateLog(d.activity);
   updateBtcPanel(d.btc);
-  updateBotButtons(d.running);
+  updateBotButtons(d);
 });
 
 function candleStartFromMarket(market) {
@@ -1302,7 +1302,8 @@ async function applyTopbarModel(strategyId) {
 
 /* ── AI Model Monitor (Signull 1.11 / OpenRouter) ── */
 let aiSettings = null;
-let aiUserEditingModel = false;
+let aiModelOptions = [];
+let aiKeyConfigured = false;
 let _aiRenderedVersion = -1;
 
 function initAiPanel() {
@@ -1319,9 +1320,9 @@ function initAiPanel() {
   if (saveBtn) saveBtn.addEventListener("click", saveAiSettings);
   const resetBtn = document.getElementById("btn-ai-reset");
   if (resetBtn) resetBtn.addEventListener("click", resetAiMemory);
-  const modelInput = document.getElementById("ai-model-input");
-  if (modelInput) modelInput.addEventListener("input", () => { aiUserEditingModel = true; });
-  fetchAiSettings();
+  const loadBtn = document.getElementById("btn-ai-load-models");
+  if (loadBtn) loadBtn.addEventListener("click", loadAiModels);
+  fetchAiSettings().then(() => loadAiModels());
 }
 
 async function fetchAiSettings() {
@@ -1330,29 +1331,79 @@ async function fetchAiSettings() {
     if (!res.ok) return;
     const data = await res.json();
     aiSettings = data;
-    const modelInput = document.getElementById("ai-model-input");
-    if (modelInput && !aiUserEditingModel && data.model) modelInput.value = data.model;
-    const list = document.getElementById("ai-model-list");
-    if (list) {
-      list.innerHTML = (data.default_models || [])
-        .map(m => `<option value="${esc(m)}"></option>`).join("");
-    }
+    aiKeyConfigured = !!data.api_key_set;
+    setAiModelSelect(data.model);
     const hint = document.getElementById("ai-key-hint");
-    if (hint) {
+    if (hint && !aiModelOptions.length) {
       hint.textContent = data.api_key_set
-        ? `Key configured (${data.api_key_masked}). Leave blank to keep it, or paste a new one.`
-        : "No API key configured. Paste an OpenRouter key — free models end with :free.";
+        ? `Key configured (${data.api_key_masked}). Loading available models…`
+        : "No API key configured. Paste an OpenRouter key, then Load models.";
     }
   } catch (_) {}
+}
+
+function setAiModelSelect(model) {
+  const sel = document.getElementById("ai-model-select");
+  if (!sel || !model) return;
+  if (!Array.from(sel.options).some(o => o.value === model)) {
+    const opt = document.createElement("option");
+    opt.value = model;
+    opt.textContent = model;
+    sel.appendChild(opt);
+  }
+  sel.value = model;
+}
+
+function renderAiModelOptions(selected) {
+  const sel = document.getElementById("ai-model-select");
+  if (!sel) return;
+  const free = aiModelOptions.filter(m => m.free);
+  const paid = aiModelOptions.filter(m => !m.free);
+  const opt = m => `<option value="${esc(m.id)}" title="${esc(m.id)}">${esc(m.name)}</option>`;
+  let html = "";
+  if (free.length) html += `<optgroup label="Free (${free.length})">${free.map(opt).join("")}</optgroup>`;
+  if (paid.length) html += `<optgroup label="Paid (${paid.length})">${paid.map(opt).join("")}</optgroup>`;
+  sel.innerHTML = html || '<option value="">No models returned</option>';
+  setAiModelSelect(selected || (aiSettings && aiSettings.model) || "");
+}
+
+async function loadAiModels() {
+  const btn = document.getElementById("btn-ai-load-models");
+  const hint = document.getElementById("ai-key-hint");
+  if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
+  if (!aiKeyConfigured && hint) {
+    hint.textContent = "Add an OpenRouter API key first, then Load models.";
+  }
+  try {
+    const res = await fetch("/api/ai/models");
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Could not load models");
+    }
+    const data = await res.json();
+    aiModelOptions = data.models || [];
+    renderAiModelOptions();
+    if (hint) {
+      const freeCount = data.free_count != null
+        ? data.free_count
+        : aiModelOptions.filter(m => m.free).length;
+      const keyNote = aiKeyConfigured ? ` Key: ${(aiSettings && aiSettings.api_key_masked) || "set"}.` : " No key configured.";
+      hint.textContent = `${aiModelOptions.length} models available (${freeCount} free). Pick one and Save.${keyNote}`;
+    }
+  } catch (e) {
+    if (hint) hint.textContent = e.message || "Could not load models";
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Load models"; }
+  }
 }
 
 async function saveAiSettings() {
   const btn = document.getElementById("btn-ai-save");
   const msg = document.getElementById("ai-save-msg");
-  const modelInput = document.getElementById("ai-model-input");
+  const modelSel = document.getElementById("ai-model-select");
   const keyInput = document.getElementById("ai-key-input");
   const payload = {};
-  const model = modelInput ? modelInput.value.trim() : "";
+  const model = modelSel ? modelSel.value.trim() : "";
   const key = keyInput ? keyInput.value.trim() : "";
   if (model) payload.model = model;
   if (key) payload.api_key = key;
@@ -1373,10 +1424,10 @@ async function saveAiSettings() {
       throw new Error(err.detail || res.statusText || "Save failed");
     }
     aiSettings = await res.json();
-    aiUserEditingModel = false;
+    aiKeyConfigured = !!aiSettings.api_key_set;
     if (keyInput) keyInput.value = "";
     if (msg) { msg.textContent = "Saved"; msg.className = "strat-update-msg ok"; }
-    fetchAiSettings();
+    if (key) loadAiModels();
     setTimeout(() => { if (msg && msg.textContent === "Saved") msg.textContent = ""; }, 3000);
   } catch (e) {
     if (msg) { msg.textContent = e.message || "Save failed"; msg.className = "strat-update-msg err"; }
@@ -1886,16 +1937,20 @@ function updateBtcPanel(btc) {
   needsRedraw = true;
 }
 
-function updateBotButtons(running) {
+function updateBotButtons(d) {
+  const running = !!(d && d.running);
+  const stopRequested = !!(d && d.stop_requested);
   const start = document.querySelector(".btn-start");
   const stop = document.querySelector(".btn-stop");
+  const startDisabled = running && !stopRequested;
+  const stopDisabled = !running || stopRequested;
   if (start) {
-    if (start.disabled !== !!running) start.disabled = running;
-    start.classList.toggle("disabled", !!running);
+    start.disabled = startDisabled;
+    start.classList.toggle("disabled", startDisabled);
   }
   if (stop) {
-    if (stop.disabled === !!running) stop.disabled = !running;
-    stop.classList.toggle("disabled", !running);
+    stop.disabled = stopDisabled;
+    stop.classList.toggle("disabled", stopDisabled);
   }
 }
 

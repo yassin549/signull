@@ -22,6 +22,7 @@ from .config import BotConfig
 from .btc_feed import BtcPriceFeed
 from .feed import MarketFeed
 from .health import HealthMonitor
+from .openrouter import OpenRouterError, list_models
 from .backtest.registry import get_strategy
 from .session_store import clear_session, load_session
 from .state import BotState
@@ -265,7 +266,16 @@ class BotService:
 
     def start_bot(self) -> None:
         if self.is_running:
-            return
+            # A stop may have been requested while the loop is finishing its
+            # current (possibly slow) tick. Wait for it, then start fresh so the
+            # Start button never silently no-ops.
+            if not self.state.should_bot_stop():
+                return
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=15.0)
+            if self.is_running:
+                return
         self.state.clear_stop()
         self._bot = TradingBot(
             self.config,
@@ -392,6 +402,7 @@ def create_app(config: BotConfig) -> FastAPI:
     async def status():
         snap = service.state.get_snapshot(history_points=900)
         snap["bot_thread_alive"] = service.is_running
+        snap["stop_requested"] = service.state.should_bot_stop()
         return snap
 
     @app.get("/api/config")
@@ -430,6 +441,17 @@ def create_app(config: BotConfig) -> FastAPI:
     @app.get("/api/ai/settings")
     async def ai_settings_get():
         return public_ai_settings()
+
+    @app.get("/api/ai/models")
+    async def ai_models_get():
+        try:
+            models = await asyncio.to_thread(list_models)
+        except OpenRouterError as err:
+            raise HTTPException(status_code=502, detail=str(err)) from err
+        return {
+            "models": models,
+            "free_count": sum(1 for m in models if m.get("free")),
+        }
 
     @app.post("/api/ai/settings")
     async def ai_settings_post(req: AISettingsRequest):

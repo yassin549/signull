@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=43" />
+  <link rel="stylesheet" href="/static/styles.css?v=44" />
 </head>
 <body>
   <div class="app">
@@ -251,9 +251,13 @@
         <div class="ai-body">
           <div class="ai-config">
             <div class="ai-field">
-              <label for="ai-model-input">AI Model</label>
-              <input id="ai-model-input" type="text" list="ai-model-list" placeholder="openrouter model id" spellcheck="false" />
-              <datalist id="ai-model-list"></datalist>
+              <label for="ai-model-select">AI Model</label>
+              <div class="ai-model-row">
+                <select id="ai-model-select">
+                  <option value="">Load models…</option>
+                </select>
+                <button type="button" class="btn" id="btn-ai-load-models">Load models</button>
+              </div>
             </div>
             <div class="ai-field">
               <label for="ai-key-input">OpenRouter API Key</label>
@@ -660,7 +664,7 @@
   </div>
 
   <script src="/static/lightweight-charts.js?v=40"></script>
-  <script src="/static/live.js?v=44"></script>
+  <script src="/static/live.js?v=45"></script>
   <script src="/static/backtest.js?v=40"></script>
   <script src="/static/shell.js?v=40"></script>
 </body>

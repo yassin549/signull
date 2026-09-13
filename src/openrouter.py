@@ -32,7 +32,7 @@ class OpenRouterClient:
         *,
         model: str | None = None,
         temperature: float = 0.2,
-        max_tokens: int = 700,
+        max_tokens: int = 1500,
     ) -> dict[str, Any]:
         """Send a chat completion and return content + usage + latency."""
         settings = load_ai_settings()
@@ -87,3 +87,72 @@ class OpenRouterClient:
             "usage": usage,
             "latency_ms": latency_ms,
         }
+
+
+def _normalize_model(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce an OpenRouter model object to the fields the dashboard needs."""
+    pricing = raw.get("pricing") or {}
+
+    def _price(key: str) -> float | None:
+        try:
+            return float(pricing.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    prompt = _price("prompt")
+    completion = _price("completion")
+    free = prompt == 0 and completion == 0
+    return {
+        "id": raw.get("id") or "",
+        "name": raw.get("name") or raw.get("id") or "",
+        "context_length": raw.get("context_length"),
+        "free": bool(free),
+        "prompt_price": prompt,
+        "completion_price": completion,
+    }
+
+
+def list_models(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: float = 20.0,
+) -> list[dict[str, Any]]:
+    """List models available to the configured OpenRouter key.
+
+    Prefers the account-scoped ``/models/user`` endpoint (respects the key's
+    privacy/data-policy filters) and falls back to the public catalogue.
+    """
+    settings = load_ai_settings()
+    key = (api_key or settings["api_key"] or "").strip()
+    base = (base_url or settings["base_url"]).strip().rstrip("/")
+    headers = {"User-Agent": "signull"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    last_error: str | None = None
+    for path in ("/models/user", "/models"):
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.get(f"{base}{path}", headers=headers)
+        except httpx.HTTPError as exc:
+            last_error = f"OpenRouter request failed: {exc}"
+            continue
+        if resp.status_code >= 400:
+            last_error = f"OpenRouter HTTP {resp.status_code} on {path}"
+            continue
+        try:
+            payload = resp.json()
+        except ValueError:
+            last_error = "OpenRouter returned invalid JSON"
+            continue
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            last_error = "Unexpected OpenRouter model list payload"
+            continue
+        models = [_normalize_model(m) for m in rows if isinstance(m, dict) and m.get("id")]
+        if models:
+            models.sort(key=lambda m: (not m["free"], str(m["name"]).lower()))
+            return models
+
+    raise OpenRouterError(last_error or "Could not load OpenRouter models")
