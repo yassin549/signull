@@ -19,17 +19,21 @@ load_dotenv()
 
 SETTINGS_PATH = Path(__file__).resolve().parent.parent / "data" / "openrouter.json"
 
-DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 DEFAULT_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Free-first catalogue surfaced in the dashboard dropdown.  Users can still
-# type any OpenRouter model id, including paid ones.
+# type any OpenRouter model id, including paid ones.  Free slugs come and go —
+# refresh from https://openrouter.ai/models?max_price=0 when one retires.
 DEFAULT_MODELS: list[str] = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-r1-distill-llama-70b:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nex-agi/nex-n2.5-pro:free",
+    "thinkingmachines/inkling:free",
+    "cohere/north-mini-code:free",
     "openai/gpt-4o-mini",
     "anthropic/claude-3.5-sonnet",
 ]
